@@ -48,6 +48,8 @@ _installed = False
 _sink: Callable[[str], None] | None = None
 _saved_stderr_fd: int | None = None
 _reader_thread: threading.Thread | None = None
+#: Raw Win32 STD_ERROR_HANDLE we installed (kept alive for the whole session).
+_native_write_handle: int | None = None
 
 
 def quiet_uhd(level: str | None = None) -> str:
@@ -104,23 +106,31 @@ def _reader_loop(read_fd: int) -> None:
         pass
 
 
-def _redirect_windows_stderr_handle(fd: int) -> None:
+def _redirect_windows_stderr_handle(fd: int) -> bool:
     """Point ``STD_ERROR_HANDLE`` at ``fd`` so UHD's own CRT picks it up.
 
-    ``os.dup2`` only updates Python's CRT tables; the UHD DLL links its own
-    C runtime, so ``std::cerr`` keeps writing to the *original* stderr handle
-    unless we also replace the process standard-error handle before the DLL is
-    loaded.  Best effort, Windows only.
+    ``os.dup2`` only updates Python's CRT tables; a library that links its own
+    C runtime (or caches the Win32 handle from ``GetStdHandle(-12)``) keeps
+    writing to the *original* stderr handle unless we also replace the process
+    standard-error handle.  Must run after ``dup2`` (so fd ``fd`` is the pipe's
+    write end) and while that fd is still open.  Best effort, Windows only;
+    returns ``True`` when ``SetStdHandle`` reported success.
     """
+    global _native_write_handle
     if not sys.platform.startswith("win"):
-        return
+        return False
     try:
         import ctypes
         import msvcrt
-        handle = msvcrt.get_osfhandle(fd)
-        ctypes.windll.kernel32.SetStdHandle(-12, ctypes.c_void_p(handle))
+        handle = int(msvcrt.get_osfhandle(fd))
+        if handle in (0, -1):
+            return False
+        _native_write_handle = handle
+        ok = ctypes.windll.kernel32.SetStdHandle(
+            -12, ctypes.c_void_p(handle))
+        return bool(ok)
     except Exception:  # noqa: BLE001 - never fail because of this
-        pass
+        return False
 
 
 def install_native_stderr_filter(force: bool = False) -> bool:
@@ -128,6 +138,12 @@ def install_native_stderr_filter(force: bool = False) -> bool:
 
     Idempotent.  Skipped under pytest unless ``force=True`` so the test suite's
     own stream capture is not disturbed.  Returns ``True`` when it installed.
+
+    Works for both CRTs: ``os.dup2`` moves Python's fd 2 onto the pipe, and
+    :func:`_redirect_windows_stderr_handle` re-points the process
+    ``STD_ERROR_HANDLE`` so UHD's own C runtime (``std::cerr`` /
+    ``GetStdHandle(-12)``) writes into the same pipe.  fd 2 is kept open and
+    points at the pipe's write end, so the reader thread never sees EOF early.
     """
     global _installed, _saved_stderr_fd, _reader_thread
     if _installed:
@@ -140,7 +156,17 @@ def install_native_stderr_filter(force: bool = False) -> bool:
         return False
     try:
         read_fd, write_fd = os.pipe()
-        _saved_stderr_fd = os.dup(2)
+        # A GUI started without a console (pythonw) may have no fd 2 at all;
+        # give the CRT a valid fd first so ``os.dup(2)`` cannot fail and the
+        # native redirect below still runs.
+        try:
+            _saved_stderr_fd = os.dup(2)
+        except OSError:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 2)
+            if devnull != 2:
+                os.close(devnull)
+            _saved_stderr_fd = None
         os.dup2(write_fd, 2)
         # Point STD_ERROR_HANDLE at fd 2 *after* the duplication and before the
         # original write handle is closed: SetStdHandle stores a raw handle and

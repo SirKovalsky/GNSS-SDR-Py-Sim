@@ -237,7 +237,7 @@ class Bridge(QtCore.QObject):
     #: Native UHD stderr text, forwarded from the fd-2 reader thread.
     native = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(float, float, float, float)
-    #: Separate phase progress: ``(kind, frac, loops, sim_s, cyclic)``.
+    #: TX phase label for the single bar: ``(kind, frac, loops, sim_s, cyclic)``.
     phase = QtCore.pyqtSignal(str, float, int, float, bool)
     channels = QtCore.pyqtSignal(list)
     finished = QtCore.pyqtSignal(object)
@@ -335,6 +335,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ask_event = threading.Event()
         self._ask_result = [False]
         self._updating_range = False
+        #: True while a cyclic B210 transmission drives the single bar per pass.
+        self._cyclic_tx = False
         self._run_cfg: SimConfig | None = None
         self._truck_result: dict | None = None
         self._anim_idx = 0.0
@@ -437,9 +439,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_nav.setPlaceholderText("пусто = скачать автоматически")
         btn_nav = QtWidgets.QPushButton("…")
         btn_nav.setFixedWidth(32)
-        btn_nav.clicked.connect(
-            lambda: self._browse(self.ed_nav, "RINEX navigation",
-                                 _RINEX_FILTER, _RINEX_FILTER_ALL))
+        btn_nav.clicked.connect(self._browse_nav)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.ed_nav)
         row.addWidget(btn_nav)
@@ -519,7 +519,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_start.dateTimeChanged.connect(
             lambda *_: self._refresh_start_date_label())
 
-        # Coverage binding (B4): re-evaluate when the file/«now» changes.
+        # Coverage binding (B4 / issue 3): re-evaluate whenever the RINEX path
+        # changes — browsing, typing, a CDDIS download or the «now» checkbox.
+        self.ed_nav.textChanged.connect(self._on_nav_changed)
         self.ed_nav.editingFinished.connect(self._update_start_range)
         self.chk_now.toggled.connect(self._on_now_toggled)
         return g_nav
@@ -714,6 +716,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_start_cover.setText(text)
         # The date may have been clamped into the coverage range.
         self._refresh_start_date_label()
+
+    def _on_nav_changed(self, _text: str = "") -> None:
+        """Refresh the coverage window when the RINEX path changes (issue 3).
+
+        Called on ``ed_nav.textChanged`` (browse button, typing, CDDIS
+        completion) so the read-only date label and the editable start time
+        immediately reflect the file's actual epoch span.  While the user is
+        still typing a path that does not exist yet, only the date label is
+        refreshed (no RINEX parse); ``_update_start_range`` already guards
+        against recursion.
+        """
+        text = (self.ed_nav.text() or "").strip()
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        if parts and not all(os.path.exists(p) for p in parts):
+            self._refresh_start_date_label()
+            return
+        self._update_start_range()
+
+    def _browse_nav(self) -> None:
+        """Browse for a RINEX file; always refresh the coverage/date (issue 3)."""
+        before = self.ed_nav.text()
+        self._browse(self.ed_nav, "RINEX navigation",
+                     _RINEX_FILTER, _RINEX_FILTER_ALL)
+        if self.ed_nav.text() == before:
+            # Re-picking the same path emits no ``textChanged``; refresh anyway.
+            self._on_nav_changed()
 
     # ------------------------------------------------------------------
     def _set_nav_mode_note(self, moved=None) -> None:
@@ -1360,6 +1388,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl.addStretch(1)
         v.addLayout(ctrl)
 
+        # A single progress bar for the whole operation (issue 1): the value is
+        # produced/total samples for an IQ-file run, (pre-generation +
+        # transmission) over the total for a non-cyclic B210 run, and the
+        # current-pass fraction for a cyclic transmission (so it keeps moving
+        # instead of freezing at 100 %).  The label names the phase.
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setFormat("%p%")
@@ -1367,29 +1400,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_progress = QtWidgets.QLabel("Готово")
         self.lbl_progress.setWordWrap(True)
         v.addWidget(self.lbl_progress)
-
-        # Separate TX phase indicators: pre-generation has its own value, and
-        # transmission has a second bar that reaches 100 % only when the real
-        # stream is done (for cyclic TX it wraps every loop and shows
-        # elapsed/loop count instead of freezing at 100 %).
-        self.progress_pre = QtWidgets.QProgressBar()
-        self.progress_pre.setRange(0, 1000)
-        self.progress_pre.setFormat("предгенерация %p%")
-        self.progress_pre.setVisible(False)
-        self.lbl_progress_pre = QtWidgets.QLabel()
-        self.lbl_progress_pre.setWordWrap(True)
-        self.lbl_progress_pre.setVisible(False)
-        v.addWidget(self.progress_pre)
-        v.addWidget(self.lbl_progress_pre)
-        self.progress_tx = QtWidgets.QProgressBar()
-        self.progress_tx.setRange(0, 1000)
-        self.progress_tx.setFormat("передача %p%")
-        self.progress_tx.setVisible(False)
-        self.lbl_progress_tx = QtWidgets.QLabel()
-        self.lbl_progress_tx.setWordWrap(True)
-        self.lbl_progress_tx.setVisible(False)
-        v.addWidget(self.progress_tx)
-        v.addWidget(self.lbl_progress_tx)
 
         v.addWidget(QtWidgets.QLabel("Видимые спутники"))
         self.table = QtWidgets.QTableWidget(0, 5)
@@ -1754,21 +1764,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _launch(self, cfg: SimConfig) -> None:
         self.log.clear()
         self.table.setRowCount(0)
+        self._cyclic_tx = False
         self.progress.setValue(0)
+        self.progress.setFormat("%p%")
         if hasattr(self, "lbl_progress"):
             self.lbl_progress.setText("Подготовка…")
-        # Separate phase bars: only meaningful for a B210 transmission.
-        tx = bool(getattr(cfg, "use_usrp", False))
-        for bar, lab in ((getattr(self, "progress_pre", None),
-                          getattr(self, "lbl_progress_pre", None)),
-                         (getattr(self, "progress_tx", None),
-                          getattr(self, "lbl_progress_tx", None))):
-            if bar is not None:
-                bar.setValue(0)
-                bar.setVisible(tx)
-            if lab is not None:
-                lab.setText("")
-                lab.setVisible(tx)
         self.btn_start.setEnabled(False)
         self.btn_gen.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -2172,63 +2172,65 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_progress(self, frac: float, sim_s: float, wall: float,
                      rate: float) -> None:
-        try:
-            value = int(round(float(frac or 0.0) * 1000.0))
-        except (TypeError, ValueError):
-            value = 0
-        self.progress.setValue(max(0, min(1000, value)))
-        # Make it explicit whether the bar tracks IQ-file generation (no radio)
-        # or B210 transmission.
-        tx = bool(self._run_cfg is not None and self._run_cfg.use_usrp)
-        verb = "Передача" if tx else "Генерация"
-        self.progress.setFormat(("передача " if tx else "генерация ") + "%p%")
-        if hasattr(self, "lbl_progress"):
-            self.lbl_progress.setText(
-                f"{verb}: {value / 10:.0f}% ({sim_s:.1f} с)")
-        self.setWindowTitle(
-            f"{_APP_TITLE} — {sim_s:.1f} с / {wall:.1f} с ({rate:.2f}x)")
+        """Drive the single progress bar from the runner's overall fraction.
 
-    def _on_phase(self, kind: str, frac: float,
-                  loops: int, sim_s: float, cyclic: bool) -> None:
-        """Drive the separate pre-generation / transmission progress bars.
-
-        Pre-generation (``"pregen"``) has its own 0…100 % value.  Transmission
-        (``"tx"``) has a second 0…100 % bar over the *actual* stream; for a
-        cyclic transmission it wraps every loop and is labelled
-        «циклическая передача» with the elapsed time and loop count, so it
-        never freezes at 100 % while the signal keeps playing.
+        The fraction is produced/total for an IQ-file run and
+        (pre-generation + transmission) over the total for a non-cyclic B210
+        run.  For a cyclic transmission ``_on_phase`` owns the bar so it wraps
+        every pass; here we only keep the window title fresh.
         """
         try:
             value = int(round(float(frac or 0.0) * 1000.0))
         except (TypeError, ValueError):
             value = 0
         value = max(0, min(1000, value))
+        # Make it explicit whether the bar tracks IQ-file generation (no radio)
+        # or B210 transmission.
+        tx = bool(self._run_cfg is not None and self._run_cfg.use_usrp)
+        if not self._cyclic_tx:
+            self.progress.setValue(value)
+            self.progress.setFormat(("передача " if tx else "генерация ") + "%p%")
+            if hasattr(self, "lbl_progress"):
+                verb = "Передача" if tx else "Генерация"
+                self.lbl_progress.setText(
+                    f"{verb}: {value / 10:.0f}% ({sim_s:.1f} с)")
+        self.setWindowTitle(
+            f"{_APP_TITLE} — {sim_s:.1f} с / {wall:.1f} с ({rate:.2f}x)")
+
+    def _on_phase(self, kind: str, frac: float,
+                  loops: int, sim_s: float, cyclic: bool) -> None:
+        """Update the single bar's status label for the current TX phase.
+
+        The bar value itself is the overall fraction from :meth:`_on_progress`
+        for a non-cyclic B210 run (pre-generation then transmission, two
+        segments of the *same* bar).  A cyclic transmission instead wraps the
+        bar every pass and labels it «циклическая передача» with the elapsed
+        time and pass number, so it never freezes at 100 %.
+        """
+        try:
+            value = int(round(float(frac or 0.0) * 1000.0))
+        except (TypeError, ValueError):
+            value = 0
+        value = max(0, min(1000, value))
+        lab = getattr(self, "lbl_progress", None)
         if kind == "pregen":
-            bar = getattr(self, "progress_pre", None)
-            lab = getattr(self, "lbl_progress_pre", None)
-            if bar is not None:
-                bar.setVisible(True)
-                bar.setValue(value)
+            self._cyclic_tx = False
             if lab is not None:
-                lab.setVisible(True)
                 lab.setText(f"Предгенерация: {value / 10:.0f}% "
                             f"({sim_s:.1f} с сигнала)")
             return
         if kind != "tx":
             return
-        bar = getattr(self, "progress_tx", None)
-        lab = getattr(self, "lbl_progress_tx", None)
-        if bar is not None:
-            bar.setVisible(True)
-            bar.setValue(value)
-            bar.setFormat(("циклическая передача %p%" if cyclic
-                           else "передача %p%"))
-        if lab is not None:
-            lab.setVisible(True)
-            if cyclic:
-                lab.setText(f"Циклическая передача: {value / 10:.0f}% "
-                            f"(проход {int(loops) + 1}, {sim_s:.1f} с)")
-            else:
+        if cyclic:
+            self._cyclic_tx = True
+            self.progress.setValue(value)
+            self.progress.setFormat("циклическая передача %p%")
+            if lab is not None:
+                lab.setText(f"Циклическая передача: проход {int(loops) + 1}, "
+                            f"{sim_s:.1f} с (цикл {value / 10:.0f}%)")
+        else:
+            self._cyclic_tx = False
+            if lab is not None:
                 lab.setText(f"Передача: {value / 10:.0f}% ({sim_s:.1f} с)")
 
     def _on_channels(self, chans: list) -> None:
@@ -2249,15 +2251,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "lbl_progress"):
                 self.lbl_progress.setText(f"Ошибка: {err}")
         else:
+            self._cyclic_tx = False
+            self.progress.setFormat("%p%")
             self.progress.setValue(1000)
             if hasattr(self, "lbl_progress"):
                 self.lbl_progress.setText("Готово")
-            # A finished (non-cyclic) transmission reaches 100 % exactly once,
-            # when the stream is actually done.
-            for bar in (getattr(self, "progress_pre", None),
-                        getattr(self, "progress_tx", None)):
-                if bar is not None and bar.isVisible():
-                    bar.setValue(1000)
         self._update_channel_validity()
 
     # ------------------------------------------------------------------

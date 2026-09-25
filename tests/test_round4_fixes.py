@@ -3,9 +3,10 @@
 Covers:
 A) ephemeris coverage / start date comes from the ACTUAL RINEX epochs
    (earliest…latest record epoch), not the old ``toe ± 6 h`` heuristic;
-B) separate pre-generation and transmission progress, cyclic-TX labelling;
+B) a single progress bar with per-phase labels (pre-generation / transmission
+   are two segments of the same bar; cyclic TX wraps it and shows the pass);
 C) captured native UHD stderr really reaches the GUI journal (plain/coloured)
-   and the Windows ``STD_ERROR_HANDLE`` redirect keeps a valid handle.
+   end-to-end, including the Windows ``STD_ERROR_HANDLE`` redirect.
 
 Headless, no hardware, no network::
 
@@ -208,20 +209,92 @@ def test_phase_events_cyclic_tx_wraps_and_counts_loops() -> None:
     assert all(0.0 <= p[1] <= 1.0 for p in tx)
 
 
-def test_gui_on_phase_drives_separate_bars() -> None:
+def test_gui_single_progress_bar_phase_labels() -> None:
+    """The generation tab keeps exactly ONE bar for the whole operation."""
+    from PyQt5 import QtWidgets
     from gnss_sim.gui import MainWindow
 
     app = _app()
     win = MainWindow()
     try:
-        win._on_phase("pregen", 0.5, 0, 12.0, False)
-        assert win.progress_pre.value() == 500
-        assert "Предгенерация" in win.lbl_progress_pre.text()
+        bars = win.findChildren(QtWidgets.QProgressBar)
+        assert len(bars) == 1
+        assert not hasattr(win, "progress_pre")
+        assert not hasattr(win, "progress_tx")
+        assert not hasattr(win, "lbl_progress_pre")
+        assert not hasattr(win, "lbl_progress_tx")
+
+        win._run_cfg = SimConfig(use_usrp=True)
+        # Pre-generation: the bar carries the overall (pregen+tx) value while
+        # the label names the phase.
+        win._on_progress(0.25, 5.0, 5.0, 1.0)
+        win._on_phase("pregen", 0.5, 0, 6.0, False)
+        assert win.progress.value() == 250
+        assert "Предгенерация" in win.lbl_progress.text()
+
+        # Non-cyclic transmission: same bar, combined value; phase in label.
+        win._on_progress(0.75, 15.0, 15.0, 1.0)
+        win._on_phase("tx", 0.5, 0, 15.0, False)
+        assert win.progress.value() == 750
+        assert "Передача" in win.lbl_progress.text()
+
+        # Cyclic transmission: the SAME bar wraps every pass and the label
+        # shows elapsed time and pass number.
         win._on_phase("tx", 0.25, 2, 30.0, True)
-        assert win.progress_tx.value() == 250
-        assert "циклическая передача" in win.progress_tx.format().lower()
-        assert "Циклическая передача" in win.lbl_progress_tx.text()
-        assert "проход 3" in win.lbl_progress_tx.text()
+        assert win.progress.value() == 250
+        assert "циклическая передача" in win.progress.format().lower()
+        assert "Циклическая передача" in win.lbl_progress.text()
+        assert "проход 3" in win.lbl_progress.text()
+        # A late overall update must not clobber the wrapping cyclic bar.
+        win._on_progress(0.9, 35.0, 35.0, 1.0)
+        assert win.progress.value() == 250
+        # Finishing resets the cyclic flag and completes the bar.
+        win._on_finished(None)
+        assert win.progress.value() == 1000
+    finally:
+        win.close()
+    del app
+
+
+def test_gui_setting_nav_path_updates_date_immediately(tmp_path) -> None:
+    """Set the RINEX path (as textChanged does) → window/date refresh at once.
+
+    No explicit ``_update_start_range`` call: the ``ed_nav.textChanged`` wiring
+    added for issue 3 must move the stale 2026/09/25 start to the file date.
+    """
+    from PyQt5 import QtCore
+    from gnss_sim.gui import MainWindow
+
+    app = _app()
+    win = MainWindow()
+    try:
+        # Keep the initial toggle from resolving anything until the file is set.
+        win._coverage_by_sv = lambda *a, **k: None
+        win.chk_now.setChecked(False)
+        win.ed_start.setDateTimeRange(
+            QtCore.QDateTime(2000, 1, 1, 0, 0, 0),
+            QtCore.QDateTime(2100, 1, 1, 0, 0, 0))
+        win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 25, 12, 0, 0))
+        win._refresh_start_date_label()
+        assert "2026/09/25" in win.lbl_start_date.text()
+
+        lo = date2gps(2026, 9, 23, 0, 0, 0)
+        hi = date2gps(2026, 9, 23, 12, 0, 0)
+        e_lo, e_hi = Ephemeris(), Ephemeris()
+        e_lo.toc = lo
+        e_hi.toc = hi
+        win._coverage_by_sv = lambda *a, **k: {"G01": [e_lo, e_hi]}
+
+        nav = tmp_path / "BRDC00IGS_R_20262660000_01D_MN.rnx"
+        nav.write_text("", encoding="utf-8")
+        # Only setText — the textChanged handler must do the refresh.
+        win.ed_nav.setText(str(nav))
+
+        assert win.ed_start.date().toPyDate().isoformat() == "2026-09-23"
+        assert "2026/09/23" in win.lbl_start_date.text()
+        assert "RINEX" in win.lbl_start_cover.text()
+        assert win.ed_start.minimumDateTime().date().toPyDate().isoformat() == (
+            "2026-09-23")
     finally:
         win.close()
     del app
@@ -300,3 +373,80 @@ def test_native_std_error_handle_reaches_sink(tmp_path) -> None:
                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     assert proc.returncode == 0, proc.stderr
     assert b"SINK:[INFO] via STD_ERROR_HANDLE" in proc.stdout
+
+
+#: Helper script: capture native stderr, build the real MainWindow, then write a
+#: plain line through fd 2 and a warning through ``STD_ERROR_HANDLE``.  It
+#: asserts inside the child that both reached the GUI journal (plain warning
+#: uncoloured / genuine warning coloured) and prints ``PROBE_OK=True``.
+_NATIVE_GUI_PROBE = r'''
+import os, sys, time, ctypes
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, r"__ROOT__")
+from gnss_sim import nativelog
+from gnss_sim.gui import MainWindow, _LOG_WARN_COLOR
+from PyQt5 import QtWidgets
+
+nativelog.install_native_stderr_filter(force=True)
+app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+win = MainWindow()
+
+# UHD writes via the C runtime (fd 2) — an "error" word in an [INFO] line must
+# stay plain.
+os.write(2, b"[INFO] plain with error word\n")
+# Some UHD/CRT combinations go straight to the Win32 standard-error handle.
+h = ctypes.windll.kernel32.GetStdHandle(-12)
+msg = b"[WARNING] native warning\n"
+n = ctypes.c_ulong(0)
+ctypes.windll.kernel32.WriteFile(h, msg, len(msg), ctypes.byref(n), None)
+
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    app.processEvents()
+    time.sleep(0.02)
+
+plain = win.log.toPlainText()
+doc = win.log.document()
+colors = {}
+for i in range(doc.blockCount()):
+    blk = doc.findBlockByNumber(i)
+    it = blk.begin(); cs = set()
+    while not it.atEnd():
+        fr = it.fragment()
+        if fr.isValid():
+            cs.add(fr.charFormat().foreground().color().name())
+        it += 1
+    colors[blk.text()] = cs
+
+ok = (("[INFO] plain with error word" in plain)
+      and ("[WARNING] native warning" in plain)
+      and colors.get("[INFO] plain with error word") == {"#000000"}
+      and colors.get("[WARNING] native warning") == {_LOG_WARN_COLOR})
+sys.stdout.write("PROBE_OK=" + str(ok) + "\n")
+sys.stdout.flush()
+win.close()
+'''
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"),
+                    reason="Windows native stderr -> GUI journal")
+def test_native_stderr_end_to_end_reaches_gui_journal(tmp_path) -> None:
+    """UHD's native stderr must reach the real GUI journal (issue 2).
+
+    A helper process installs the fd-2 / ``STD_ERROR_HANDLE`` capture, builds
+    the actual ``MainWindow``, and writes a plain line through fd 2 plus a
+    warning through ``GetStdHandle(-12)``.  The child asserts the journal shows
+    both and colours only the genuine ``[WARNING]``.
+    """
+    script = tmp_path / "native_gui_probe.py"
+    script.write_text(_NATIVE_GUI_PROBE.replace("__ROOT__", _ROOT),
+                      encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True,
+                          env=env, timeout=120)
+    out = proc.stdout.decode("utf-8", "replace")
+    err = proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 0, (out, err)
+    assert "PROBE_OK=True" in out, (out, err)
+
