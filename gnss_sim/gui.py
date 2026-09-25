@@ -7,13 +7,13 @@ lets you click a haul route and turns it into a mining dump-truck motion file.
 
 from __future__ import annotations
 
-from .nativelog import (install_native_stderr_filter, quiet_uhd,
+from .nativelog import (install_native_stderr_filter, quiet_uhd_gui,
                         set_native_stderr_sink)
 
 # UHD must be imported *before* PyQt5 on Windows (creating a USRP after Qt has
-# loaded can crash with 0xC0000005); quiet it and capture its native stderr
-# before it loads.
-quiet_uhd()
+# loaded can crash with 0xC0000005); ask for its [INFO]/[WARNING] lines and
+# capture its native stderr before it loads.
+quiet_uhd_gui()
 install_native_stderr_filter()
 try:  # pragma: no cover - platform dependent
     import uhd  # noqa: F401
@@ -213,10 +213,13 @@ Galileo/BeiDou нужен merged-файл. Архивы <code>.gz</code> рас�
 </ul>
 
 <h3>Время старта</h3>
-<p>Поле «Время старта» — календарь (<code>гггг/ММ/дд чч:мм:сс</code>) и
-галочка <b>«Сейчас (UTC)»</b>. Если время выходит за диапазон загруженных
-эфемерид (toe ± окно), старт отклоняется с понятным сообщением; при
-автоскачивании проверка выполняется после загрузки файла.</p>
+<p>Дата старта берётся из <b>номера RINEX-файла</b> (его DOY), например
+<code>BRDC00IGS_R_20262670000_01D_MN.rnx</code> (DOY&nbsp;267) даёт
+<b>2026/09/24</b>; редактируется только <b>время</b> (ЧЧ:ММ:СС), дата —
+заблокирована. Окно покрытия — фактические эпохи RINEX
+<code>[начало, конец]</code>; старт вне окна отклоняется с понятным сообщением,
+а галочка <b>«Сейчас (UTC)»</b> снимается/блокируется, если файл не покрывает
+текущее время. При автоскачивании проверка выполняется после загрузки файла.</p>
 
 <h3>Списки и прокрутка</h3>
 <p>Колесо мыши над списком (частота, центр, источник, формат и т.п.) больше
@@ -337,6 +340,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._updating_range = False
         #: True while a cyclic B210 transmission drives the single bar per pass.
         self._cyclic_tx = False
+        #: Progress-widget state: ``_bar_switched`` is False while the
+        #: preparation/generation bar is visible and True once the transmission
+        #: bar replaced it; ``_pregen_seen`` records whether the runner already
+        #: emitted a distinct preparation phase for this run.
+        self._bar_switched = False
+        self._pregen_seen = False
+        self._phase_seen = False
         self._run_cfg: SimConfig | None = None
         self._truck_result: dict | None = None
         self._anim_idx = 0.0
@@ -353,6 +363,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # this just points it at the log widget.
         install_native_stderr_filter()
         set_native_stderr_sink(self.bridge.native.emit)
+
+    @property
+    def progress(self) -> QtWidgets.QProgressBar:
+        """The currently visible bar (preparation/generation or transmission).
+
+        Tests and the rest of the window use ``win.progress`` as a single handle;
+        it resolves to the bar the user is actually looking at.
+        """
+        return self.progress_tx if self._bar_switched else self.progress_prep
 
     # ==================================================================
     # UI construction
@@ -626,6 +645,27 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         return None
 
+    def _rinex_name_date(self):
+        """UTC date encoded in the selected RINEX file name(s), or ``None``.
+
+        ``ed_nav`` may hold a single path or a ``;``-joined per-system set; the
+        first name that parses wins.  Used to pin the read-only start DATE to
+        the file's own day (issue 3) instead of the earliest record epoch.
+        """
+        text = (self.ed_nav.text() or "").strip()
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        if not parts:
+            return None
+        try:
+            from .rinexfetch import date_from_rinex_name
+        except Exception:  # noqa: BLE001
+            return None
+        for part in parts:
+            found = date_from_rinex_name(part)
+            if found is not None:
+                return found
+        return None
+
     def _update_start_range(self) -> None:
         """Bind the start-time widget to the cached ephemeris coverage (B4).
 
@@ -647,6 +687,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_start_range_inner(self) -> None:
         from .config import parse_start_time
+        from .gpstime import gps2date
         try:
             now = parse_start_time("now")
             start = parse_start_time(self._start_text())
@@ -687,32 +728,55 @@ class MainWindow(QtWidgets.QMainWindow):
         start_dt = self._gps_to_qdt(start)
         note = check_start_coverage(start, by_sv)
         now_note = check_start_coverage(now, by_sv)
-        moved = None
         if now_note is not None:
             # The RINEX does not cover «now»: the checkbox cannot be used.
             if hasattr(self, "chk_now"):
                 self.chk_now.setChecked(False)
                 self.chk_now.setEnabled(False)
-            if note is not None:
-                # The current start is outside the file too: pull it to the
-                # RINEX start so the date label reflects the file (fixes the
-                # stale 2026/09/25 date when a 2026-09-23 file is loaded).
-                moved = lo
-                self.ed_start.setDateTime(self._gps_to_qdt(lo))
-        else:
-            if hasattr(self, "chk_now"):
-                self.chk_now.setEnabled(True)
-            if note is not None:
-                # Manual start outside the window: snap to the nearest edge.
-                moved = lo if start_dt < lo_dt else hi
-                self.ed_start.setDateTime(self._gps_to_qdt(moved))
+        elif hasattr(self, "chk_now"):
+            self.chk_now.setEnabled(True)
+
+        # Issue 3: the DATE comes from the RINEX file NUMBER (its day-of-year),
+        # not from the earliest record epoch.  A merged/per-system file for DOY
+        # 267 covers 2026-09-24 but its earliest ``toc`` can be 2026-09-23
+        # 23:30; pinning the start to the previous day made a ZED-F9P reject
+        # the ephemerides.  The [RINEX start, RINEX end] span is still kept for
+        # validation, and the time-of-day stays editable.
+        file_date = self._rinex_name_date()
+        now_date = tuple(gps2date(now)[:3])
+        moved_dt: QtCore.QDateTime | None = None
+        if file_date is not None:
+            if ((file_date.year, file_date.month, file_date.day) != now_date
+                    and hasattr(self, "chk_now")):
+                # A file from another day: «now» must not override its date.
+                self.chk_now.setChecked(False)
+            _, _, _, sh, sm, ss = gps2date(start)
+            target = QtCore.QDateTime(file_date.year, file_date.month,
+                                      file_date.day, sh, sm, int(ss))
+            target.setTimeSpec(QtCore.Qt.UTC)
+            if target < lo_dt:
+                target = lo_dt
+            elif target > hi_dt:
+                target = hi_dt
+            moved_dt = target
+            self.ed_start.setDateTime(target)
+        elif note is not None:
+            # No RINEX name date (e.g. a synthetic/hand-made file): snap the
+            # out-of-range start to the nearest span edge (previous behaviour).
+            moved = lo if start_dt < lo_dt else hi
+            self.ed_start.setDateTime(self._gps_to_qdt(moved))
         text = "Покрытие эфемерид (RINEX): " + window
-        if moved is not None:
-            md = self._gps_to_qdt(moved)
-            text += (". Старт вне диапазона — переведён на "
-                     f"{md.toString('yyyy/MM/dd HH:mm')}")
-            if now_note is not None:
-                text += " («Сейчас (UTC)» недоступно: RINEX не покрывает now)"
+        if file_date is not None:
+            text += (". Дата старта из имени файла: "
+                     f"{file_date.year:04d}/{file_date.month:02d}/"
+                     f"{file_date.day:02d}")
+        if moved_dt is not None:
+            text += ("; старт на "
+                     f"{moved_dt.toString('yyyy/MM/dd HH:mm')}")
+        if now_note is not None:
+            text += " («Сейчас (UTC)» недоступно: RINEX не покрывает now)"
+        elif note is not None and file_date is None:
+            text += ("; старт вне диапазона — переведён на ближайшую границу")
         self.lbl_start_cover.setText(text)
         # The date may have been clamped into the coverage range.
         self._refresh_start_date_label()
@@ -1388,15 +1452,27 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl.addStretch(1)
         v.addLayout(ctrl)
 
-        # A single progress bar for the whole operation (issue 1): the value is
-        # produced/total samples for an IQ-file run, (pre-generation +
-        # transmission) over the total for a non-cyclic B210 run, and the
-        # current-pass fraction for a cyclic transmission (so it keeps moving
-        # instead of freezing at 100 %).  The label names the phase.
-        self.progress = QtWidgets.QProgressBar()
-        self.progress.setRange(0, 1000)
-        self.progress.setFormat("%p%")
-        v.addWidget(self.progress)
+        # One visible bar area (issue 1), implemented as a stack of two bars so
+        # the widget can be REPLACED when the phase changes:
+        #   * preparation/generation fills 0→100 % completely;
+        #   * when preparation finishes (or right before the first sample is
+        #     sent) the visible widget becomes the transmission bar, reset to 0,
+        #     labelled «Передача», and fills as samples are sent;
+        #   * a pure IQ-file run never shows the transmission bar and keeps the
+        #     generation bar at 100 %;
+        #   * a cyclic transmission keeps wrapping the transmission bar per pass
+        #     («циклическая передача» + elapsed/pass).
+        self.progress_stack = QtWidgets.QStackedWidget()
+        self.progress_prep = QtWidgets.QProgressBar()
+        self.progress_prep.setRange(0, 1000)
+        self.progress_prep.setFormat("%p%")
+        self.progress_tx = QtWidgets.QProgressBar()
+        self.progress_tx.setRange(0, 1000)
+        self.progress_tx.setFormat("%p%")
+        self.progress_stack.addWidget(self.progress_prep)
+        self.progress_stack.addWidget(self.progress_tx)
+        self.progress_stack.setCurrentWidget(self.progress_prep)
+        v.addWidget(self.progress_stack)
         self.lbl_progress = QtWidgets.QLabel("Готово")
         self.lbl_progress.setWordWrap(True)
         v.addWidget(self.lbl_progress)
@@ -1765,10 +1841,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.clear()
         self.table.setRowCount(0)
         self._cyclic_tx = False
-        self.progress.setValue(0)
-        self.progress.setFormat("%p%")
+        self._pregen_seen = False
+        self._phase_seen = False
+        self._bar_switched = False
+        self.progress_stack.setCurrentWidget(self.progress_prep)
+        self.progress_prep.setValue(0)
+        self.progress_prep.setFormat("%p%")
+        self.progress_tx.setValue(0)
+        self.progress_tx.setFormat("%p%")
         if hasattr(self, "lbl_progress"):
             self.lbl_progress.setText("Подготовка…")
+        # A reused IQ file has no synthesis step: when it is streamed to the
+        # radio show the transmission bar straight away (the runner emits only
+        # an overall fraction there, which ``_on_progress`` feeds to it).
+        if cfg.iq_input and cfg.use_usrp:
+            self._switch_to_tx_bar()
         self.btn_start.setEnabled(False)
         self.btn_gen.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -2172,40 +2259,62 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_progress(self, frac: float, sim_s: float, wall: float,
                      rate: float) -> None:
-        """Drive the single progress bar from the runner's overall fraction.
+        """Drive the visible bar from the runner's overall fraction.
 
-        The fraction is produced/total for an IQ-file run and
-        (pre-generation + transmission) over the total for a non-cyclic B210
-        run.  For a cyclic transmission ``_on_phase`` owns the bar so it wraps
-        every pass; here we only keep the window title fresh.
+        The overall fraction is only used while no phase signal has taken over:
+        a pure IQ-file run (no radio) has no ``phase`` callback, so this fills
+        the preparation/generation bar to 100 % and it stays there.  A B210 run
+        is driven by :meth:`_on_phase` (preparation 0…100 %, then the
+        transmission bar), so late overall values must not clobber it.
         """
         try:
             value = int(round(float(frac or 0.0) * 1000.0))
         except (TypeError, ValueError):
             value = 0
         value = max(0, min(1000, value))
-        # Make it explicit whether the bar tracks IQ-file generation (no radio)
-        # or B210 transmission.
-        tx = bool(self._run_cfg is not None and self._run_cfg.use_usrp)
-        if not self._cyclic_tx:
-            self.progress.setValue(value)
-            self.progress.setFormat(("передача " if tx else "генерация ") + "%p%")
+        # Until the runner reports a distinct phase, the overall fraction drives
+        # whichever bar is visible: preparation/generation by default, the
+        # transmission bar for a reused IQ file streamed straight to the radio.
+        # Once a phase signal arrived the phase owns the bar.
+        if not self._phase_seen:
+            tx = bool(self._run_cfg is not None and self._run_cfg.use_usrp)
+            bar = self.progress_tx if self._bar_switched else self.progress_prep
+            bar.setValue(value)
             if hasattr(self, "lbl_progress"):
-                verb = "Передача" if tx else "Генерация"
-                self.lbl_progress.setText(
-                    f"{verb}: {value / 10:.0f}% ({sim_s:.1f} с)")
+                if self._bar_switched:
+                    bar.setFormat("передача %p%")
+                    self.lbl_progress.setText(
+                        f"Передача: {value / 10:.0f}% ({sim_s:.1f} с)")
+                elif tx:
+                    bar.setFormat("подготовка %p%")
+                    self.lbl_progress.setText(
+                        f"Подготовка: {value / 10:.0f}% ({sim_s:.1f} с)")
+                else:
+                    bar.setFormat("генерация %p%")
+                    self.lbl_progress.setText(
+                        f"Генерация: {value / 10:.0f}% ({sim_s:.1f} с)")
         self.setWindowTitle(
             f"{_APP_TITLE} — {sim_s:.1f} с / {wall:.1f} с ({rate:.2f}x)")
 
+    def _switch_to_tx_bar(self) -> None:
+        """Replace the preparation widget with the transmission bar (reset to 0)."""
+        if not self._bar_switched:
+            self.progress_tx.setValue(0)
+            self.progress_tx.setFormat("%p%")
+            if hasattr(self, "lbl_progress"):
+                self.lbl_progress.setText("Передача…")
+        self._bar_switched = True
+        self.progress_stack.setCurrentWidget(self.progress_tx)
+
     def _on_phase(self, kind: str, frac: float,
                   loops: int, sim_s: float, cyclic: bool) -> None:
-        """Update the single bar's status label for the current TX phase.
+        """Update the preparation or transmission bar for the current phase.
 
-        The bar value itself is the overall fraction from :meth:`_on_progress`
-        for a non-cyclic B210 run (pre-generation then transmission, two
-        segments of the *same* bar).  A cyclic transmission instead wraps the
-        bar every pass and labels it «циклическая передача» with the elapsed
-        time and pass number, so it never freezes at 100 %.
+        ``pregen`` fills the preparation bar 0…100 %; when it completes (or on
+        the first ``tx`` update, i.e. right before sending) the visible widget is
+        replaced by the transmission bar, reset to 0.  A cyclic transmission
+        wraps that bar every pass and labels it «циклическая передача» with the
+        elapsed time and pass number, so it never freezes at 100 %.
         """
         try:
             value = int(round(float(frac or 0.0) * 1000.0))
@@ -2213,23 +2322,35 @@ class MainWindow(QtWidgets.QMainWindow):
             value = 0
         value = max(0, min(1000, value))
         lab = getattr(self, "lbl_progress", None)
+        self._phase_seen = True
         if kind == "pregen":
             self._cyclic_tx = False
-            if lab is not None:
-                lab.setText(f"Предгенерация: {value / 10:.0f}% "
-                            f"({sim_s:.1f} с сигнала)")
+            self._pregen_seen = True
+            if not self._bar_switched:
+                self.progress_prep.setValue(value)
+                self.progress_prep.setFormat("подготовка %p%")
+                if lab is not None:
+                    lab.setText(f"Подготовка: {value / 10:.0f}% "
+                                f"({sim_s:.1f} с сигнала)")
+            if value >= 1000:
+                # Preparation is complete: replace the widget with the TX bar.
+                self._switch_to_tx_bar()
             return
         if kind != "tx":
             return
+        # First TX update (or end of pre-generation): show the TX bar, reset.
+        self._switch_to_tx_bar()
         if cyclic:
             self._cyclic_tx = True
-            self.progress.setValue(value)
-            self.progress.setFormat("циклическая передача %p%")
+            self.progress_tx.setValue(value)
+            self.progress_tx.setFormat("циклическая передача %p%")
             if lab is not None:
                 lab.setText(f"Циклическая передача: проход {int(loops) + 1}, "
                             f"{sim_s:.1f} с (цикл {value / 10:.0f}%)")
         else:
             self._cyclic_tx = False
+            self.progress_tx.setValue(value)
+            self.progress_tx.setFormat("передача %p%")
             if lab is not None:
                 lab.setText(f"Передача: {value / 10:.0f}% ({sim_s:.1f} с)")
 
@@ -2352,10 +2473,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
-    # Re-assert the quiet UHD level/log capture in case this entry point is used
+    # Re-assert the GUI UHD level/log capture in case this entry point is used
     # directly (``python -m gnss_sim.gui``); MainWindow points the sink at its
     # own log widget.
-    quiet_uhd()
+    quiet_uhd_gui()
     install_native_stderr_filter()
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()

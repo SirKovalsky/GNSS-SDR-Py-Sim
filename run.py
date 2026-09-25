@@ -8,12 +8,12 @@ precaution used by the SDR_Scan application).
 import os
 import sys
 
-# Keep UHD at its quietest level and make sure its native stderr (including the
-# bare ``U``/``O`` under/overflow markers that bypass UHD_LOG_LEVEL) never paints
-# the console orange.  Both must happen before the first ``import uhd``.
-from gnss_sim.nativelog import install_native_stderr_filter, quiet_uhd
+# Keep UHD's native stderr (including the bare ``U``/``O`` under/overflow markers
+# that bypass UHD_LOG_LEVEL) out of the console and route its ``[INFO]`` lines
+# into the GUI journal.  Both must happen before the first ``import uhd``.
+from gnss_sim.nativelog import (install_native_stderr_filter, quiet_uhd_gui)
 
-quiet_uhd()
+quiet_uhd_gui()
 install_native_stderr_filter()
 
 try:  # pragma: no cover - platform dependent

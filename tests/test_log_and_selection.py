@@ -40,6 +40,25 @@ def test_quiet_uhd_defaults_to_fatal(monkeypatch) -> None:
     assert os.environ["UHD_LOG_LEVEL"] == "error"
 
 
+def test_gui_requests_uhd_info_level(monkeypatch) -> None:
+    """The GUI must ask UHD for ``[INFO]`` lines (issue 2).
+
+    The CLI keeps the quiet default; a real B210 run showed no UHD output
+    because ``UHD_LOG_LEVEL=fatal`` suppressed the logger before the capture
+    could forward anything.  The GUI therefore sets ``info`` explicitly (an
+    explicit environment override still wins).
+    """
+    from gnss_sim.nativelog import GUI_UHD_LOG_LEVEL, quiet_uhd_gui
+
+    monkeypatch.delenv("UHD_LOG_LEVEL", raising=False)
+    assert GUI_UHD_LOG_LEVEL == "info"
+    assert quiet_uhd_gui() == "info"
+    assert os.environ["UHD_LOG_LEVEL"] == "info"
+    # An explicit env override is preserved for debugging.
+    monkeypatch.setenv("UHD_LOG_LEVEL", "debug")
+    assert quiet_uhd_gui() == "debug"
+
+
 def test_clean_native_text_strips_lone_markers() -> None:
     # The B200 async handler emits bare U/O/L characters without a newline.
     assert clean_native_text("UU[INFO] ok\n") == "[INFO] ok\n"

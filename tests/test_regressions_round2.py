@@ -102,8 +102,13 @@ def test_gui_progress_format_distinguishes_generation_and_tx() -> None:
         assert win.progress.value() == 500
         assert "генерация" in win.progress.format()
         assert win.lbl_progress.text().startswith("Генерация")
+        # A B210 run keeps the preparation bar until a tx phase replaces it.
         win._run_cfg = SimConfig(use_usrp=True)
         win._on_progress(0.5, 1.0, 1.0, 1.0)
+        assert "подготовка" in win.progress.format()
+        assert win.lbl_progress.text().startswith("Подготовка")
+        win._on_phase("tx", 0.5, 0, 1.0, False)
+        assert win.progress is win.progress_tx
         assert "передача" in win.progress.format()
         assert win.lbl_progress.text().startswith("Передача")
     finally:

@@ -2,9 +2,11 @@
 
 Covers:
 A) ephemeris coverage / start date comes from the ACTUAL RINEX epochs
-   (earliest…latest record epoch), not the old ``toe ± 6 h`` heuristic;
-B) a single progress bar with per-phase labels (pre-generation / transmission
-   are two segments of the same bar; cyclic TX wraps it and shows the pass);
+   (earliest…latest record epoch) for validation, while the displayed DATE is
+   taken from the RINEX file NUMBER (day-of-year), not the earliest toc;
+B) a preparation bar fills 0→100 % completely, then the visible widget is
+   replaced by the transmission bar (reset to 0); cyclic TX wraps it and shows
+   the pass; a pure IQ-file run keeps the generation bar at 100 %;
 C) captured native UHD stderr really reaches the GUI journal (plain/coloured)
    end-to-end, including the Windows ``STD_ERROR_HANDLE`` redirect.
 
@@ -37,6 +39,8 @@ from gnss_sim.runner import SimulationRunner  # noqa: E402
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DOY266 = os.path.join(
     _ROOT, "rinex_cache", "BRDC00IGS_R_20262660000_01D_MN.rnx")
+_DOY267 = os.path.join(
+    _ROOT, "rinex_cache", "BRDC00IGS_R_20262670000_01D_MN.rnx")
 
 
 def _app():
@@ -121,8 +125,10 @@ def test_gui_window_matches_rinex_epochs_without_margin() -> None:
             hy, hm, hd)
         assert (hi.time().hour(), hi.time().minute()) == (hhh, hmi)
         assert "RINEX" in win.lbl_start_cover.text()
-        # The stale «now» date (2026/09/25) is replaced by the file start.
-        assert f"{ey:04d}/{em:02d}/{ed:02d}" in win.lbl_start_date.text()
+        # The DATE comes from the file NUMBER (DOY 266 -> 2026/09/23), not from
+        # the earliest record epoch (2026/09/22 23:30) — issue 3.
+        assert "2026/09/23" in win.lbl_start_date.text()
+        assert "2026/09/22" not in win.lbl_start_date.text()
         # The widget range has no extra ±6 h margin.
         assert lo == win.ed_start.minimumDateTime()
         assert hi == win.ed_start.maximumDateTime()
@@ -157,6 +163,78 @@ def test_gui_stale_date_replaced_by_resolved_rinex() -> None:
     finally:
         win.close()
     del app
+
+
+# ======================================================================
+# A2) start DATE from the RINEX file number (issue 3)
+# ======================================================================
+def test_date_from_rinex_name_patterns() -> None:
+    from gnss_sim.rinexfetch import date_from_rinex_name
+
+    # Merged multi-GNSS, with and without the gzip suffix.
+    assert date_from_rinex_name(
+        "BRDC00IGS_R_20262670000_01D_MN.rnx").isoformat() == "2026-09-24"
+    assert date_from_rinex_name(
+        "BRDC00IGS_R_20262670000_01D_MN.rnx.gz").isoformat() == "2026-09-24"
+    # Per-system (GPS/GLONASS/Galileo/BeiDou/QZSS) daily files.
+    assert date_from_rinex_name("brdc2670.26n").isoformat() == "2026-09-24"
+    assert date_from_rinex_name("brdc2670.26n.gz").isoformat() == "2026-09-24"
+    assert date_from_rinex_name("/cache/brdc2680.26g").isoformat() == (
+        "2026-09-25")
+    assert date_from_rinex_name("brdc2670.26c").isoformat() == "2026-09-24"
+    # Unknown names keep their own date (None -> caller keeps the old value).
+    assert date_from_rinex_name("my_custom_nav.rnx") is None
+    assert date_from_rinex_name("") is None
+
+
+@pytest.mark.skipif(not os.path.exists(_DOY267), reason="cached merged RINEX")
+def test_gui_start_date_from_rinex_number_doy267() -> None:
+    """DOY 267 -> 2026-09-24, even though the earliest toc is 09-23 23:30."""
+    from gnss_sim.gui import MainWindow
+    from gnss_sim.rinex import (check_start_coverage, ephemeris_epoch_span,
+                                parse_nav_file)
+
+    app = _app()
+    win = MainWindow()
+    try:
+        win.chk_now.setChecked(False)
+        win.ed_nav.setText(_DOY267)
+        win._update_start_range()
+        assert win.ed_start.date().toPyDate().isoformat() == "2026-09-24"
+        assert "2026/09/24" in win.lbl_start_date.text()
+        # The validation span is still the actual RINEX epoch span, and the
+        # file-date start is inside it (so a receiver can use the ephemerides).
+        by_sv, _ = parse_nav_file(_DOY267)
+        lo, hi = ephemeris_epoch_span(by_sv)
+        assert gps2date(lo)[:3] == (2026, 9, 23)
+        assert win.ed_start.minimumDateTime() <= win.ed_start.dateTime()
+        assert win.ed_start.dateTime() <= win.ed_start.maximumDateTime()
+        assert check_start_coverage(parse_start_time(win._start_text()),
+                                    by_sv) is None
+    finally:
+        win.close()
+    del app
+
+
+def test_broadcast_week_tow_consistent_with_rinex_day() -> None:
+    """Subframe-1 week number and HOW TOW must match the RINEX-day start."""
+    from gnss_sim.navmsg import eph2sbf, generate_nav_msg
+    from gnss_sim.rinex import check_start_coverage, parse_nav_file, select_ephemeris
+
+    if not os.path.exists(_DOY267):
+        pytest.skip("cached merged RINEX missing")
+    by_sv, iono = parse_nav_file(_DOY267)
+    start = date2gps(2026, 9, 24, 0, 0, 0)
+    assert check_start_coverage(start, by_sv) is None
+    eph = select_ephemeris(by_sv, "G01", start)
+    assert eph is not None
+    assert eph.toe.week == start.week
+    sbf = eph2sbf(eph, iono, transmit_week=start.week)
+    assert ((int(sbf[0][2]) >> 20) & 0x3FF) == start.week % 1024
+    dwrd = np.zeros(60, dtype=np.int64)
+    _, dwrd = generate_nav_msg(start, sbf, dwrd, 1)
+    tow = (int(dwrd[11]) >> 13) & 0x1FFFF  # subframe 1 HOW
+    assert tow * 6 == (start.sec // 6 + 1) * 6
 
 
 # ======================================================================
@@ -209,48 +287,76 @@ def test_phase_events_cyclic_tx_wraps_and_counts_loops() -> None:
     assert all(0.0 <= p[1] <= 1.0 for p in tx)
 
 
-def test_gui_single_progress_bar_phase_labels() -> None:
-    """The generation tab keeps exactly ONE bar for the whole operation."""
+def test_gui_progress_replaced_prep_then_tx() -> None:
+    """Issue 1: prep bar fills 0→100 %, then the transmission bar replaces it."""
     from PyQt5 import QtWidgets
     from gnss_sim.gui import MainWindow
 
     app = _app()
     win = MainWindow()
     try:
-        bars = win.findChildren(QtWidgets.QProgressBar)
-        assert len(bars) == 1
-        assert not hasattr(win, "progress_pre")
-        assert not hasattr(win, "progress_tx")
-        assert not hasattr(win, "lbl_progress_pre")
-        assert not hasattr(win, "lbl_progress_tx")
+        # One visible bar area: two bars in a stack, only one shown at a time.
+        stack = win.progress_stack
+        assert isinstance(stack, QtWidgets.QStackedWidget)
+        assert stack.count() == 2
+        assert stack.currentWidget() is win.progress_prep
+        assert win.progress is win.progress_prep
 
         win._run_cfg = SimConfig(use_usrp=True)
-        # Pre-generation: the bar carries the overall (pregen+tx) value while
-        # the label names the phase.
+        # Overall progress before any phase drives the preparation bar.
         win._on_progress(0.25, 5.0, 5.0, 1.0)
+        assert win.progress_prep.value() == 250
+        # Pre-generation fills the SAME preparation bar 0→100 % (own value).
         win._on_phase("pregen", 0.5, 0, 6.0, False)
-        assert win.progress.value() == 250
-        assert "Предгенерация" in win.lbl_progress.text()
+        assert win.progress.value() == 500
+        assert "Подготовка" in win.lbl_progress.text()
+        # Completing preparation REPLACES the widget with the TX bar, reset to 0.
+        win._on_phase("pregen", 1.0, 0, 12.0, False)
+        assert stack.currentWidget() is win.progress_tx
+        assert win.progress is win.progress_tx
+        assert win.progress_tx.value() == 0
 
-        # Non-cyclic transmission: same bar, combined value; phase in label.
-        win._on_progress(0.75, 15.0, 15.0, 1.0)
+        # Transmission fills the new bar from 0 again.
         win._on_phase("tx", 0.5, 0, 15.0, False)
-        assert win.progress.value() == 750
+        assert win.progress_tx.value() == 500
         assert "Передача" in win.lbl_progress.text()
+        # A late overall value must not clobber the transmission bar.
+        win._on_progress(0.9, 35.0, 35.0, 1.0)
+        assert win.progress_tx.value() == 500
 
-        # Cyclic transmission: the SAME bar wraps every pass and the label
-        # shows elapsed time and pass number.
+        # Cyclic transmission wraps the same bar every pass, shows the pass.
         win._on_phase("tx", 0.25, 2, 30.0, True)
-        assert win.progress.value() == 250
-        assert "циклическая передача" in win.progress.format().lower()
+        assert win.progress_tx.value() == 250
+        assert "циклическая передача" in win.progress_tx.format().lower()
         assert "Циклическая передача" in win.lbl_progress.text()
         assert "проход 3" in win.lbl_progress.text()
-        # A late overall update must not clobber the wrapping cyclic bar.
         win._on_progress(0.9, 35.0, 35.0, 1.0)
-        assert win.progress.value() == 250
-        # Finishing resets the cyclic flag and completes the bar.
+        assert win.progress_tx.value() == 250
+        # Finishing completes the visible bar.
         win._on_finished(None)
-        assert win.progress.value() == 1000
+        assert win.progress_tx.value() == 1000
+    finally:
+        win.close()
+    del app
+
+
+def test_gui_file_run_keeps_generation_bar() -> None:
+    """A pure IQ-file run stays on the generation bar (no TX widget) at 100 %."""
+    from gnss_sim.gui import MainWindow
+
+    app = _app()
+    win = MainWindow()
+    try:
+        win._run_cfg = SimConfig(use_usrp=False)
+        win._on_progress(0.5, 1.0, 1.0, 0.5)
+        assert win.progress is win.progress_prep
+        assert win.progress_prep.value() == 500
+        assert "генерация" in win.progress_prep.format()
+        win._on_progress(1.0, 2.0, 2.0, 0.5)
+        assert win.progress_prep.value() == 1000
+        win._on_finished(None)
+        assert win.progress is win.progress_prep
+        assert win.progress_prep.value() == 1000
     finally:
         win.close()
     del app

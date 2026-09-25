@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import gzip
 import os
+import re
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -87,6 +88,44 @@ def _shift_date(year: int, month: int, day: int,
                 delta_days: int) -> tuple[int, int, int]:
     dt = date(int(year), int(month), int(day)) + timedelta(days=int(delta_days))
     return dt.year, dt.month, dt.day
+
+
+#: Merged multi-GNSS daily file: ``BRDC00IGS_R_{YYYY}{DOY:03d}0000_01D_MN.rnx``.
+_MERGED_NAME_RE = re.compile(
+    r"BRDC00IGS_R_(\d{4})(\d{3})\d{4}_\d{2}D_MN\.rnx", re.IGNORECASE)
+#: Per-system daily file: ``brdc{DOY:03d}0.{yy}n`` (suffix n/g/l/c/j, optional
+#: ``.gz``).  The two-digit year is a 20xx year for the modern era.
+_SYSTEM_NAME_RE = re.compile(r"brdc(\d{3})0\.(\d{2})[a-z]", re.IGNORECASE)
+
+
+def date_from_rinex_name(path: str) -> date | None:
+    """Return the UTC calendar date encoded in a daily RINEX file name.
+
+    Handles both the merged multi-GNSS form
+    ``BRDC00IGS_R_{YYYY}{DOY:03d}0000_01D_MN.rnx[.gz]`` and the per-system form
+    ``brdc{DOY:03d}0.{yy}[n/g/l/c/j][.gz]`` (``yy`` -> ``20yy``).  Unlike the
+    earliest record epoch (``toc``), which can fall on the previous UTC day, the
+    name's day-of-year is authoritative for "which day this file covers"; the
+    GUI uses it to pin the read-only start date.  Returns ``None`` when the name
+    does not match (so arbitrary user files keep their own dates).
+    """
+    base = os.path.basename(str(path or ""))
+    if base.lower().endswith(".gz"):
+        base = base[:-3]
+    match = _MERGED_NAME_RE.search(base)
+    if match:
+        year, doy = int(match.group(1)), int(match.group(2))
+    else:
+        match = _SYSTEM_NAME_RE.search(base)
+        if not match:
+            return None
+        doy, yy = int(match.group(1)), int(match.group(2))
+        year = 2000 + yy if yy < 80 else 1900 + yy
+    try:
+        y, m, d = date_from_doy(year, doy)
+    except ValueError:
+        return None
+    return date(y, m, d)
 
 
 def _doy(year: int, month: int, day: int) -> int:  # backwards compatible name
