@@ -208,16 +208,19 @@ def test_gui_b1i_basic_advanced_sync() -> None:
     app = _app()
     win = MainWindow()
     try:
-        # Defaults: B1I selected, Advanced opt-in available.
-        assert win.cb_bds.isChecked()
-        assert win.cb_combine.isEnabled()
-        # B1I off -> the Advanced opt-in is collapsed and its controls disabled.
-        win.cb_bds.setChecked(False)
-        assert not win.cb_combine.isChecked()
+        # Default: B1I UNCHECKED, so the Advanced B1I controls are disabled.
+        assert not win.cb_bds.isChecked()
         assert not win.cb_combine.isEnabled()
         assert not win.cmb_b1i_data.isEnabled()
         assert not win.cb_auto_b1i.isEnabled()
+        # Selecting B1I in Basic enables the Advanced opt-in.
+        win.cb_bds.setChecked(True)
+        assert win.cb_combine.isEnabled()
+        assert win.cmb_b1i_data.isEnabled()
+        assert win.cb_auto_b1i.isEnabled()
         # Vice versa: ticking the Advanced opt-in selects B1I in Basic.
+        win.cb_bds.setChecked(False)
+        assert not win.cb_combine.isChecked()
         win.cb_combine.setChecked(True)
         assert win.cb_bds.isChecked()
         assert win.cb_combine.isChecked()

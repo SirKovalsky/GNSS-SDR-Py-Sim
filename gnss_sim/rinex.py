@@ -19,6 +19,7 @@ import os
 from dataclasses import dataclass, field
 
 from .constants import (
+    BDT_GPST_OFFSET_S, BDT_WEEK_OFFSET,
     GM_EARTH,
     POW2_M5, POW2_M19, POW2_M29, POW2_M31, POW2_M33,
     POW2_M43, POW2_M55,
@@ -492,10 +493,32 @@ def count_systems(path: str) -> dict[str, int]:
     return counts
 
 
+def ephemeris_toe_gps(eph: Ephemeris) -> GpsTime:
+    """Return ``eph.toe`` expressed in GPS time.
+
+    The RINEX BeiDou record stores ``toe`` in **BDT** (week = GPS week − 1356,
+    BDT = GPS − 14 s); without normalisation the coverage window of a merged
+    RINEX jumps to the year 2000 and the start-time field becomes unusable
+    (user issue 3).
+    """
+    if eph.system == "C":
+        sec = eph.toe.sec + BDT_GPST_OFFSET_S
+        week = eph.toe.week + BDT_WEEK_OFFSET
+        if sec >= SECONDS_IN_WEEK:
+            sec -= SECONDS_IN_WEEK
+            week += 1
+        return GpsTime(week, sec)
+    return eph.toe
+
+
 def ephemeris_toe_span(
         by_sv: dict[str, list[Ephemeris]]) -> tuple[GpsTime, GpsTime] | None:
-    """Return ``(min_toe, max_toe)`` over all parsed ephemerides, or ``None``."""
-    toes = [e.toe for sets in by_sv.values() for e in sets]
+    """Return ``(min_toe, max_toe)`` in GPS time, or ``None``.
+
+    BeiDou ``toe`` values are normalised from BDT to GPS (see
+    :func:`ephemeris_toe_gps`) so the span is meaningful for a mixed RINEX.
+    """
+    toes = [ephemeris_toe_gps(e) for sets in by_sv.values() for e in sets]
     if not toes:
         return None
     lo = min(toes, key=_abs_gps)

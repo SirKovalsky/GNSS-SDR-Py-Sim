@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="user motion file (10 Hz CSV, ECEF or Lat,Lon,Hgt)")
     p.add_argument("-t", "--start", default="now",
                    help="start time 'YYYY/MM/DD,hh:mm:ss' or 'now'")
-    p.add_argument("-d", "--duration", type=float, default=60.0,
+    p.add_argument("-d", "--duration", type=float, default=120.0,
                    help="duration [s] (0 = until stopped)")
     p.add_argument("--band", default="l1",
                    choices=["l1", "b1i", "all", "wide"],
@@ -152,6 +152,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The Windows console often uses a legacy code page (cp866/cp1251) that
+    # cannot encode the log's ``≥``/``→``/``·`` glyphs.  A raw ``print`` then
+    # raised ``UnicodeEncodeError`` inside ``run()`` and aborted the run before
+    # TX (observed during the COM3 investigation).  Never let encoding kill a
+    # run: replace unencodable characters instead.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:  # noqa: BLE001 - reconfigure is best effort
+            pass
+
     # UHD logs ``[INFO]``/``[WARNING]`` to stderr; on Windows PowerShell paints
     # any native stderr output orange/red and turns it into
     # ``NativeCommandError`` even when the process exit code is 0.  Keep UHD at

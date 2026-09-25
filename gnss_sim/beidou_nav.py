@@ -76,9 +76,8 @@ BCH_PARITY = 4
 #: g(X) = X**4 + X + 1 -> 0b10011
 BCH_POLY = 0b10011
 
-#: BDT reference constants (BDT = GPST - 14 s; BDT week = GPS week - 1356).
-BDT_GPST_OFFSET_S = 14.0
-BDT_WEEK_OFFSET = 1356
+#: BDT reference constants (single source of truth in :mod:`gnss_sim.constants`).
+from .constants import BDT_GPST_OFFSET_S, BDT_WEEK_OFFSET  # noqa: E402,F401
 
 
 # ----------------------------------------------------------------------

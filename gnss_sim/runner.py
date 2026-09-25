@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -52,6 +53,14 @@ _TX_RAM_BYTES = 8
 _TX_BLOCK_SECONDS = 0.1
 #: Default «контроль передачи» threshold (dB above the RX noise floor).
 _TX_CHECK_MARGIN_DB = 6.0
+#: Progress journal milestones (%).  Logging every block/write spammed the
+#: journal (user issue 1); only these milestones (or a long wall-time gap) are
+#: written.
+_PROGRESS_MILESTONES = (25, 50, 75, 100)
+#: Maximum wall-time between two progress journal lines.
+_PROGRESS_LOG_INTERVAL_S = 30.0
+#: Time constant of the endless-TX streaming progress asymptote (``0.5 -> 1``).
+_TX_STREAM_TAU_S = 20.0
 
 
 class _DuplexSink(Sink):
@@ -269,6 +278,29 @@ class SimulationRunner:
     def _logf(self, msg: str) -> None:
         if self._log is not None:
             self._log(msg)
+
+    def _milestone_logger(self, label: str):
+        """Return a ``(pct, detail) -> None`` journal logger (issue 1a).
+
+        The journal is written only when ``pct`` crosses the next milestone
+        (:data:`_PROGRESS_MILESTONES`) or when more than
+        :data:`_PROGRESS_LOG_INTERVAL_S` elapsed since the previous line — never
+        once per block.
+        """
+        state = {"idx": 0, "last": time.time()}
+
+        def emit(pct: int, detail: str) -> None:
+            now = time.time()
+            due = (state["idx"] < len(_PROGRESS_MILESTONES)
+                   and pct >= _PROGRESS_MILESTONES[state["idx"]])
+            if due or now - state["last"] >= _PROGRESS_LOG_INTERVAL_S:
+                while (state["idx"] < len(_PROGRESS_MILESTONES)
+                       and _PROGRESS_MILESTONES[state["idx"]] <= pct):
+                    state["idx"] += 1
+                state["last"] = now
+                self._logf(f"{label}: {pct}% ({detail})")
+
+        return emit
 
     def _emit_spectrum(self, label: str, samples: np.ndarray) -> None:
         """Отдать ~0.5-секундный блок (не более 65536 отсчётов) в график.
@@ -865,12 +897,15 @@ class SimulationRunner:
             seg_total = int(self._segment_seconds * cfg.fs)
             buf: list = []
             got = 0
-            next_pct = 5
-            last_log = 0.0
             # «генерация» is a pure IQ-file run (no radio); a B210 run only
             # pre-synthesises the segment first, so it says «предгенерация».
             label = ("Идёт предгенерация" if cfg.use_usrp
                      else "Идёт генерация")
+            log_progress = self._milestone_logger(label)
+            # A TX segment reserves the first half of the bar for synthesis and
+            # the second half for the (endless) streaming, so the bar keeps
+            # advancing for the whole run (issue 1b).
+            gen_span = 0.5 if cfg.use_usrp else 1.0
             # Check the stop event for every generated block so «Стоп» reacts
             # within roughly one block_ms, not after the whole segment.
             while got < seg_total:
@@ -891,20 +926,15 @@ class SimulationRunner:
                     self.sink.write(b)
                     self._emit_spectrum("TX", b)
                     produced += len(b)
-                    if self._progress is not None and seg_total:
-                        wall = max(1e-9, time.time() - t0)
-                        sim_s = got / cfg.fs
-                        self._progress(got / seg_total, sim_s, wall,
-                                       sim_s / wall if wall else 0.0)
-                pct = int(100 * got / seg_total) if seg_total else 0
-                now = time.time()
-                if pct >= next_pct or now - last_log >= 2.0:
-                    while next_pct <= pct:
-                        next_pct += 5
-                    last_log = now
-                    self._logf(f"{label}: {pct}% "
-                               f"({got / cfg.fs:.1f} из "
-                               f"{seg_total / cfg.fs:.1f} с)")
+                if self._progress is not None and seg_total:
+                    wall = max(1e-9, time.time() - t0)
+                    sim_s = got / cfg.fs
+                    self._progress(gen_span * got / seg_total, sim_s, wall,
+                                   sim_s / wall if wall else 0.0)
+                if seg_total:
+                    log_progress(int(100 * got / seg_total),
+                                 f"{got / cfg.fs:.1f} из "
+                                 f"{seg_total / cfg.fs:.1f} с")
                 if stopped:
                     break
             where = "в память" if cfg.use_usrp else "в файл"
@@ -915,6 +945,7 @@ class SimulationRunner:
                 # stream the RAM segment continuously until «Стоп».  ``duration``
                 # is deliberately ignored as a stop condition here; it still
                 # bounds file output and non-loop TX.
+                stream_t0 = time.time()
                 while not self._stop.is_set():
                     for b in buf:
                         if self._stop.is_set():
@@ -924,7 +955,10 @@ class SimulationRunner:
                     if self._progress is not None:
                         wall = max(1e-9, time.time() - t0)
                         sim_s = produced / cfg.fs
-                        self._progress(0.0, sim_s, wall, sim_s / wall)
+                        t = max(0.0, time.time() - stream_t0)
+                        frac = gen_span + (1.0 - gen_span) * (
+                            1.0 - math.exp(-t / _TX_STREAM_TAU_S))
+                        self._progress(frac, sim_s, wall, sim_s / wall)
         else:
             total = int(duration * cfg.fs) if duration else None
             if cfg.use_usrp:
@@ -933,8 +967,7 @@ class SimulationRunner:
                 # not fit) run synthesis and send in parallel via a bounded
                 # queue.  Otherwise UHD underflows between blocks.
                 return self._run_tx_stream(total, block, t0)
-            next_pct = 5
-            last_log = 0.0
+            log_progress = self._milestone_logger("Идёт генерация")
             while not self._stop.is_set():
                 n = block
                 if total is not None:
@@ -951,26 +984,24 @@ class SimulationRunner:
                     frac = (produced / total) if total else 0.0
                     self._progress(frac, sim_s, wall, sim_s / wall)
                 if total is not None:
-                    pct = int(100 * produced / total)
-                    now = time.time()
-                    if pct >= next_pct or now - last_log >= 2.0:
-                        while next_pct <= pct:
-                            next_pct += 5
-                        last_log = now
-                        self._logf(f"Идёт генерация: {pct}% "
-                                   f"({produced / cfg.fs:.1f} из "
-                                   f"{total / cfg.fs:.1f} с)")
+                    log_progress(int(100 * produced / total),
+                                 f"{produced / cfg.fs:.1f} из "
+                                 f"{total / cfg.fs:.1f} с")
         return produced
 
     # ------------------------------------------------------------------
     # TX streaming (pre-generated RAM segment or bounded producer/consumer)
     # ------------------------------------------------------------------
-    def _generate_to_ram(self, target: int, block: int) -> tuple[list, int]:
+    def _generate_to_ram(self, target: int, block: int,
+                         frac_scale: float = 1.0) -> tuple[list, int]:
         """Synthesise exactly ``target`` samples into a list of RAM blocks.
 
         Emits throttled progress so the user sees that work is happening while
         nothing is transmitted yet (the TX LED only lights after this phase),
         and honours ``self._stop`` between blocks so «Стоп» aborts promptly.
+        ``frac_scale`` maps this phase onto a slice of the progress bar (the TX
+        path reserves the first half for pre-generation and uses the second
+        half for the streaming phase).
         """
         assert self.engine is not None
         cfg = self.cfg
@@ -978,8 +1009,7 @@ class SimulationRunner:
         blocks: list[np.ndarray] = []
         got = 0
         t0 = time.time()
-        last_log = 0.0
-        next_pct = 5
+        log_progress = self._milestone_logger("Предгенерация")
         self._logf(
             "TX: передача начнётся только после предгенерации сегмента в RAM; "
             "светодиод TX загорится по её завершении")
@@ -996,16 +1026,10 @@ class SimulationRunner:
             if self._progress is not None:
                 wall = max(1e-9, time.time() - t0)
                 sim_s = got / fs
-                frac = (got / target) if target else 0.0
+                frac = frac_scale * ((got / target) if target else 0.0)
                 self._progress(frac, sim_s, wall, sim_s / wall)
             pct = int(100 * got / target) if target else 100
-            now = time.time()
-            if pct >= next_pct or now - last_log >= 2.0:
-                while next_pct <= pct:
-                    next_pct += 5
-                last_log = now
-                self._logf(f"Предгенерация: {pct}% "
-                           f"({got / fs:.1f} с из {target / fs:.1f} с)")
+            log_progress(pct, f"{got / fs:.1f} с из {target / fs:.1f} с")
         elapsed = max(1e-9, time.time() - t0)
         rate = got / elapsed
         self._logf(f"Синтез: {got / fs:.2f} с сигнала за {elapsed:.1f} с "
@@ -1018,10 +1042,19 @@ class SimulationRunner:
         return blocks, got
 
     def _write_ram_blocks(self, blocks: list, target: int | None, float_t0: float,
-                          loop: bool) -> int:
-        """Stream pre-generated RAM blocks to the sink (optionally looping)."""
+                          loop: bool, base: float = 0.0,
+                          span: float = 1.0) -> int:
+        """Stream pre-generated RAM blocks to the sink (optionally looping).
+
+        ``base``/``span`` place the streaming phase on the overall progress bar
+        (the TX path uses ``base=0.5`` after pre-generation).  A finite
+        ``target`` fills ``base..base+span`` monotonically; an endless stream
+        (``target is None``) follows an asymptote that only reaches 100 % when
+        the user actually stops the run.
+        """
         cfg = self.cfg
         produced = 0
+        stream_t0 = time.time()
         while not self._stop.is_set():
             for b in blocks:
                 # Honour «Стоп» within one block, not after the whole segment.
@@ -1034,7 +1067,13 @@ class SimulationRunner:
             if self._progress is not None:
                 wall = max(1e-9, time.time() - float_t0)
                 sim_s = produced / cfg.fs
-                frac = (produced / target) if target else 0.0
+                if target:
+                    frac = base + span * min(1.0, produced / target)
+                elif loop:
+                    t = max(0.0, time.time() - stream_t0)
+                    frac = base + span * (1.0 - math.exp(-t / _TX_STREAM_TAU_S))
+                else:
+                    frac = base
                 self._progress(frac, sim_s, wall, sim_s / wall)
             if self._stop.is_set():
                 break
@@ -1073,13 +1112,16 @@ class SimulationRunner:
                 f"(~{sysinfo.human(target * _TX_RAM_BYTES)}), затем передача "
                 f"из памяти; оценка предгенерации ~{est_s:.0f} с")
             self._warn_large_tx_segment(target)
-            blocks, got = self._generate_to_ram(target, block)
+            # Pre-generation fills the first half of the bar; transmission the
+            # second half (issue 1b), so the bar advances during both phases.
+            blocks, got = self._generate_to_ram(target, block, frac_scale=0.5)
             if got < target:
                 self._logf(f"TX: предгенерация прервана ({got}/{target})")
             else:
                 self._logf("TX: сегмент в RAM готов — потоковая передача "
                            "на B210 без синтеза между блоками")
-            return self._write_ram_blocks(blocks, got, t0, loop=False)
+            return self._write_ram_blocks(blocks, got, t0, loop=False,
+                                          base=0.5, span=0.5)
         if target is not None:
             fit_s = (budget / _TX_RAM_BYTES / cfg.fs) if budget > 0 else 0.0
             self._logf(
@@ -1131,6 +1173,7 @@ class SimulationRunner:
                                   daemon=True)
         thread.start()
         produced = 0
+        stream_t0 = time.time()
         while True:
             try:
                 item = q.get(timeout=0.2)
@@ -1146,7 +1189,11 @@ class SimulationRunner:
             if self._progress is not None:
                 wall = max(1e-9, time.time() - t0)
                 sim_s = produced / cfg.fs
-                frac = (produced / target) if target else 0.0
+                if target:
+                    frac = min(1.0, produced / target)
+                else:
+                    t = max(0.0, time.time() - stream_t0)
+                    frac = 1.0 - math.exp(-t / _TX_STREAM_TAU_S)
                 self._progress(frac, sim_s, wall, sim_s / wall)
             if stop.is_set():
                 break

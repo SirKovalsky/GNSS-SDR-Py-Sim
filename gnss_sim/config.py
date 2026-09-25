@@ -315,7 +315,7 @@ class SimConfig:
     height: float = 10.0
     motion_file: str = ""
     start_text: str = "now"
-    duration: float = 60.0
+    duration: float = 120.0
     fs: float = 2.6e6
     center_freq: float = 1575.42e6
     #: Band/session: ``l1`` (default), ``b1i`` or ``all``/``wide`` (see

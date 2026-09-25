@@ -242,10 +242,11 @@ def test_gui_unified_signal_selection() -> None:
     app = _app()
     win = MainWindow()
     try:
-        # Default: all six systems checked but no opt-in -> conservative narrow
-        # L1 (2.6 / 1575.42); B1I is dropped (message only, no widening).
-        assert win.cb_bds.isChecked() is True
+        # Default: GPS/Galileo/QZSS/SBAS checked, BeiDou B1I OFF -> narrow
+        # L1 (2.6 / 1575.42).  The combined L1+B1I opt-in needs B1I selected.
+        assert win.cb_bds.isChecked() is False
         assert win.cb_combine.isChecked() is False
+        assert not win.cb_combine.isEnabled()
         cfg = win._collect()
         assert cfg.band == "l1" and cfg.combine is False
         assert cfg.fs == pytest.approx(2.6e6, abs=1.0)
@@ -254,7 +255,7 @@ def test_gui_unified_signal_selection() -> None:
         assert "l1" in win.lbl_band.text()
         assert "2.6" in win.lbl_fs.text()
 
-        # Explicit opt-in «Объединять L1+B1I» -> combined ~25 / 1571.33.
+        # Explicit opt-in «Объединять L1+B1I» (also selects B1I) -> ~25/1571.33.
         win.cb_combine.setChecked(True)
         cfg = win._collect()
         assert cfg.band == "all" and cfg.combine is True

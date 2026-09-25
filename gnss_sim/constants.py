@@ -42,6 +42,11 @@ SECONDS_IN_WEEK = 604800.0
 SECONDS_IN_HALF_WEEK = 302400.0
 SECONDS_IN_DAY = 86400.0
 
+# ---- BeiDou time (BDT) ----------------------------------------------------
+#: BDT = GPST - 14 s and BDT week = GPS week - 1356 (BDT epoch 2006-01-01).
+BDT_GPST_OFFSET_S = 14.0
+BDT_WEEK_OFFSET = 1356
+
 # ---- Ephemeris / nav message ---------------------------------------------
 MAX_SAT = 32
 MAX_CHAN = 16

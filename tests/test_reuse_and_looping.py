@@ -191,11 +191,13 @@ def test_start_time_coverage_validation() -> None:
     assert "RINEX" in msg
 
 
-def test_gui_start_widget_full_datetime_no_error() -> None:
+def test_gui_start_widget_full_datetime_no_error(monkeypatch) -> None:
     from PyQt5 import QtCore
     from gnss_sim.gui import MainWindow
     app = _app()
     win = MainWindow()
+    monkeypatch.setattr(win, "_coverage_by_sv", lambda *a, **k: None)
+    win.chk_now.setChecked(True)  # emulate «no cached coverage» start state
     try:
         assert win._start_text() == "now"
         win.chk_now.setChecked(False)
@@ -222,6 +224,11 @@ def test_gui_validate_start_rejects_out_of_range(monkeypatch) -> None:
             "n", warnings["n"] + 1)))
     try:
         win.chk_now.setChecked(False)
+        # Widen the widget range so a genuinely out-of-coverage start reaches
+        # _validate_start (the coverage binding would otherwise clamp it).
+        win.ed_start.setDateTimeRange(
+            QtCore.QDateTime(2000, 1, 1, 0, 0, 0),
+            QtCore.QDateTime(2100, 1, 1, 0, 0, 0))
         win.ed_start.setDateTime(QtCore.QDateTime(2020, 1, 1, 0, 0, 0))
         cfg = win._collect()
         cfg.nav_file = _NAV

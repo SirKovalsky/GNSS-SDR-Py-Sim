@@ -234,6 +234,8 @@ class Bridge(QtCore.QObject):
     """Marshals runner callbacks onto the GUI thread."""
 
     log = QtCore.pyqtSignal(str)
+    #: Native UHD stderr text, forwarded from the fd-2 reader thread.
+    native = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(float, float, float, float)
     channels = QtCore.pyqtSignal(list)
     finished = QtCore.pyqtSignal(object)
@@ -321,6 +323,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.runner: SimulationRunner | None = None
         self.bridge = Bridge()
         self.bridge.log.connect(self._append_log)
+        self.bridge.native.connect(self._append_native_log)
         self.bridge.progress.connect(self._on_progress)
         self.bridge.channels.connect(self._on_channels)
         self.bridge.finished.connect(self._on_finished)
@@ -328,6 +331,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge.askNav.connect(self._on_ask_nav)
         self._ask_event = threading.Event()
         self._ask_result = [False]
+        self._updating_range = False
         self._run_cfg: SimConfig | None = None
         self._truck_result: dict | None = None
         self._anim_idx = 0.0
@@ -343,7 +347,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # the console.  run.py installs the fd-2 capture before importing UHD;
         # this just points it at the log widget.
         install_native_stderr_filter()
-        set_native_stderr_sink(self.bridge.log.emit)
+        set_native_stderr_sink(self.bridge.native.emit)
 
     # ==================================================================
     # UI construction
@@ -497,7 +501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_start_cover.setWordWrap(True)
         f.addWidget(self.lbl_start_cover, 9, 0, 1, 2)
         self.sp_dur = QtWidgets.QDoubleSpinBox(); self.sp_dur.setRange(0, 86400)
-        self.sp_dur.setValue(60.0); self.sp_dur.setSuffix(" с")
+        self.sp_dur.setValue(120.0); self.sp_dur.setSuffix(" с")
         self.sp_dur.setToolTip(
             "Сколько секунд записать/сгенерировать (0=∞, до «Стоп»). При TX с "
             "включённым зацикливанием эфир идёт непрерывно до «Стоп», а это "
@@ -527,7 +531,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_motion.setText("")
         self.chk_now.setChecked(True)
         self.ed_start.setDateTime(QtCore.QDateTime.currentDateTimeUtc())
-        self.sp_dur.setValue(60.0)
+        self.sp_dur.setValue(120.0)
         self._update_start_range()
 
     # ------------------------------------------------------------------
@@ -561,10 +565,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _gps_to_qdt(g, offset_s: float = 0.0) -> QtCore.QDateTime:
-        """Convert a :class:`GpsTime` (+offset) to a UTC ``QDateTime``."""
+        """Convert a :class:`GpsTime` (+offset) to a UTC ``QDateTime``.
+
+        The time spec must be UTC: ``QDateTimeEdit.setDateTimeRange`` converts a
+        local-spec datetime to the widget's spec, which shifted the coverage
+        window by the machine's UTC offset (making the start time look
+        uneditable/uncovered).
+        """
         from .gpstime import gps2date, inc_gps_time
         y, mo, d, hh, mi, ss = gps2date(inc_gps_time(g, float(offset_s)))
-        return QtCore.QDateTime(y, mo, d, hh, mi, int(ss))
+        dt = QtCore.QDateTime(y, mo, d, hh, mi, int(ss))
+        dt.setTimeSpec(QtCore.Qt.UTC)
+        return dt
 
     def _nav_by_sv(self, path: str):
         """Parse (and cache) a RINEX file into ``by_sv``; ``None`` on failure."""
@@ -619,6 +631,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if not hasattr(self, "ed_start") or not hasattr(self, "lbl_start_cover"):
             return
+        if getattr(self, "_updating_range", False):
+            return  # re-entrancy guard (chk_now.setChecked triggers us again)
+        self._updating_range = True
+        try:
+            self._update_start_range_inner()
+        finally:
+            self._updating_range = False
+
+    def _update_start_range_inner(self) -> None:
         from .config import parse_start_time
         try:
             now = parse_start_time("now")
@@ -796,7 +817,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------
     def _build_signals_group(self) -> QtWidgets.QGroupBox:
-        g_sig = QtWidgets.QGroupBox("Сигналы — единственный выбор систем")
+        g_sig = QtWidgets.QGroupBox("Сигналы")
         f2 = QtWidgets.QGridLayout(g_sig)
         self.cb_ca = QtWidgets.QCheckBox("GPS L1 C/A")
         self.cb_ca.setChecked(True)
@@ -809,10 +830,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_sbas = QtWidgets.QCheckBox("SBAS L1 C/A")
         self.cb_sbas.setChecked(True)
         self.cb_bds = QtWidgets.QCheckBox("BeiDou B1I (1561.098 МГц)")
-        self.cb_bds.setChecked(True)
-        _sig_tip = ("Единственный выбор систем: диапазон (l1/b1i/all), "
-                    "центр/fs и источник RINEX выводятся автоматически. "
-                    "Ручная пересборка полосы — только в CLI (-s/-f).")
+        self.cb_bds.setChecked(False)  # off by default (narrow L1 session)
+        _sig_tip = ("Системы определяют диапазон (l1/b1i/all), центр/fs и "
+                    "источник RINEX автоматически. Подробнее — в «Справке».")
         for i, w in enumerate((self.cb_ca, self.cb_l1c, self.cb_gal,
                                self.cb_qzss, self.cb_sbas, self.cb_bds)):
             w.setToolTip(_sig_tip)
@@ -842,8 +862,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _reset_signals_group(self) -> None:
         for cb in (self.cb_ca, self.cb_l1c, self.cb_gal, self.cb_qzss,
-                   self.cb_sbas, self.cb_bds, self.cb_iono):
+                   self.cb_sbas, self.cb_iono):
             cb.setChecked(True)
+        self.cb_bds.setChecked(False)  # default: B1I off (narrow L1 session)
         self.cmb_l1c_data.setCurrentText("zeros")
         self.sp_el.setValue(5.0)
         self.sp_amp.setValue(0.15)
@@ -878,7 +899,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_iq_in = QtWidgets.QCheckBox("Использовать готовый IQ-файл")
         self.cb_iq_in.setToolTip(
             "Генерация пропускается: файл читается и, если включён B210, "
-            "передаётся в эфир; иначе только проверяется и описывается.")
+            "передаётся в эфир; иначе только проверяется и описывается.\n"
+            "Если рядом есть <файл>.json — sample_rate/format/center_freq "
+            "берутся из него; иначе используются значения из настроек.")
         f3.addWidget(self.cb_iq_in, 4, 0, 1, 2)
         self.ed_iq_in = QtWidgets.QLineEdit("")
         self.ed_iq_in.setPlaceholderText("путь к готовому IQ-файлу")
@@ -896,6 +919,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_iq_in.toggled.connect(self.ed_iq_in.setEnabled)
         self.cb_iq_in.toggled.connect(btn_iq.setEnabled)
         _row(f3, 5, "Готовый IQ", self._wrap(r_iq))
+        # The verbose side-car note moved into the tooltip of the checkbox.
         self.cb_iq_ram = QtWidgets.QCheckBox(
             "Загрузить IQ в RAM (зацикливать из памяти)")
         self.cb_iq_ram.setToolTip(
@@ -906,11 +930,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_iq_ram.setEnabled(False)
         self.cb_iq_in.toggled.connect(self.cb_iq_ram.setEnabled)
         f3.addWidget(self.cb_iq_ram, 6, 0, 1, 2)
-        self.lbl_iq_note = QtWidgets.QLabel(
-            "Если рядом есть <файл>.json — sample_rate/format/center_freq "
-            "берутся из него; иначе используются значения из настроек.")
-        self.lbl_iq_note.setWordWrap(True)
-        f3.addWidget(self.lbl_iq_note, 7, 0, 1, 2)
 
         self.cb_loop = QtWidgets.QCheckBox("Зацикливать сегмент (RAM)")
         self.cb_loop.setChecked(True)
@@ -918,18 +937,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "Для файла: сегмент генерируется один раз и пишется один раз.\n"
             "Для передачи на B210 (TX): непрерывная передача сегмента до "
             "кнопки «Стоп» — «Длительность» в эфире не ограничивает.")
-        f3.addWidget(self.cb_loop, 8, 0, 1, 2)
+        f3.addWidget(self.cb_loop, 7, 0, 1, 2)
         self.sp_loop = QtWidgets.QDoubleSpinBox(); self.sp_loop.setRange(0, 86400)
         self.sp_loop.setValue(0.0); self.sp_loop.setSuffix(" с (0=авто)")
         self.sp_loop.setToolTip(
             "Длина зацикливаемого сегмента в RAM (0 — авто). При TX с "
             "зацикливанием передача идёт до «Стоп».")
-        _row(f3, 9, "Длина сегмента", self.sp_loop)
+        _row(f3, 8, "Длина сегмента", self.sp_loop)
         self.sp_mem = QtWidgets.QDoubleSpinBox(); self.sp_mem.setRange(0, 1024)
         self.sp_mem.setValue(0.0); self.sp_mem.setSuffix(" ГБ (0=60%)")
-        _row(f3, 10, "Бюджет RAM", self.sp_mem)
+        _row(f3, 9, "Бюджет RAM", self.sp_mem)
         self.lbl_ram = QtWidgets.QLabel()
-        f3.addWidget(self.lbl_ram, 11, 0, 1, 2)
+        f3.addWidget(self.lbl_ram, 10, 0, 1, 2)
         try:
             from .sysinfo import available_ram, human, total_ram
             self.lbl_ram.setText(
@@ -939,7 +958,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f3.addWidget(self._group_reset_btn(
             self._reset_output_group,
             "Сбросить только выход IQ (готовый файл, формат, лууп)"),
-            12, 0, 1, 2)
+            11, 0, 1, 2)
         return g_out
 
     def _on_format_changed(self, fmt: str) -> None:
@@ -984,23 +1003,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_backend.setCurrentText("auto")
 
     def _build_band_group(self) -> QtWidgets.QGroupBox:
-        g = QtWidgets.QGroupBox("Диапазон (вычисляется) и BeiDou B1I")
+        g = QtWidgets.QGroupBox("BeiDou B1I")
         f = QtWidgets.QGridLayout(g)
-        note = QtWidgets.QLabel(
-            "Диапазон/центр/fs больше не выбираются вручную: они выводятся из "
-            "галочек «Сигналы» (l1 — L1/E1; b1i — только BeiDou B1I; all — "
-            "единый поток L1/E1 + B1I). Ручная пересборка полосы — в CLI "
-            "(<code>-s</code>/<code>-f</code>).")
-        note.setWordWrap(True)
-        f.addWidget(note, 0, 0, 1, 2)
-
         self.cmb_b1i_data = QtWidgets.QComboBox()
         self.cmb_b1i_data.addItems(["d1", "placeholder"])
         self.cmb_b1i_data.setToolTip(
             "Данные BeiDou B1I: d1 — реальное сообщение D1 (NH20+BCH+эфемериды), "
             "placeholder — постоянный +1 (но со структурой NH20).")
         self._guard_combo(self.cmb_b1i_data)
-        _row(f, 1, "Данные B1I", self.cmb_b1i_data)
+        _row(f, 0, "Данные B1I", self.cmb_b1i_data)
 
         self.cb_combine = QtWidgets.QCheckBox(
             "Объединять L1+B1I (широкая полоса ~25 Мвыб/с)")
@@ -1012,7 +1023,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "чтобы получить один широкий поток ~1571.33 МГц / ~25 Мвыб/с с "
             "сохранением боковых лепестков BOC(6,1). Предгенерация такого "
             "сегмента в RAM занимает минуты и несколько ГБ.")
-        f.addWidget(self.cb_combine, 2, 0, 1, 2)
+        f.addWidget(self.cb_combine, 1, 0, 1, 2)
 
         self.cb_auto_b1i = QtWidgets.QCheckBox("Авто-подбор fs/центра под B1I")
         self.cb_auto_b1i.setChecked(True)
@@ -1020,17 +1031,17 @@ class MainWindow(QtWidgets.QMainWindow):
             "Устаревшее: авто-подбор широкой полосы под B1I, если он не "
             "помещается в текущую полосу (действует только при ручных -s/-f). "
             "В обычном режиме полоса выводится из галочек «Сигналы».")
-        f.addWidget(self.cb_auto_b1i, 3, 0, 1, 2)
+        f.addWidget(self.cb_auto_b1i, 2, 0, 1, 2)
         self.lbl_auto_b1i = QtWidgets.QLabel(
             "B1I (1561.098 МГц) не помещается в узкую полосу L1: без галочки "
             "«Объединять L1+B1I» B1I отключается, fs остаётся 2.6 Мвыб/с. "
             "Для объединённого широкого потока включите эту галочку.")
         self.lbl_auto_b1i.setWordWrap(True)
-        f.addWidget(self.lbl_auto_b1i, 4, 0, 1, 2)
+        f.addWidget(self.lbl_auto_b1i, 3, 0, 1, 2)
         f.addWidget(self._group_reset_btn(
             self._reset_band_group,
             "Сбросить данные B1I и объединение"),
-            5, 0, 1, 2)
+            4, 0, 1, 2)
         self.cb_combine.stateChanged.connect(self._on_combine_toggled)
         self._refresh_derived()
         return g
@@ -1189,13 +1200,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "если файл выхода тоже задан — и файл, и эфир. Параметры B210 — "
             "на вкладке «Дополнительные».")
         f.addWidget(self.cb_tx, 0, 0, 1, 2)
-        note = QtWidgets.QLabel(
-            "Минимальное усиление TX (0 дБ) безопаснее всего; отрицательное "
-            "значение будет зажато устройством (снижение мощности — только "
-            "внешним аттенюатором). Настройки UHD — во вкладке "
-            "«Дополнительные».")
-        note.setWordWrap(True)
-        f.addWidget(note, 1, 0, 1, 2)
         return g
 
     def _build_uhd_group(self) -> QtWidgets.QGroupBox:
@@ -2081,6 +2085,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 safe = html.escape(line)
                 self.log.appendHtml(
                     f'<span style="color:{color};">{safe}</span>')
+            else:
+                self.log.appendPlainText(line)
+
+    def _append_native_log(self, text: str) -> None:
+        """Forward captured native UHD stderr into the journal (issue 2).
+
+        Native lines are shown as plain text; only genuine UHD warnings/errors
+        (``[WARNING]``/``[ERROR]`` tags, or an explicit Russian marker) are
+        coloured, so an ``[INFO]`` line that happens to contain the substring
+        ``error`` stays uncoloured.  The chunk is split first: the fd-2 reader
+        forwards arbitrary multi-line chunks.
+        """
+        import html
+        lines = str(text).splitlines()
+        if not lines:
+            lines = [""]
+        for line in lines:
+            stripped = line.lstrip()
+            genuine = (stripped.startswith(("[WARNING]", "[ERROR]"))
+                       or "ВНИМАН" in line or "ОШИБК" in line)
+            color = None
+            if genuine:
+                low = line.lower()
+                if "error" in low or "ошибк" in low:
+                    color = _LOG_ERROR_COLOR
+                else:
+                    color = _LOG_WARN_COLOR
+            if color and hasattr(self.log, "appendHtml"):
+                self.log.appendHtml(
+                    f'<span style="color:{color};">{html.escape(line)}</span>')
             else:
                 self.log.appendPlainText(line)
 
