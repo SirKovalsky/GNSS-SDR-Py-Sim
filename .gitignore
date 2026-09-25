@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Кэши и большие данные
+rinex_cache/
+tile_cache/
+truck_track.csv
+*.cs16
+*.cs8
+*.cf32
+*.cs4
+*.iq
+*.bin
+!run.py
+
+# Вложенные апстрим-клоны (у них свои git-remote)
+gps-sdr-sim/
+multi-sdr-gps-sim/
+
+# ОС / редакторы
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
+
+# �������� ��������� � �����
+brdc*
+gnss_sim_output.*

@@ -1,0 +1,20 @@
+# Зависимости GNSS Sim (GPS L1 C/A + L1C, Galileo E1, SBAS, QZSS).
+# Нужен Python 3.10..3.13 (в 3.14 нет wheel'ов uhd).
+# numpy держим < 2.0: UHD 4.10 собран против NumPy 1.x.
+numpy>=1.24,<2.0
+PyQt5>=5.15.9
+
+# График спектра (PSD) в GUI и чтение NMEA с u-blox ZED-F9P по COM-порту.
+pyqtgraph>=0.13
+pyserial>=3.5
+
+# CUDA-ускорение синтеза (необязательно; нужен NVIDIA GPU и драйвер).
+# auto-режим сам выберет CUDA, если пакет установлен и GPU доступен:
+#   Windows/Linux + CUDA 12.x:  pip install "cupy-cuda12x<14"
+#   CUDA 11.x:                  pip install "cupy-cuda11x"
+# Без CuPy приложение работает на CPU.
+
+# UHD (только для передачи на USRP B210) ставится ОТДЕЛЬНО, как и в SDR_Scan:
+#   Windows: UHD-инсталлятор + pip install uhd==4.10.0.0
+#   Linux:   sudo apt install libuhd-dev uhd-host python3-uhd
+# Без UHD приложение всё равно работает — генерирует IQ в файл.
