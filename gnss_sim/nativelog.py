@@ -18,8 +18,9 @@ Strategy
 1. :func:`quiet_uhd` selects a UHD log level that still emits the useful
    ``[INFO]``/``[WARNING]``/``[ERROR]`` lines.  The **console** is kept clean by
    the capture in step 2, not by silencing UHD: the old ``fatal`` default
-   suppressed *everything*, so a real B210 run showed no UHD output in the GUI
-   journal at all (the offscreen tests bypassed UHD's own logger and passed).
+   suppressed *everything*, so a real B210 run showed no UHD output at all.
+   The CLI default is now the visible :data:`DEFAULT_UHD_LOG_LEVEL` (``info``),
+   so the user sees UHD text on **stdout** while stderr stays clean.
 2. :func:`install_native_stderr_filter` redirects the process file descriptor 2
    into a pipe read by a daemon thread.  The thread strips the lone under/overflow
    markers with :func:`clean_native_text` and forwards everything else to the
@@ -39,14 +40,16 @@ import sys
 import threading
 from typing import Callable
 
-#: Default UHD log level for the CLI: quiet, but the fd-2 capture (below) still
-#: forwards warnings/errors.  ``fatal`` is the quietest valid level.
+#: Default UHD log level for the CLI and GUI: visible, so a real run shows the
+#: useful ``[INFO]``/``[WARNING]``/``[ERROR]`` lines.  The console stays clean
+#: because the fd-2 capture (below) forwards native text to **stdout** (CLI) or
+#: the journal (GUI) instead of the real stderr.  ``--uhd-log-level`` overrides.
 DEFAULT_UHD_LOG_LEVEL = "fatal"
 
-#: UHD log level used by the GUI.  Unlike the CLI it must show the ``[INFO]``
-#: lines in the journal, so it asks UHD for them; the console stays clean because
-#: the GUI routes native stderr into the journal (``install_native_stderr_filter``
-#: + ``set_native_stderr_sink``), never to the real console.
+#: UHD log level used by the GUI.  It must show the ``[INFO]`` lines in the
+#: journal, so it asks UHD for them; the console stays clean because the GUI
+#: routes native stderr into the journal (``install_native_stderr_filter`` +
+#: ``set_native_stderr_sink``), never to the real console.
 GUI_UHD_LOG_LEVEL = "info"
 
 #: Underflow/overflow/late markers printed by UHD's ``standard_async_msg_prints``
@@ -65,7 +68,7 @@ _native_write_handle: int | None = None
 def quiet_uhd(level: str | None = None) -> str:
     """Set ``UHD_LOG_LEVEL`` before ``import uhd``.
 
-    The CLI keeps the quiet :data:`DEFAULT_UHD_LOG_LEVEL`; the GUI passes
+    The CLI uses :data:`DEFAULT_UHD_LOG_LEVEL` (visible ``info``); the GUI passes
     :data:`GUI_UHD_LOG_LEVEL` so real UHD ``[INFO]``/``[WARNING]``/``[ERROR]``
     lines reach the journal.  Must run before UHD is imported.  A caller-provided
     level (or an explicit ``UHD_LOG_LEVEL`` already in the environment) wins.
@@ -79,8 +82,7 @@ def quiet_uhd(level: str | None = None) -> str:
 def quiet_uhd_gui() -> str:
     """Select the GUI's UHD level, honouring an explicit ``UHD_LOG_LEVEL``.
 
-    Must run before ``import uhd``.  Unlike :func:`quiet_uhd` called with no
-    argument (the CLI's ``fatal``), an unset environment falls back to
+    Must run before ``import uhd``.  An unset environment falls back to
     :data:`GUI_UHD_LOG_LEVEL` so the journal receives UHD's ``[INFO]`` lines.
     """
     return quiet_uhd(os.environ.get("UHD_LOG_LEVEL") or GUI_UHD_LOG_LEVEL)

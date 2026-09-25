@@ -248,20 +248,96 @@ def test_engine_galileo_channel_is_populated() -> None:
 
 
 def test_engine_galileo_symbol_period_and_indexing() -> None:
+    """I/NAV symbols span one 4 ms code period and follow the received code.
+
+    Regression: the symbol index used to be derived from the *transmit* time
+    (no ``rng/c``), so the data/secondary boundaries were shifted by the
+    pseudorange and no longer coincided with the code-epoch wraps.  One symbol
+    per code period, with the propagation delay included, is the ICD timing.
+    """
+    from gnss_sim.constants import SPEED_OF_LIGHT
+    from gnss_sim.engine import _Geo
+    from gnss_sim.gpstime import sub_gps_time
+
     eng = _make_engine()
     ch = next(c for c in eng.channels if c.kind == "galileo")
     bits = ch.galileo_bits
-    # Silence the E1-C pilot and use f_code = 0 / carrier = 1 so the term is
-    # proportional to the E1-B data symbol only (recovered up to a fixed sign).
+    # Constant E1-B code (ones) and silenced E1-C: the term is then the data
+    # symbol times the CBOC subcarrier; sampling exactly on code epochs makes
+    # the subcarrier constant too, so the ratio is the data ratio.
+    ch.e1b = np.ones_like(ch.e1b)
     ch.e1c = np.zeros_like(ch.e1c)
     g = ch.galileo_frame_start
-    t = np.arange(0.0, 0.040, 0.001, dtype=np.float64)[:40]
-    term = eng._galileo_term(ch, g, t, 0.0, np.ones_like(t), np)
+    rho = _Geo(2.0e7, 0.0, 2.0e7, (0.0, 1.0), 0.0)
+    base_ms = (sub_gps_time(g, ch.galileo_frame_start) + 6.0
+               - rho.rng / SPEED_OF_LIGHT) * 1000.0
+    ch.e1_phase = (base_ms % 4.0) * 1023.0
+    f_code = 1.023e6
+    t = ((4092.0 - ch.e1_phase) / f_code
+         + np.arange(40) * gal.CODE_PERIOD_S)
+    term = eng._galileo_term(ch, g, t, f_code, np.ones_like(t), np, rho)
     assert not np.any(term == 0.0)
     ratio = (term / term[0]).real
-    sym = np.floor(t / gal.CODE_PERIOD_S).astype(np.int64) % bits.shape[0]
-    expected = (1.0 - 2.0 * bits[sym]) / (1.0 - 2.0 * bits[0])
+    k = np.floor((base_ms + t * 1000.0) / 4.0).astype(np.int64)
+    sym = k % bits.shape[0]
+    expected = (1.0 - 2.0 * bits[sym]) / (1.0 - 2.0 * bits[sym[0]])
     assert np.allclose(ratio, expected)
+    # One symbol per 4 ms: the index advances by exactly one each code period.
+    assert np.all(np.diff(k) == 1)
+
+
+def test_engine_galileo_composite_matches_icd_formula() -> None:
+    """E1 = (E1B*CBOC+ - E1C*CBOC-)/sqrt(2) with symbol timing tied to code.
+
+    Regression for two ICD deviations: the E1-C term used to be *added*
+    (relative polarity of the data and pilot components was flipped) and the
+    I/NAV symbol index ignored the propagation delay.
+    """
+    from gnss_sim.constants import SPEED_OF_LIGHT
+    from gnss_sim.engine import CBOC_ALPHA, CBOC_BETA, _Geo
+    from gnss_sim.gpstime import sub_gps_time
+
+    eng = _make_engine()
+    ch = next(c for c in eng.channels if c.kind == "galileo")
+    ch.galileo_bits = np.zeros(7500, dtype=np.int8)      # constant +1 data
+    g = ch.galileo_frame_start
+    rho = _Geo(2.1e7, 0.0, 2.1e7, (0.0, 1.0), 0.0)
+    f_code = 1.023e6
+    fs = 8.184e6
+    t = np.arange(int(fs * 0.008)) / fs
+    term = eng._galileo_term(ch, g, t, f_code, np.ones_like(t), np, rho)
+
+    cp = ch.e1_phase + f_code * t
+    frac = cp - np.floor(cp)
+    s1 = np.sign(np.sin(2.0 * np.pi * frac)); s1[s1 == 0.0] = 1.0
+    s6 = np.sign(np.sin(2.0 * np.pi * 6.0 * frac)); s6[s6 == 0.0] = 1.0
+    chip = np.floor(cp).astype(np.int64) % 4092
+    base_ms = (sub_gps_time(g, ch.galileo_frame_start) + 6.0
+               - rho.rng / SPEED_OF_LIGHT) * 1000.0
+    k = (np.floor(base_ms / 4.0).astype(np.int64)
+         + np.floor(cp / 4092.0).astype(np.int64))
+    sec = ch.e1sec[k % 25]
+    ref = (ch.e1b[chip] * (CBOC_ALPHA * s1 + CBOC_BETA * s6)
+           - ch.e1c[chip] * sec * (CBOC_ALPHA * s1 - CBOC_BETA * s6)
+           ) * 0.7071067811865476
+    assert np.allclose(term, ref)
+
+
+def test_engine_galileo_broadcasts_gst_week() -> None:
+    """I/NAV word 5 must carry the GST week (GPS week - 1024), not the GPS week."""
+    from gnss_sim.engine import GST_WEEK_OFFSET
+
+    eng = _make_engine()
+    ch = next(c for c in eng.channels if c.kind == "galileo")
+    # page 4 of DEFAULT_SEQUENCE (1,2,3,4,5,..) is word type 5.
+    page = ch.galileo_bits[4 * gal.PAGE_SYMBOLS:5 * gal.PAGE_SYMBOLS]
+    parsed = gal.parse_page(page)
+    assert parsed["word_type"] == 5
+    wn = gal._read_raw(parsed["word"], 74, 12)
+    expected = (int(ch.galileo_frame_start.week) - GST_WEEK_OFFSET) % 4096
+    assert wn == expected
+    # The GPS week would be a different value -> catches the regression.
+    assert wn != int(ch.galileo_frame_start.week) % 4096
 
 
 def test_engine_galileo_signal_nontrivial() -> None:

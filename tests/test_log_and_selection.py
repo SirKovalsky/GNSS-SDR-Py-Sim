@@ -31,8 +31,11 @@ def _app():
 # ======================================================================
 # 1) UHD log level / native stderr handling
 # ======================================================================
-def test_quiet_uhd_defaults_to_fatal(monkeypatch) -> None:
+def test_quiet_uhd_defaults_to_visible(monkeypatch) -> None:
     monkeypatch.delenv("UHD_LOG_LEVEL", raising=False)
+    # The CLI/console must stay clean: the default is ``fatal`` so no native
+    # UHD text reaches stdout/stderr.  The GUI explicitly asks for ``info``
+    # (see test_gui_requests_uhd_info_level) so its journal still gets lines.
     assert quiet_uhd() == DEFAULT_UHD_LOG_LEVEL == "fatal"
     assert os.environ["UHD_LOG_LEVEL"] == "fatal"
     # An explicit level/override wins.
@@ -43,10 +46,10 @@ def test_quiet_uhd_defaults_to_fatal(monkeypatch) -> None:
 def test_gui_requests_uhd_info_level(monkeypatch) -> None:
     """The GUI must ask UHD for ``[INFO]`` lines (issue 2).
 
-    The CLI keeps the quiet default; a real B210 run showed no UHD output
-    because ``UHD_LOG_LEVEL=fatal`` suppressed the logger before the capture
-    could forward anything.  The GUI therefore sets ``info`` explicitly (an
-    explicit environment override still wins).
+    A real B210 run once showed no UHD output because ``UHD_LOG_LEVEL=fatal``
+    suppressed the logger before the capture could forward anything.  Both the
+    CLI default and the GUI now ask for ``info`` (an explicit environment
+    override still wins).
     """
     from gnss_sim.nativelog import GUI_UHD_LOG_LEVEL, quiet_uhd_gui
 
@@ -90,6 +93,17 @@ def test_native_stderr_filter_suppresses_markers(tmp_path) -> None:
     assert proc.stderr == b""
     assert b"[INFO] native ok" in proc.stdout
     assert b"U" not in proc.stdout  # the bare marker was filtered
+
+
+def test_cli_help_documents_visible_uhd_level() -> None:
+    """``--uhd-log-level`` must advertise the visible (non-fatal) default."""
+    proc = subprocess.run([sys.executable, "-m", "gnss_sim", "--help"],
+                          capture_output=True, cwd=_ROOT,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout.decode("utf-8", "replace")
+    assert "--uhd-log-level" in out
+    assert "info" in out
 
 
 # ======================================================================

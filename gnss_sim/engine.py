@@ -70,6 +70,8 @@ TWO_PI = 2.0 * np.pi
 _SBAS_GEO_RADIUS = 42164000.0
 _SBAS_RANGE = 3.8e7
 _GALILEO_SEC_BIT = 0.004          # 250 bps secondary / data symbol length
+#: GST week 0 started 1999-08-22 = GPS week 1024; the I/NAV WN field is GST.
+GST_WEEK_OFFSET = 1024
 
 #: Default synthetic SBAS satellites: (PRN, longitude offset from user, deg)
 SBAS_DEFAULT = ((120, -15.0), (123, 0.0), (126, 15.0))
@@ -515,8 +517,15 @@ class SignalEngine:
 
         Words 1..6 carry the broadcast ephemeris/clock, the ionosphere/BGD/GST
         model and the GST-UTC model; the remaining pages are the spare word.
+
+        ``frame_start`` is on the GPS time scale; the I/NAV week field is the
+        GST week, i.e. GPS week minus the 1024-week GST epoch offset (GST week 0
+        started 1999-08-22 = GPS week 1024).  Broadcasting the GPS week made a
+        receiver's Galileo time tag ~1024 weeks off, which can stop it from
+        accepting/using the E1 ephemeris even when the signal is tracked.
         """
-        return inav_bit_block(ch.eph, gst_week=frame_start.week,
+        gst_week = (int(frame_start.week) - GST_WEEK_OFFSET) % 4096
+        return inav_bit_block(ch.eph, gst_week=gst_week,
                               gst_tow=frame_start.sec)
 
     def _b1i_frame_bits(self, ch: Channel, frame_start: GpsTime) -> np.ndarray | None:
@@ -636,7 +645,7 @@ class SignalEngine:
         return (xp.sqrt(0.75) * pilot * sub
                 + xp.sqrt(0.25) * data_ch * boc11) * carrier
 
-    def _galileo_term(self, ch, g, t, f_code, carrier, xp):
+    def _galileo_term(self, ch, g, t, f_code, carrier, xp, rho=None):
         e1b = self._device(ch.e1b, xp)
         e1c = self._device(ch.e1c, xp)
         e1sec = self._device(ch.e1sec, xp)
@@ -650,14 +659,25 @@ class SignalEngine:
         comp_b = CBOC_ALPHA * boc11 + CBOC_BETA * boc61
         comp_c = CBOC_ALPHA * boc11 - CBOC_BETA * boc61
         # One I/NAV symbol spans 4 ms = one E1-B code period (250 bps).  The
-        # index is taken relative to the 30 s sub-frame epoch so it stays small
-        # and exact on the float32 CUDA path (the E1-C secondary code period is
-        # 25 symbols, so k % 25 does not depend on the epoch).
+        # symbol index must be tied to the *received* code epoch, i.e. include
+        # the propagation delay ``rng/c`` exactly like the GPS leg does; data
+        # and secondary-code boundaries then coincide with code-period wraps.
+        # Indexing it from the transmit time (no ``rng/c``) shifted them by the
+        # pseudorange (up to a full symbol) and cost ~9 dB of E1-B/E1-C
+        # correlation.  ``floor(base_ms/4)`` gives the symbol at the block
+        # start and ``floor(cp/4092)`` the code periods elapsed within the
+        # block, so the sum tracks the code phase (the E1-C period is 25
+        # symbols, so ``k % 25`` is epoch independent).
         if ch.galileo_frame_start is not None:
-            base = g.sec - ch.galileo_frame_start.sec
+            if rho is not None:
+                base_ms = (sub_gps_time(g, ch.galileo_frame_start)
+                           + 6.0 - rho.rng / SPEED_OF_LIGHT) * 1000.0
+            else:
+                base_ms = (g.sec - ch.galileo_frame_start.sec) * 1000.0
         else:
-            base = g.sec
-        k = xp.floor((base + t) / _GALILEO_SEC_BIT).astype(xp.int64)
+            base_ms = g.sec * 1000.0
+        k = (xp.floor(base_ms / 4.0).astype(xp.int64)
+             + xp.floor(cp / 4092.0).astype(xp.int64))
         sec_idx = k % 25
         if ch.galileo_bits is not None:
             bits = self._device(ch.galileo_bits, xp, cache=False)
@@ -665,8 +685,12 @@ class SignalEngine:
             data = (1.0 - 2.0 * bits[sym]).astype(t.dtype)
         else:
             data = xp.ones_like(t)                    # fallback E1-B data
+        # OS SIS ICD / MathWorks: E1 = (E1B * CBOC(+) - E1C * CBOC(-)) / sqrt(2).
+        # E1-B and E1-C are combined with opposite signs (the E1-C term is
+        # subtracted); getting this wrong flips the relative polarity of the two
+        # components and can stop a real receiver from acquiring E1.
         sig = (e1b[chip] * data * comp_b
-               + e1c[chip] * e1sec[sec_idx] * comp_c)
+               - e1c[chip] * e1sec[sec_idx] * comp_c)
         return 0.7071067811865476 * sig * carrier
 
     def _sbas_term(self, ch, g, t, f_code, carrier, xp):
@@ -733,7 +757,8 @@ class SignalEngine:
                 if ch.cp is not None:
                     acc += ch.amp * self._l1c_term(ch, g, t, f_code, carrier, xp)
             elif ch.kind == "galileo":
-                acc += ch.amp * self._galileo_term(ch, g, t, f_code, carrier, xp)
+                acc += ch.amp * self._galileo_term(ch, g, t, f_code, carrier, xp,
+                                                   rho)
             elif ch.kind == "sbas":
                 acc += ch.amp * self._sbas_term(ch, g, t, f_code, carrier, xp)
             elif ch.kind == "beidou":

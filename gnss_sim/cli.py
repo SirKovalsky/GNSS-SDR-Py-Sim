@@ -157,9 +157,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="list USRP devices and exit")
     p.add_argument("--uhd-log-level", default=None,
                    help="уровень логов UHD (UHD_LOG_LEVEL): fatal/error/warning/"
-                        "info/debug; по умолчанию fatal — UHD не засоряет "
-                        "stderr и не красит консоль; нативный маркер underflow "
-                        "«U» отфильтровывается отдельно")
+                        "info/debug. По умолчанию info: строки UHD видны в "
+                        "консоли (stdout), но stderr остаётся чистым, поэтому "
+                        "PowerShell не красит их оранжевым; нативный маркер "
+                        "underflow «U» отфильтровывается отдельно")
     return p
 
 
@@ -177,9 +178,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # UHD logs ``[INFO]``/``[WARNING]`` to stderr; on Windows PowerShell paints
     # any native stderr output orange/red and turns it into
-    # ``NativeCommandError`` even when the process exit code is 0.  Keep UHD at
-    # ``fatal`` and capture its native stderr (the bare ``U``/``O`` markers
-    # bypass UHD_LOG_LEVEL) so all simulator diagnostics end up on stdout.
+    # ``NativeCommandError`` even when the process exit code is 0.  Ask UHD for
+    # a *visible* level (``info`` by default) and capture its native stderr (the
+    # bare ``U``/``O`` markers bypass UHD_LOG_LEVEL); the capture forwards every
+    # line to stdout, so UHD text is visible without orange PowerShell stderr.
     from .nativelog import install_native_stderr_filter, quiet_uhd
 
     quiet_uhd()
