@@ -77,8 +77,10 @@ def test_native_stderr_filter_suppresses_markers(tmp_path) -> None:
 # 2) Unified selection helpers
 # ======================================================================
 def test_derive_band_key_from_systems() -> None:
-    # Default GUI state: every system -> combined stream.
-    assert derive_band_key() == "all"
+    # Default GUI state (every system, no opt-in) -> conservative narrow L1;
+    # B1I is dropped by the runner instead of silently widening the stream.
+    assert derive_band_key() == "l1"
+    assert derive_band_key(combine=True) == "all"
     # BeiDou only -> narrowband b1i.
     assert derive_band_key(
         enable_ca=False, enable_l1c=False, enable_galileo=False,
@@ -89,6 +91,9 @@ def test_derive_band_key_from_systems() -> None:
     assert derive_band_key(
         enable_beidou=False, enable_ca=False, enable_l1c=False,
         enable_galileo=True) == "l1"
+    # combine only matters when both groups are present.
+    assert derive_band_key(
+        enable_beidou=False, combine=True) == "l1"
 
 
 def test_derive_nav_mode_from_systems() -> None:

@@ -21,6 +21,7 @@ from gnss_sim.beidou_nav import (  # noqa: E402
 )
 from gnss_sim.config import (  # noqa: E402
     BAND_PRESETS, SimConfig, band_preset, compute_combined_band,
+    derive_band_key, derive_band_plan,
 )
 from gnss_sim.constants import R2D  # noqa: E402
 from gnss_sim.engine import SignalEngine  # noqa: E402
@@ -66,28 +67,60 @@ def test_band_presets_recommended_values() -> None:
     assert SimConfig().center_override is False
 
 
-def test_compute_combined_band_all_five() -> None:
+def test_compute_combined_band_conservative_default() -> None:
+    """No signal group widens automatically; only ``preserve_boc`` opts in."""
+    # All five enabled, conservative default: the L1 group stays narrow
+    # (±1.023 MHz) and NO ~25 Msps stream is produced silently.
     plan = compute_combined_band()
-    # min = B1I low, max = L1C/E1 high (BOC(6,1) main lobes).
     assert plan.low == pytest.approx(1561.098e6 - 2.046e6)
-    assert plan.high == pytest.approx(1575.42e6 + 8.184e6)
+    assert plan.high == pytest.approx(1575.42e6 + 1.023e6)
     assert plan.center_freq == pytest.approx((plan.low + plan.high) / 2.0)
-    assert plan.fs == pytest.approx(25.0e6, abs=1.0)
-    assert plan.span == pytest.approx(24.552e6, abs=1.0)
+    assert plan.fs == pytest.approx(20.0e6, abs=1.0)
+    assert plan.fs < 25.0e6
+    # Explicit opt-in preserves the BOC(6,1) side lobes -> ~1571.33 / 25 Msps.
+    wide = compute_combined_band(preserve_boc=True)
+    assert wide.low == pytest.approx(1561.098e6 - 2.046e6)
+    assert wide.high == pytest.approx(1575.42e6 + 8.184e6)
+    assert wide.center_freq == pytest.approx(1571.328e6, abs=1e4)
+    assert wide.fs == pytest.approx(25.0e6, abs=1.0)
+    assert wide.span == pytest.approx(24.552e6, abs=1.0)
     # A single B1I-only stream stays narrow.
     b1i = compute_combined_band(
         enable_ca=False, enable_l1c=False, enable_galileo=False,
         enable_qzss=False, enable_sbas=False, enable_beidou=True)
     assert b1i.center_freq == pytest.approx(1561.098e6)
     assert b1i.fs == pytest.approx(4.092e6, abs=1.0)
-    # L1 only (no B1I) does not include the 1561 MHz band.
+    # L1 only (no B1I) does not include the 1561 MHz band and stays at 2.6.
     l1 = compute_combined_band(enable_beidou=False)
-    assert l1.low == pytest.approx(1575.42e6 - 8.184e6)
+    assert l1.low == pytest.approx(1575.42e6 - 1.023e6)
     assert l1.center_freq == pytest.approx(1575.42e6)
-    assert l1.fs >= 16.368e6
+    assert l1.fs == pytest.approx(2.6e6, abs=1.0)
     # Respects B210 limits.
-    for plan in (compute_combined_band(), b1i, l1):
+    for plan in (compute_combined_band(), wide, b1i, l1):
         assert 2.6e6 <= plan.fs <= 56.0e6
+
+
+def test_derive_band_plan_conservative_banding() -> None:
+    """derive_band_plan matches the runner's conservative band resolution."""
+    # All systems, no opt-in -> narrow L1 (2.6 / 1575.42), B1I will be dropped.
+    assert derive_band_key() == "l1"
+    l1 = derive_band_plan()
+    assert l1.fs == pytest.approx(2.6e6)
+    assert l1.center_freq == pytest.approx(1575.42e6)
+    # B1I only -> narrow 4.092 / 1561.098.
+    assert derive_band_key(
+        enable_ca=False, enable_l1c=False, enable_galileo=False,
+        enable_qzss=False, enable_sbas=False, enable_beidou=True) == "b1i"
+    b1i = derive_band_plan(
+        enable_ca=False, enable_l1c=False, enable_galileo=False,
+        enable_qzss=False, enable_sbas=False, enable_beidou=True)
+    assert b1i.fs == pytest.approx(4.092e6, abs=1.0)
+    assert b1i.center_freq == pytest.approx(1561.098e6)
+    # Explicit opt-in -> combined ~25 / 1571.33.
+    assert derive_band_key(combine=True) == "all"
+    wide = derive_band_plan(combine=True)
+    assert wide.fs == pytest.approx(25.0e6, abs=1.0)
+    assert wide.center_freq == pytest.approx(1571.328e6, abs=1e4)
 
 
 def test_compute_combined_band_narrow_ca_only() -> None:
@@ -106,7 +139,23 @@ def test_runner_band_l1_drops_b1i_without_widening() -> None:
     runner._apply_band()
     assert cfg.fs == 2.6e6 and cfg.center_freq == 1575.42e6
     assert cfg.enable_beidou is False
-    assert any("переключает fs на 30" in m for m in logs)
+    text = "\n".join(logs)
+    assert "отключён" in text and "2.6 Мвыб/с" in text
+    assert "--combine" in text and "Объединять" in text
+
+
+def test_runner_combine_opt_in_uses_combined_stream() -> None:
+    """``band=l1`` + ``combine`` is the explicit opt-in to L1+B1I (~25 Msps)."""
+    cfg = SimConfig(fs=2.6e6, center_freq=1575.42e6, enable_beidou=True,
+                    band="l1", combine=True, use_usrp=True)
+    logs: list[str] = []
+    SimulationRunner(cfg, log=logs.append)._apply_band()
+    assert cfg.enable_beidou is True
+    assert cfg.fs == pytest.approx(25.0e6, abs=1.0)
+    assert cfg.center_freq == pytest.approx(1571.328e6, abs=1e4)
+    text = "\n".join(logs)
+    assert "Сессия all" in text
+    assert "предгенерация" in text.lower()
 
 
 def test_runner_band_b1i_sets_narrowband_beidou_only() -> None:
@@ -131,8 +180,8 @@ def test_runner_band_all_computes_combined_stream() -> None:
     assert cfg.enable_beidou is True
     text = "\n".join(logs)
     assert "Сессия all" in text and "единый поток" in text
-    # No high-fs warning at the computed ~25 Msps.
-    assert "ВНИМАНИЕ" not in text
+    # Explicit combined stream warns about the slow/large pre-generation.
+    assert "ВНИМАНИЕ" in text and "предгенерация" in text.lower()
 
 
 def test_runner_band_all_alias_and_explicit_override() -> None:
@@ -182,6 +231,9 @@ def test_cli_band_sets_radio_and_allows_override() -> None:
     assert args.band == "all"
     args = p.parse_args(["--b1i-data", "placeholder"])
     assert args.b1i_data == "placeholder"
+    # Explicit combined-stream opt-in is a separate flag (default off).
+    assert p.parse_args([]).combine is False
+    assert p.parse_args(["--combine"]).combine is True
 
 
 def test_gui_unified_signal_selection() -> None:
@@ -190,15 +242,27 @@ def test_gui_unified_signal_selection() -> None:
     app = _app()
     win = MainWindow()
     try:
-        # Default: all six systems checked -> one combined `all` stream.
+        # Default: all six systems checked but no opt-in -> conservative narrow
+        # L1 (2.6 / 1575.42); B1I is dropped (message only, no widening).
         assert win.cb_bds.isChecked() is True
+        assert win.cb_combine.isChecked() is False
         cfg = win._collect()
-        assert cfg.band == "all"
+        assert cfg.band == "l1" and cfg.combine is False
+        assert cfg.fs == pytest.approx(2.6e6, abs=1.0)
+        assert cfg.center_freq == pytest.approx(1575.42e6)
+        assert cfg.nav_mode == "merged"
+        assert "l1" in win.lbl_band.text()
+        assert "2.6" in win.lbl_fs.text()
+
+        # Explicit opt-in «Объединять L1+B1I» -> combined ~25 / 1571.33.
+        win.cb_combine.setChecked(True)
+        cfg = win._collect()
+        assert cfg.band == "all" and cfg.combine is True
         assert cfg.fs == pytest.approx(25.0e6, abs=1.0)
         assert cfg.center_freq == pytest.approx(1571.328e6, abs=1e4)
-        assert cfg.nav_mode == "merged"
-        assert "all" in win.lbl_band.text()
-        assert "25" in win.lbl_fs.text()
+        assert "all" in win.lbl_band.text() and "25" in win.lbl_fs.text()
+        win.cb_combine.setChecked(False)
+        assert win._collect().fs == pytest.approx(2.6e6, abs=1.0)
 
         # BeiDou only -> narrowband b1i, GPS-only systems off.
         for cb in (win.cb_ca, win.cb_l1c, win.cb_gal, win.cb_qzss, win.cb_sbas):
@@ -225,8 +289,10 @@ def test_gui_unified_signal_selection() -> None:
         cfg = win._collect()
         assert cfg.nav_mode == "merged"
         assert "мультисистем" in win.lbl_nav_mode.text().lower()
-        # ... and the derived fs grows to cover the wider CBOC main lobes.
-        assert cfg.fs >= 16.368e6
+        # Conservative banding: the CBOC(6,1) side lobes are NOT added
+        # automatically, so fs stays at the narrow 2.6 Msps L1 rate.
+        assert cfg.fs == pytest.approx(2.6e6, abs=1.0)
+        assert cfg.center_freq == pytest.approx(1575.42e6)
 
         # BeiDou B1I data stays a separate (non-system) choice.
         win.cmb_b1i_data.setCurrentText("placeholder")

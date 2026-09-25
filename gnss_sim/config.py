@@ -16,6 +16,10 @@ from .gpstime import GpsTime, date2gps
 B1I_CARRIER_HZ = 1561.098e6
 #: Half-width (Hz) each signal group needs around its carrier.
 L1_NARROW_HALF_HZ = 1.023e6     # GPS/QZSS L1 C/A and SBAS L1
+#: Optional BOC(6,1) side-lobe half-width.  Only used when the user explicitly
+#: opts in (GUI «Объединять L1+B1I», CLI ``--combine``): by default the L1 group
+#: is banded conservatively at 2.6 Msps and the ±8.184 MHz side lobes are NOT
+#: preserved.
 L1_BOC_HALF_HZ = 8.184e6        # GPS/QZSS L1C TMBOC(6,1) and Galileo E1 CBOC
 B1I_HALF_HZ = 2.046e6           # BeiDou B1I BPSK(2)
 #: B210 sample-rate limits for a generated stream.
@@ -63,14 +67,17 @@ def compute_combined_band(
     enable_qzss: bool = True,
     enable_sbas: bool = True,
     enable_beidou: bool = True,
+    preserve_boc: bool = False,
 ) -> BandPlan:
     """Compute a combined centre/``fs`` for the *enabled* signal groups.
 
     Half-widths around each carrier (see the module constants): L1 C/A and
-    SBAS ``±1.023 MHz``; L1C TMBOC and Galileo E1 CBOC ``±8.184 MHz``; BeiDou
-    B1I ``±2.046 MHz``.  The result spans ``min..max`` of all enabled groups,
-    is centred on the midpoint, widened by 5 %, snapped to a sane B210 rate
-    and clamped to ``2.6..56 MHz``.
+    SBAS ``±1.023 MHz``; BeiDou B1I ``±2.046 MHz``.  The L1C TMBOC / Galileo E1
+    CBOC ``±8.184 MHz`` BOC(6,1) side lobes are **off by default** (the L1 group
+    stays narrow); pass ``preserve_boc=True`` to keep them (combined wide stream
+    ~1571.33 MHz / 25 Msps).  The result spans ``min..max`` of all enabled
+    groups, is centred on the midpoint, widened by 5 %, snapped to a sane B210
+    rate and clamped to ``2.6..56 MHz``.
     """
     intervals: list[tuple[float, float]] = []
     sources: list[str] = []
@@ -79,6 +86,7 @@ def compute_combined_band(
         intervals.append((carrier - half, carrier + half))
         sources.append(name)
 
+    l1c_half = L1_BOC_HALF_HZ if preserve_boc else L1_NARROW_HALF_HZ
     if enable_ca:
         add("L1 C/A", CARR_FREQ_L1, L1_NARROW_HALF_HZ)
     if enable_sbas:
@@ -86,11 +94,11 @@ def compute_combined_band(
     if enable_qzss and enable_ca:
         add("QZSS C/A", CARR_FREQ_L1, L1_NARROW_HALF_HZ)
     if enable_l1c:
-        add("L1C", CARR_FREQ_L1, L1_BOC_HALF_HZ)
+        add("L1C", CARR_FREQ_L1, l1c_half)
     if enable_galileo:
-        add("E1", CARR_FREQ_L1, L1_BOC_HALF_HZ)
+        add("E1", CARR_FREQ_L1, l1c_half)
     if enable_qzss and enable_l1c:
-        add("QZSS L1C", CARR_FREQ_L1, L1_BOC_HALF_HZ)
+        add("QZSS L1C", CARR_FREQ_L1, l1c_half)
     if enable_beidou:
         add("B1I", B1I_CARRIER_HZ, B1I_HALF_HZ)
     if not intervals:  # nothing enabled: keep the historic narrow L1 band
@@ -112,8 +120,8 @@ def compute_combined_band(
 
 
 #: Canonical combined plan with every system enabled (used for the ``all``
-#: preset title/values; the runner/GUI recompute it from the actual enables).
-ALL_BAND_PLAN = compute_combined_band()
+#: preset title/values; only reached via the explicit opt-in / ``--band all``).
+ALL_BAND_PLAN = compute_combined_band(preserve_boc=True)
 
 
 @dataclass(frozen=True)
@@ -200,20 +208,61 @@ def derive_band_key(
     enable_qzss: bool = True,
     enable_sbas: bool = True,
     enable_beidou: bool = True,
+    combine: bool = False,
 ) -> str:
     """Derive the ``l1``/``b1i``/``all`` session from the enabled systems.
 
     Single source of truth for the GUI: BeiDou B1I (1561.098 MHz) only -> ``b1i``;
-    B1I together with any L1/E1 carrier -> the one combined stream ``all``; no
-    B1I -> the historic narrow ``l1`` session.
+    no B1I -> the historic narrow ``l1`` session.  B1I together with any L1/E1
+    carrier is conservative by default: the ``l1`` session is chosen and B1I is
+    dropped (with a message from the runner) instead of silently widening the
+    stream.  Only ``combine=True`` (GUI «Объединять L1+B1I», CLI ``--combine``)
+    picks the one combined wide stream ``all``.
     """
     l1_family = bool(enable_ca or enable_l1c or enable_galileo
                      or enable_qzss or enable_sbas)
     if enable_beidou and l1_family:
-        return "all"
+        return "all" if combine else "l1"
     if enable_beidou:
         return "b1i"
     return "l1"
+
+
+def derive_band_plan(
+    *,
+    enable_ca: bool = True,
+    enable_l1c: bool = True,
+    enable_galileo: bool = True,
+    enable_qzss: bool = True,
+    enable_sbas: bool = True,
+    enable_beidou: bool = True,
+    combine: bool = False,
+) -> BandPlan:
+    """Return the :class:`BandPlan` matching :func:`derive_band_key`.
+
+    Keeps the GUI's read-only fs/centre labels and the runner's resolved band
+    consistent: ``l1`` drops B1I and stays narrow (2.6 MHz / 1575.42 MHz);
+    ``b1i`` is the narrow band around 1561.098 MHz; ``all`` is the explicit
+    combined stream with the BOC(6,1) side lobes preserved (~25 MHz).
+    """
+    band = derive_band_key(
+        enable_ca=enable_ca, enable_l1c=enable_l1c,
+        enable_galileo=enable_galileo, enable_qzss=enable_qzss,
+        enable_sbas=enable_sbas, enable_beidou=enable_beidou,
+        combine=combine)
+    if band == "b1i":
+        return compute_combined_band(
+            enable_ca=False, enable_l1c=False, enable_galileo=False,
+            enable_qzss=False, enable_sbas=False, enable_beidou=True)
+    if band == "l1":
+        return compute_combined_band(
+            enable_ca=enable_ca, enable_l1c=enable_l1c,
+            enable_galileo=enable_galileo, enable_qzss=enable_qzss,
+            enable_sbas=enable_sbas, enable_beidou=False)
+    return compute_combined_band(
+        enable_ca=enable_ca, enable_l1c=enable_l1c,
+        enable_galileo=enable_galileo, enable_qzss=enable_qzss,
+        enable_sbas=enable_sbas, enable_beidou=True, preserve_boc=True)
 
 
 def derive_nav_mode(
@@ -276,6 +325,10 @@ class SimConfig:
     #: computed ``all`` band must not overwrite them.
     fs_override: bool = False
     center_override: bool = False
+    #: Explicit opt-in to one combined L1+B1I stream (~1571.33 MHz / 25 Msps,
+    #: BOC(6,1) side lobes preserved).  Off by default: L1-only stays at
+    #: 2.6 Msps and B1I is dropped with a message.
+    combine: bool = False
 
     enable_ca: bool = True
     enable_l1c: bool = True

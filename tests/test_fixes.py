@@ -313,10 +313,11 @@ def test_gui_layout_controls_and_cb_auto_distinct() -> None:
         assert win.btn_gen.text() == "Сгенерировать IQ"
 
         # fs/centre are read-only derived labels (no manual combos any more);
-        # the default selection is every system -> the combined 25 Msps stream.
+        # the default selection is conservative L1 (2.6 Msps / 1575.42 MHz)
+        # until «Объединять L1+B1I» is ticked.
         assert not hasattr(win, "cmb_fs") and not hasattr(win, "cmb_fc")
-        assert "25" in win.lbl_fs.text()
-        assert "1571" in win.lbl_fc.text()
+        assert "2.6" in win.lbl_fs.text()
+        assert "1575.42" in win.lbl_fc.text()
 
         win.cb_auto.setChecked(False)
         win.cb_tx_auto.setChecked(True)

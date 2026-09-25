@@ -32,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "центр 1561.098 МГц, 4.092 Мвыб/с; all — единый поток "
                         "всех систем (L1/E1 + B1I), центр/fs вычисляются "
                         "(≈1571.33 МГц / 25 Мвыб/с); wide — синоним all")
+    p.add_argument("--combine", action="store_true",
+                   help="явно объединить L1+B1I в один широкий поток "
+                        "(≈1571.33 МГц / ~25 Мвыб/с, боковые лепестки BOC(6,1) "
+                        "сохраняются). По умолчанию при L1+B1I выбирается узкая "
+                        "полоса L1 (2.6 Мвыб/с), а B1I отключается")
     p.add_argument("-s", "--sample-rate", type=float, default=None,
                    help="sampling frequency [Hz] (по умолчанию — из --band)")
     p.add_argument("-f", "--center-freq", type=float, default=None,
@@ -184,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         fs=fs, center_freq=center, band=args.band,
         fs_override=args.sample_rate is not None,
         center_override=args.center_freq is not None,
+        combine=args.combine,
         enable_ca=not args.no_ca, enable_l1c=not args.no_l1c,
         enable_galileo=not args.no_galileo, enable_qzss=not args.no_qzss,
         enable_sbas=not args.no_sbas, enable_beidou=not args.no_beidou,

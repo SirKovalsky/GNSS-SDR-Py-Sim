@@ -127,6 +127,31 @@ def test_generate_to_ram_stops_on_stop_event() -> None:
     assert got == 4 and len(blocks) == 1
 
 
+def test_generate_to_ram_emits_progress() -> None:
+    """The GUI/CLI progress bar must advance during TX pre-generation."""
+    cfg = SimConfig(fs=1.0e6)
+    logs: list[str] = []
+    seen: list[tuple] = []
+    runner = SimulationRunner(
+        cfg, log=logs.append,
+        progress=lambda frac, sim_s, wall, rate: seen.append(
+            (frac, sim_s, wall, rate)))
+
+    class _Engine:
+        def generate_block(self, n: int) -> np.ndarray:
+            return np.zeros(int(n), dtype=np.complex128)
+
+    runner.engine = _Engine()
+    blocks, got = runner._generate_to_ram(8, 4)
+    assert got == 8 and len(blocks) == 2
+    # One progress update per generated block, ending at 100 %.
+    assert len(seen) == 2
+    assert seen[-1][0] == pytest.approx(1.0)
+    assert seen[-1][1] == pytest.approx(8 / 1.0e6)
+    # The human-readable log uses the «Предгенерация: X% (Y из Z с)» wording.
+    assert any(m.startswith("Предгенерация:") for m in logs)
+
+
 def test_write_ram_blocks_stops_between_blocks() -> None:
     runner, _logs = _runner(2.6e6)
 

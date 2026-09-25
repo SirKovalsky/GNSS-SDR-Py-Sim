@@ -29,7 +29,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import track as trackmod
 from . import ublox
-from .config import (SimConfig, compute_combined_band, derive_band_key,
+from .config import (SimConfig, derive_band_key, derive_band_plan,
                      derive_nav_mode)
 from .mapview import OsmMap
 from .runner import SimulationRunner
@@ -964,23 +964,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._guard_combo(self.cmb_b1i_data)
         _row(f, 1, "Данные B1I", self.cmb_b1i_data)
 
+        self.cb_combine = QtWidgets.QCheckBox(
+            "Объединять L1+B1I (широкая полоса ~25 Мвыб/с)")
+        self.cb_combine.setChecked(False)
+        self.cb_combine.setToolTip(
+            "По умолчанию L1 и B1I несовместимы по полосе: при обеих группах "
+            "выбирается узкая L1 (2.6 Мвыб/с, центр 1575.42 МГц), а B1I "
+            "отключается. Включите эту галочку (или CLI --combine / --band all), "
+            "чтобы получить один широкий поток ~1571.33 МГц / ~25 Мвыб/с с "
+            "сохранением боковых лепестков BOC(6,1). Предгенерация такого "
+            "сегмента в RAM занимает минуты и несколько ГБ.")
+        f.addWidget(self.cb_combine, 2, 0, 1, 2)
+
         self.cb_auto_b1i = QtWidgets.QCheckBox("Авто-подбор fs/центра под B1I")
         self.cb_auto_b1i.setChecked(True)
         self.cb_auto_b1i.setToolTip(
-            "Устаревшее: авто-подбор широкой полосы под B1I (если B1I не "
-            "помещается). При едином потоке (B1I + L1) центр/fs вычисляются "
-            "автоматически из выбранных систем.")
-        f.addWidget(self.cb_auto_b1i, 2, 0, 1, 2)
+            "Устаревшее: авто-подбор широкой полосы под B1I, если он не "
+            "помещается в текущую полосу (действует только при ручных -s/-f). "
+            "В обычном режиме полоса выводится из галочек «Сигналы».")
+        f.addWidget(self.cb_auto_b1i, 3, 0, 1, 2)
         self.lbl_auto_b1i = QtWidgets.QLabel(
-            "B1I (1561.098 МГц) не помещается в узкую полосу L1. Отметьте "
-            "«BeiDou B1I» вместе с L1/E1 — программа сама соберёт единый поток "
-            "(центр/fs вычисляются) и возьмёт мультисистемный RINEX.")
+            "B1I (1561.098 МГц) не помещается в узкую полосу L1: без галочки "
+            "«Объединять L1+B1I» B1I отключается, fs остаётся 2.6 Мвыб/с. "
+            "Для объединённого широкого потока включите эту галочку.")
         self.lbl_auto_b1i.setWordWrap(True)
-        f.addWidget(self.lbl_auto_b1i, 3, 0, 1, 2)
+        f.addWidget(self.lbl_auto_b1i, 4, 0, 1, 2)
         f.addWidget(self._group_reset_btn(
             self._reset_band_group,
-            "Сбросить данные B1I и авто-подбор"),
-            4, 0, 1, 2)
+            "Сбросить данные B1I и объединение"),
+            5, 0, 1, 2)
+        self.cb_combine.stateChanged.connect(self._refresh_derived)
         return g
 
     # ------------------------------------------------------------------
@@ -992,6 +1005,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if not hasattr(self, "lbl_band") or not hasattr(self, "lbl_fs"):
             return
+        combine = (self.cb_combine.isChecked()
+                   if hasattr(self, "cb_combine") else False)
         enables = {
             "enable_ca": self.cb_ca.isChecked(),
             "enable_l1c": self.cb_l1c.isChecked(),
@@ -1000,8 +1015,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "enable_sbas": self.cb_sbas.isChecked(),
             "enable_beidou": self.cb_bds.isChecked(),
         }
-        band = derive_band_key(**enables)
-        plan = compute_combined_band(**enables)
+        band = derive_band_key(combine=combine, **enables)
+        plan = derive_band_plan(combine=combine, **enables)
         if not any(enables.values()):
             self.lbl_band.setText(
                 "<b>Системы не выбраны</b> — отметьте хотя бы один сигнал.")
@@ -1012,9 +1027,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"<b>Диапазон (вычислен): {band}</b><br>{plan.describe()}")
             self.lbl_fs.setText(f"<b>{plan.fs / 1e6:g}</b> Мвыб/с")
             self.lbl_fc.setText(f"<b>{plan.center_freq / 1e6:.3f}</b> МГц")
+        if hasattr(self, "lbl_auto_b1i"):
+            if enables["enable_beidou"] and band == "l1":
+                self.lbl_auto_b1i.setText(
+                    "BeiDou B1I отключён: он не входит в узкую полосу L1 "
+                    "(fs останется 2.6 Мвыб/с). Включите «Объединять L1+B1I», "
+                    "чтобы передать L1 и B1I одним широким потоком ~25 Мвыб/с.")
+            elif band == "all":
+                self.lbl_auto_b1i.setText(
+                    "Объединённый поток L1+B1I (~25 Мвыб/с): предгенерация "
+                    "TX-сегмента в RAM занимает минуты и несколько ГБ.")
+            else:
+                self.lbl_auto_b1i.setText(
+                    "B1I (1561.098 МГц) не помещается в узкую полосу L1: без "
+                    "галочки «Объединять L1+B1I» B1I отключается, fs остаётся "
+                    "2.6 Мвыб/с.")
         self._set_nav_mode_note()
 
     def _reset_band_group(self) -> None:
+        if hasattr(self, "cb_combine"):
+            self.cb_combine.setChecked(False)
         self.cb_auto_b1i.setChecked(True)
         self.cmb_b1i_data.setCurrentText("d1")
         self._refresh_derived()
@@ -2002,8 +2034,10 @@ class MainWindow(QtWidgets.QMainWindow):
             enable_qzss=self.cb_qzss.isChecked(),
             enable_sbas=self.cb_sbas.isChecked(),
             enable_beidou=self.cb_bds.isChecked())
-        band = derive_band_key(**enables)
-        plan = compute_combined_band(**enables)
+        combine = (self.cb_combine.isChecked()
+                   if hasattr(self, "cb_combine") else False)
+        band = derive_band_key(combine=combine, **enables)
+        plan = derive_band_plan(combine=combine, **enables)
         fs = plan.fs
         center = plan.center_freq
         nav_mode = derive_nav_mode(enable_galileo=enables["enable_galileo"],
@@ -2021,6 +2055,7 @@ class MainWindow(QtWidgets.QMainWindow):
             band=band,
             fs_override=False,
             center_override=False,
+            combine=combine,
             nav_mode=nav_mode,
             **enables,
             el_mask=self.sp_el.value(), amp_scale=self.sp_amp.value(),

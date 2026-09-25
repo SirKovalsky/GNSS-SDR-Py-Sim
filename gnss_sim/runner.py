@@ -474,15 +474,22 @@ class SimulationRunner:
             preset = band_preset("l1")
             key = "l1"
 
-        if key == "l1":
+        if key == "l1" and not (cfg.enable_beidou
+                                and getattr(cfg, "combine", False)):
             if cfg.enable_beidou:
                 cfg.enable_beidou = False
                 self._logf(
                     "Сессия l1: BeiDou B1I (1561.098 МГц) не помещается в "
-                    "полосу L1 и отключён — это НЕ переключает fs на 30 "
-                    "Мвыб/с. Для B1I выберите сессию «b1i» (только B1I) или "
-                    "«all» (все системы одновременно).")
+                    "узкую полосу L1 и отключён (fs остаётся 2.6 Мвыб/с). "
+                    "Чтобы объединить L1+B1I в одну широкую полосу "
+                    "(~25 Мвыб/с), включите «Объединять L1+B1I» в GUI или "
+                    "флаг --combine (либо --band all). Для только B1I "
+                    "выберите сессию «b1i».")
             return
+        if key == "l1":
+            # Explicit opt-in (cfg.combine) with BeiDou enabled: fall through to
+            # the combined stream below.
+            key = "all"
 
         if key == "b1i":
             changed: list[str] = []
@@ -503,12 +510,14 @@ class SimulationRunner:
                        + ((" (" + "; ".join(changed) + ")") if changed else ""))
             return
 
-        # key in ("all", "wide"): one computed combined stream.
+        # key in ("all", "wide") or an explicit l1+combine opt-in: one computed
+        # combined stream, preserving the BOC(6,1) side lobes (~25 Msps).
         cfg.enable_beidou = True
         plan = compute_combined_band(
             enable_ca=cfg.enable_ca, enable_l1c=cfg.enable_l1c,
             enable_galileo=cfg.enable_galileo, enable_qzss=cfg.enable_qzss,
-            enable_sbas=cfg.enable_sbas, enable_beidou=True)
+            enable_sbas=cfg.enable_sbas, enable_beidou=True,
+            preserve_boc=True)
         changed = []
         if getattr(cfg, "fs_override", False):
             changed.append(f"fs {cfg.fs / 1e6:.3f} Мвыб/с (задано явно)")
@@ -528,6 +537,15 @@ class SimulationRunner:
         self._logf("Полоса all (расчёт): " + plan.describe())
         if changed:
             self._logf("  итог: " + "; ".join(changed))
+        has_l1 = bool(cfg.enable_ca or cfg.enable_l1c or cfg.enable_galileo
+                      or cfg.enable_qzss or cfg.enable_sbas)
+        if has_l1 and cfg.enable_beidou:
+            self._logf(
+                "ВНИМАНИЕ: объединённый поток L1+B1I широкий "
+                f"(~{plan.fs / 1e6:g} Мвыб/с, сохранены боковые лепестки "
+                "BOC(6,1)): предгенерация TX-сегмента в RAM может занять "
+                "минуты и несколько ГБ. Уменьшите длительность или "
+                "используйте узкую сессию l1/b1i.")
         if cfg.use_usrp:
             self._logf(
                 f"TX: единый поток {cfg.fs / 1e6:.2f} Мвыб/с, центр "
@@ -944,13 +962,20 @@ class SimulationRunner:
             self._emit_spectrum("TX", b)
             blocks.append(b)
             got += n
+            # Advance the GUI/CLI progress bar while nothing is transmitted
+            # yet (the sink has not received a single sample in this phase).
+            if self._progress is not None:
+                wall = max(1e-9, time.time() - t0)
+                sim_s = got / fs
+                frac = (got / target) if target else 0.0
+                self._progress(frac, sim_s, wall, sim_s / wall)
             pct = int(100 * got / target) if target else 100
             now = time.time()
             if pct >= next_pct or now - last_log >= 2.0:
                 while next_pct <= pct:
                     next_pct += 5
                 last_log = now
-                self._logf(f"Предгенерация сегмента: {pct}% "
+                self._logf(f"Предгенерация: {pct}% "
                            f"({got / fs:.1f} с из {target / fs:.1f} с)")
         elapsed = max(1e-9, time.time() - t0)
         rate = got / elapsed
