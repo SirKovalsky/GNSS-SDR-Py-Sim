@@ -50,6 +50,13 @@ AUTO_AMP_MAX = 0.15
 #: on real multi-GNSS scenes (≈0.74…1.34); the value is chosen so the estimated
 #: pre-headroom peak stays below full scale.
 AUTO_AMP_PEAK_RATIO = 1.5
+#: Full-scale amplitude of the *delivery format* in baseband units.  A unit
+#: float is 0 dBFS only for ``cf32``/live USRP; ``cs16`` files use
+#: ``output_scale`` (default 10000), so an ``|x|`` of 1.0 is NOT full scale —
+#: the real clip limit is ``32767 / output_scale`` (≈3.28).  Ignoring this was
+#: the regression that made auto-amp + headroom attenuate a normal scene by
+#: ~10 dB (no F9P fix).  The runner passes the concrete value per run.
+DEFAULT_FULL_SCALE = 1.0
 
 
 @dataclass(frozen=True)
@@ -105,18 +112,23 @@ def combine_levels(blocks: Sequence) -> LevelStats:
 
 
 def auto_amp_scale(weights: Iterable[float],
-                   target: float = DEFAULT_AUTO_AMP_PEAK) -> float:
+                   target: float = DEFAULT_AUTO_AMP_PEAK,
+                   full_scale: float = DEFAULT_FULL_SCALE) -> float:
     """Single scene-wide amplitude derived from the per-channel weights.
 
     ``weights`` are the geometry/antenna weighted per-channel amplitudes (the
-    composite peak grows roughly linearly with their sum).  The result is
-    clamped to ``AUTO_AMP_MIN..AUTO_AMP_MAX`` so a GPS-only scene stays loud
-    and a many-channel scene does not become too quiet.
+    composite peak grows roughly linearly with their sum).  ``full_scale`` is
+    the clip limit of the delivery format in baseband units (1.0 for cf32/live
+    USRP, ``32767/output_scale`` for cs16); the target peak is expressed
+    relative to it.  The result is clamped to ``AUTO_AMP_MIN..AUTO_AMP_MAX`` so
+    a GPS-only scene stays loud and a many-channel scene does not become too
+    quiet.
     """
     total = float(sum(w for w in weights if w and w > 0.0))
     if total <= 0.0:
         return AUTO_AMP_MAX
-    value = float(target) / (AUTO_AMP_PEAK_RATIO * total)
+    limit = float(full_scale) if full_scale and full_scale > 0.0 else 1.0
+    value = float(target) * limit / (AUTO_AMP_PEAK_RATIO * total)
     return float(min(AUTO_AMP_MAX, max(AUTO_AMP_MIN, value)))
 
 
@@ -127,13 +139,21 @@ class HeadroomController:
     into RAM: the exact global peak is measured and **one** scale is applied to
     every sample (no level discontinuity on the air).  ``process_block`` is the
     streaming fallback: the scale starts from the first block and only ever
-    decreases when a later block would clip, so no sample exceeds 1.0.
+    decreases when a later block would clip, so no sample exceeds the target.
+
+    ``target`` is a fraction of ``full_scale`` — the clip limit of the delivery
+    format (1.0 for cf32/live USRP, ``32767/output_scale`` for cs16).  For a
+    cs16 file the effective target is therefore ~2.3, not 0.7, and a normal
+    multi-GNSS scene (float peak ≈2.1) is left untouched — which is what the
+    F9P needs to acquire.
     """
 
     def __init__(self, target: float = DEFAULT_HEADROOM_TARGET,
                  enabled: bool = True, log: Callable[[str], None] | None = None,
-                 name: str = "TX") -> None:
-        self.target = float(target)
+                 name: str = "TX",
+                 full_scale: float = DEFAULT_FULL_SCALE) -> None:
+        limit = float(full_scale) if full_scale and full_scale > 0.0 else 1.0
+        self.target = float(target) * limit
         self.enabled = bool(enabled) and self.target > 0.0
         self.name = str(name)
         self._log = log

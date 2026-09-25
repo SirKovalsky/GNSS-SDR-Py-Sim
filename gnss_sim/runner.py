@@ -23,10 +23,10 @@ from .iqfile import FileSink, IqFileSource, NullSink, Sink
 from .motion import interpolation_fn, load_user_motion
 from .orbit import llh2xyz
 from .power import (
+    AUTO_AMP_MAX,
     DEFAULT_HEADROOM_TARGET,
     HeadroomController,
     PowerRegulator,
-    auto_amp_scale,
     delay_profile,
     level_stats,
     rms_dbfs,
@@ -366,6 +366,28 @@ class SimulationRunner:
         except Exception:  # noqa: BLE001
             pass
 
+    def _full_scale(self) -> float:
+        """Clip limit of the delivery format in baseband units.
+
+        Live USRP TX streams ``fc32`` (full scale 1.0).  Integer IQ files are
+        written as ``round(x * output_scale)`` clipped to the integer range, so
+        the baseband clip limit is ``int_max / output_scale`` (``cs16`` with the
+        default ``output_scale=10000`` gives ≈3.28, not 1.0).  Using 1.0 here
+        was the regression: it made the anti-clip path attenuate a normal
+        scene by ~10 dB and the F9P stopped acquiring.
+        """
+        cfg = self.cfg
+        fmt = "cf32" if bool(getattr(cfg, "use_usrp", False)) else str(
+            getattr(cfg, "output_format", "cs16") or "cs16")
+        scale = float(getattr(cfg, "output_scale", 10000.0) or 1.0)
+        if fmt == "cs16":
+            return 32767.0 / scale
+        if fmt == "cs8":
+            return (127.0 * 256.0) / scale
+        if fmt == "cs4":
+            return (7.0 * 4096.0) / scale
+        return 1.0  # cf32 / float
+
     def _headroom_ctl(self) -> HeadroomController:
         """Lazily build the anti-clip controller for this run."""
         if self._headroom is None:
@@ -374,32 +396,36 @@ class SimulationRunner:
                 target=float(getattr(cfg, "headroom_target",
                                      DEFAULT_HEADROOM_TARGET)),
                 enabled=bool(getattr(cfg, "headroom", True)),
-                log=self._logf)
+                log=self._logf,
+                full_scale=self._full_scale())
         return self._headroom
 
     def _apply_auto_amp(self, engine: SignalEngine) -> None:
-        """Derive a scene-wide amplitude when ``cfg.amp_scale`` is ``None``.
+        """Use the historic nominal amplitude when ``cfg.amp_scale`` is ``None``.
 
-        The per-channel amplitudes set by :meth:`SignalEngine._allocate` use the
-        provisional scale; the weights (amplitude / provisional) let us pick one
-        scale so the estimated composite peak stays below full scale (the
-        headroom controller then trims it to the target).  An explicit
-        ``cfg.amp_scale`` is honoured unchanged.
+        The earlier "automatic" formula reduced the per-channel amplitude by the
+        summed weights (≈-10 dB on a full L1 scene).  That attenuation was
+        redundant — the anti-clip controller (when enabled) already measures and
+        trims the real composite peak — and it took the ZED-F9P below its
+        acquisition threshold on a marginal link.  The nominal 0.15 restores the
+        level that produced fixes; an explicit ``cfg.amp_scale`` still wins.
         """
         cfg = self.cfg
         if cfg.amp_scale is not None:
             return
         try:
             channels = list(engine.channels)
-            provisional = float(engine.amp_scale) or 0.15
+            provisional = float(engine.amp_scale) or AUTO_AMP_MAX
+            weights = [c.amp / provisional for c in channels]
         except Exception:  # noqa: BLE001 - fake engines in tests
             return
-        weights = [c.amp / provisional for c in channels]
-        scale = auto_amp_scale(weights)
-        engine.set_amp_scale(scale)
+        # Auto = historic nominal; the headroom controller (opt-in) enforces
+        # the composite peak, so attenuating here would double-count.
+        engine.set_amp_scale(AUTO_AMP_MAX)
         self._logf(
-            f"Амплитуда: авто (по {len(channels)} каналам) — масштаб "
-            f"{scale:.4f} (сумма весов {sum(weights):.2f}); явно задать: "
+            f"Амплитуда: авто — номинал {AUTO_AMP_MAX:.4f} "
+            f"(по {len(channels)} каналам, сумма весов {sum(weights):.2f}, "
+            f"полная шкала {self._full_scale():.2f}); явно задать: "
             f"--amp / поле «Амплитуда»")
 
     def _warn_high_fs_tx(self) -> None:

@@ -342,10 +342,12 @@ class SimConfig:
     #: multi-system scene already has headroom; an explicit float keeps the
     #: historic single-factor behaviour (CLI ``--amp``, GUI «Амплитуда»).
     amp_scale: float | None = None
-    #: Automatic anti-clip headroom for the composite baseband (default ON):
-    #: the pre-generated segment gets one exact scale (peak ≈ ``headroom_target``)
-    #: and streaming TX tracks a scale that only ever decreases.
-    headroom: bool = True
+    #: Automatic anti-clip headroom for the composite baseband.  OFF by
+    #: default: pre-scaling the composite to 0.7 cost ~3 dB on live TX and the
+    #: historic fixed 0.15 amplitude is what the ZED-F9P was verified with.
+    #: When enabled it is format-aware (cs16 full scale ≈ 32767/output_scale),
+    #: so it only trims samples that would actually overflow the int16 writer.
+    headroom: bool = False
     headroom_target: float = 0.7
     iono_enable: bool = True
     l1c_data: str = "zeros"

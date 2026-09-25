@@ -116,22 +116,48 @@ def test_auto_amp_gps_only_stays_loud() -> None:
     assert 0.10 <= scale <= AUTO_AMP_MAX
 
 
+def test_auto_amp_respects_format_full_scale() -> None:
+    """cs16 full scale is ~3.28, so a normal multi-GNSS sum keeps the nominal.
+
+    This is the regression fix: with the old hard-coded 1.0 reference the same
+    weights produced ≈0.05 (≈-10 dB) and the receiver lost the fix.
+    """
+    weights = [0.59] * 23          # ~13.6: GPS+QZSS+SBAS L1 scene
+    assert auto_amp_scale(weights) < 0.08          # old 1.0 reference
+    assert auto_amp_scale(weights, full_scale=3.2767) == pytest.approx(
+        AUTO_AMP_MAX)
+    # An over-range estimate is still allowed to fall (safety preserved).
+    assert auto_amp_scale([1.0] * 45, full_scale=3.2767) < AUTO_AMP_MAX
+
+
+def test_headroom_target_scales_with_format() -> None:
+    ctl = HeadroomController(target=0.7, full_scale=3.2767,
+                             log=lambda _m: None)
+    assert ctl.target == pytest.approx(0.7 * 3.2767)
+    hot = [np.full(100, 5.0 + 0j)]
+    ctl.process_segment(hot)
+    assert combine_levels(hot).peak == pytest.approx(ctl.target, rel=1e-6)
+
+
 def test_config_and_cli_defaults() -> None:
     cfg = SimConfig()
-    assert cfg.amp_scale is None       # automatic by default
-    assert cfg.headroom is True
+    assert cfg.amp_scale is None       # historic nominal 0.15
+    assert cfg.headroom is False       # anti-clip is opt-in
     assert cfg.headroom_target == pytest.approx(0.7)
 
     from gnss_sim.cli import build_parser
     p = build_parser()
     a = p.parse_args([])
     assert a.amp is None
-    assert a.headroom == pytest.approx(0.7)
+    assert a.headroom is None          # off unless requested
     assert a.no_headroom is False
-    a = p.parse_args(["--no-headroom", "--headroom", "0.5", "--amp", "0.1"])
-    assert a.no_headroom is True
+    a = p.parse_args(["--headroom"])
+    assert a.headroom == pytest.approx(0.7)
+    a = p.parse_args(["--headroom", "0.5", "--amp", "0.1"])
     assert a.headroom == pytest.approx(0.5)
     assert a.amp == pytest.approx(0.1)
+    a = p.parse_args(["--no-headroom"])
+    assert a.no_headroom is True
 
 
 # ======================================================================
@@ -185,8 +211,10 @@ def test_headroom_stream_never_clips_and_only_lowers() -> None:
 # Runner integration: streaming/bounded and file paths stay within target
 # ======================================================================
 def test_runner_file_output_applies_headroom() -> None:
+    # cf32/float full scale is 1.0, so a >=1 peak must be trimmed to the target.
     cfg = SimConfig(fs=1.0e6, duration=0.05, loop=False, block_ms=50.0,
-                    headroom=True, headroom_target=0.7)
+                    headroom=True, headroom_target=0.7,
+                    output_format="cf32")
     runner = SimulationRunner(cfg, log=lambda _m: None)
     runner.engine = _FakeEngine(1.5 + 1.5j)  # peak 2.121
     runner.sink = _PeakRecorder()
@@ -195,6 +223,28 @@ def test_runner_file_output_applies_headroom() -> None:
     assert produced == 50_000
     assert runner.sink.peak <= 0.7 + 1e-6
     assert runner.sink.clips == 0
+
+
+def test_runner_cs16_normal_scene_is_not_attenuated() -> None:
+    """Regression: cs16 full scale is 32767/output_scale (≈3.28), not 1.0.
+
+    A realistic multi-GNSS float peak (≈2.1) is well inside the int16 range,
+    so the auto-amp + headroom chain must leave it alone.  Previously the
+    hard-coded 1.0 reference scaled it to 0.7 (≈-10 dB) and the ZED-F9P stopped
+    acquiring; ``--amp 0.15 --no-headroom`` restored it.
+    """
+    cfg = SimConfig(fs=1.0e6, duration=0.05, loop=False, block_ms=50.0,
+                    headroom=True, headroom_target=0.7)  # cs16, scale 10000
+    runner = SimulationRunner(cfg, log=lambda _m: None)
+    fake = _FakeEngine(1.5 + 1.5j)  # peak 2.121 < 32767/10000
+    runner.engine = fake
+    runner.sink = _PeakRecorder()
+    runner._segment_seconds = None
+    produced = runner._run_engine(0.0)
+    assert produced == 50_000
+    assert runner.sink.peak == pytest.approx(2.1213, abs=1e-3)
+    # The format flag is exposed to the GUI/journal and matches the writer.
+    assert runner._full_scale() == pytest.approx(3.2767)
 
 
 def test_runner_tx_bounded_applies_headroom() -> None:
@@ -265,16 +315,27 @@ def test_all_signal_composite_peak_within_headroom_target() -> None:
         by_sv, iono, lambda _g: xyz, start, 2.6e6, center_freq=1575.42e6,
         el_mask=5.0 / R2D, amp_scale=0.15)
     runner._apply_auto_amp(engine)
-    # The automatic single scale already keeps a multi-channel scene sane.
-    assert engine.amp_scale < 0.15
+    # For a cs16 file the full scale is 32767/output_scale (≈3.28), so the
+    # automatic scale must stay at the historic nominal — reducing it (the old
+    # 1.0 reference) cost ~10 dB and broke the F9P fix.  It only kicks in for
+    # genuinely over-range scenes.
+    assert engine.amp_scale == pytest.approx(AUTO_AMP_MAX)
     blocks = [engine.generate_block(65536) for _ in range(4)]
     before = combine_levels(blocks)
-    ctl = HeadroomController(target=cfg.headroom_target, log=lambda _m: None)
+    ctl = runner._headroom_ctl()   # format-aware full scale
     ctl.process_segment(blocks)
     after = combine_levels(blocks)
-    assert after.peak <= 0.7 + 1e-6
-    assert after.clips == 0
+    # A normal composite is inside the int16 limit and must not be trimmed.
     assert before.peak > 0.0
+    assert before.peak <= runner._full_scale()
+    assert after.peak == pytest.approx(before.peak, rel=1e-6)
+    assert ctl.scale == pytest.approx(1.0)
+    # A genuinely over-range block is still trimmed to the format target.
+    hot = [np.full(4096, 4.0 + 0j)]
+    ctl2 = runner._headroom_ctl()
+    ctl2.target = 0.7 * runner._full_scale()
+    ctl2.process_segment(hot)
+    assert combine_levels(hot).peak == pytest.approx(ctl2.target, rel=1e-6)
 
 
 # ======================================================================
@@ -321,22 +382,22 @@ def test_gui_auto_amp_and_headroom_controls() -> None:
     try:
         assert win.cb_amp_auto.isChecked() is True
         assert win.sp_amp.isEnabled() is False
-        assert win.cb_headroom.isChecked() is True
+        assert win.cb_headroom.isChecked() is False
         assert win.sp_headroom.value() == pytest.approx(0.7)
         cfg = win._collect()
         assert cfg.amp_scale is None
-        assert cfg.headroom is True
+        assert cfg.headroom is False
         assert cfg.headroom_target == pytest.approx(0.7)
         # Explicit override: uncheck «Авто» and set a single factor.
         win.cb_amp_auto.setChecked(False)
         win.sp_amp.setValue(0.1)
         assert win._collect().amp_scale == pytest.approx(0.1)
-        win.cb_headroom.setChecked(False)
-        assert win._collect().headroom is False
+        win.cb_headroom.setChecked(True)
+        assert win._collect().headroom is True
         # «по умолчанию» restores the automatic defaults.
         win._reset_signals_group()
         assert win.cb_amp_auto.isChecked() is True
-        assert win.cb_headroom.isChecked() is True
+        assert win.cb_headroom.isChecked() is False
         assert win._collect().amp_scale is None
     finally:
         win.close()

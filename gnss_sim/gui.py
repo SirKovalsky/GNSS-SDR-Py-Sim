@@ -974,11 +974,14 @@ class MainWindow(QtWidgets.QMainWindow):
         amp_row.addWidget(self.cb_amp_auto)
         _row(f2, 9, "Амплитуда", self._wrap(amp_row))
         self.cb_headroom = QtWidgets.QCheckBox("Ограничивать пик (anti-clip)")
-        self.cb_headroom.setChecked(True)
+        self.cb_headroom.setChecked(False)
         self.cb_headroom.setToolTip(
-            "Автоматический запас по уровню: пик композитного сигнала "
-            "приводится к целевому значению, чтобы ЦАП B210 не клиппировал. "
-            "Для предгенерённого сегмента применяется один точный масштаб.")
+            "Автоматический запас по уровню (по умолчанию ВЫКЛ для "
+            "исторического уровня 0.15, проверенного на ZED-F9P): пик "
+            "композитного сигнала приводится к целевой доле полной шкалы "
+            "ФОРМАТА (для cs16 это 32767/output_scale, поэтому обычная сцена "
+            "не ослабляется). Для предгенерённого сегмента — один точный "
+            "масштаб.")
         self.sp_headroom = QtWidgets.QDoubleSpinBox()
         self.sp_headroom.setRange(0.1, 0.95)
         self.sp_headroom.setSingleStep(0.05)
@@ -1009,7 +1012,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_el.setValue(5.0)
         self.cb_amp_auto.setChecked(True)
         self.sp_amp.setValue(0.15)
-        self.cb_headroom.setChecked(True)
+        self.cb_headroom.setChecked(False)
         self.sp_headroom.setValue(0.7)
         if hasattr(self, "lbl_band"):
             self._refresh_derived()
