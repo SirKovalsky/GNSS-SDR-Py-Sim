@@ -246,6 +246,7 @@ class UhdTxSink:
         self._queue: "queue.Queue[np.ndarray | None] | None" = None
         self._sender: threading.Thread | None = None
         self._sender_error: TxError | None = None
+        self._async_md: Any = None
 
         with self._lock:
             self.usrp = uhd.usrp.MultiUSRP(args)
@@ -322,6 +323,31 @@ class UhdTxSink:
         self._streamer = self.usrp.get_tx_stream(st_args)
         self._max_samps = int(self._streamer.get_max_num_samps())
         self._buff = np.zeros((1, self._max_samps), dtype=np.complex64)
+        # UHD >= 4.x exposes TX underflow events through the async queue.
+        # The synchronous metadata object has no ``error_code`` in the Python
+        # bindings, so this is the only reliable underflow counter.
+        self._async_md = None
+        try:
+            self._async_md = uhd.types.TXAsyncMetadata()
+        except Exception:  # noqa: BLE001 - older binding
+            self._async_md = None
+
+    def _drain_async(self) -> None:
+        """Count TX async events (underflow/sequence/time errors)."""
+        md = self._async_md
+        streamer = self._streamer
+        if md is None or streamer is None:
+            return
+        while True:
+            try:
+                ok = streamer.recv_async_msg(md, 0.0)
+            except Exception:  # noqa: BLE001 - async unsupported on some devices
+                return
+            if not ok:
+                return
+            name = str(getattr(md, "event_code", "")).lower()
+            if "underflow" in name:
+                self._underflows += 1
 
     @property
     def max_num_samps(self) -> int:
@@ -386,6 +412,7 @@ class UhdTxSink:
                 break
             try:
                 self._send_block(item, md, ec)
+                self._drain_async()
             except BaseException as exc:  # noqa: BLE001 - stop cleanly
                 self._sender_error = classify_tx_error(exc)
                 self._warn(str(self._sender_error))
@@ -407,7 +434,10 @@ class UhdTxSink:
             md.start_of_burst = (off == 0 and self._sent == 0)
             md.end_of_burst = False
             sent = int(self._streamer.send(block, md, 1.0))
-            if tx_has_error(md, "underflow", ec):
+            # A short send means UHD could not push the whole chunk before the
+            # timeout (an underflow).  Newer bindings do not expose
+            # ``md.error_code``, so the short-send test is the reliable signal.
+            if sent < chunk or tx_has_error(md, "underflow", ec):
                 self._underflows += 1
             off += sent
             self._sent += sent
@@ -424,12 +454,16 @@ class UhdTxSink:
                 pass
             self._sender.join(timeout=5.0)
             self._sender = None
+        self._drain_async()
         self._queue = None
         if self._streamer is not None:
             try:
                 md = self._uhd.types.TXMetadata()
                 md.end_of_burst = True
-                self._streamer.send(self._buff[:, :0], md, 1.0)
+                # Send one (zero) guard sample with end_of_burst: UHD flags a
+                # zero-length EOB as an underflow burst on some B2xx firmwares.
+                self._buff[:, :1] = 0.0
+                self._streamer.send(self._buff[:, :1], md, 1.0)
             except Exception:
                 pass
         self._streamer = None

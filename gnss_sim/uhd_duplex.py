@@ -232,7 +232,8 @@ class UhdDuplex:
                                                   md, 1.0)
                 except Exception as exc:  # pragma: no cover - железо
                     raise TxError(f"Ошибка передачи UHD: {exc}") from exc
-                if tx_has_error(md, "underflow", ec):
+                # Short send == underflow (newer bindings hide md.error_code).
+                if int(sent) < chunk or tx_has_error(md, "underflow", ec):
                     self._underflows += 1
                 off += int(sent)
                 if sent == 0:

@@ -72,6 +72,24 @@ def test_uhd_tx_sink_exposes_gain_range_property() -> None:
     assert isinstance(UhdTxSink.gain_range, property)
 
 
+def test_send_block_counts_short_send_as_underflow() -> None:
+    """Newer UHD bindings hide ``md.error_code``; short sends mean underflow."""
+    import types
+
+    class _ShortStreamer:
+        def send(self, block, md, timeout):
+            return max(1, int(block.shape[1]) - 1)  # always one short
+
+    sink = object.__new__(UhdTxSink)
+    sink._streamer = _ShortStreamer()
+    sink._underflows = 0
+    sink._sent = 0
+    sink._max_samps = 4
+    md = types.SimpleNamespace(start_of_burst=False, end_of_burst=False)
+    sink._send_block(np.zeros(8, dtype=np.complex64), md, None)
+    assert sink._underflows >= 1
+
+
 # ======================================================================
 # A1) Runner TX: pre-generation into RAM / bounded producer-consumer
 # ======================================================================
@@ -291,6 +309,9 @@ def test_gui_start_coverage_binding() -> None:
     try:
         win.chk_now.setChecked(False)
         win.ed_nav.setText(_NAV)
+        # Fix the start inside the file coverage so the assertion does not
+        # depend on the wall clock (the file covers 2026/09/25 ~00:00–06:14).
+        win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 25, 3, 0, 0))
         win._update_start_range()
         assert "Покрытие эфемерид" in win.lbl_start_cover.text()
         lo = win.ed_start.minimumDateTime()

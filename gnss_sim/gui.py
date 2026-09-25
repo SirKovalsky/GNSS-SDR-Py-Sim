@@ -16,7 +16,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import track as trackmod
 from . import ublox
-from .config import BAND_PRESETS, SimConfig
+from .config import BAND_PRESETS, SimConfig, compute_combined_band
 from .mapview import OsmMap
 from .runner import SimulationRunner
 from .spectrum import SpectrumWidget
@@ -46,7 +46,8 @@ _SAMPLE_RATES = [200000, 250000, 500000, 1000000, 1023000, 2000000, 2046000,
                  2500000, 2600000, 4000000, 5000000, 10000000, 20460000,
                  25000000, 30720000, 40000000, 50000000, 56000000, 61440000]
 #: Standard centre frequencies (Hz, label) for the editable combo box.
-_CENTER_FREQS = [(1561098000, "B1I"), (1568250000, "L1+B1I wideband"),
+_CENTER_FREQS = [(1561098000, "B1I"), (1571328000, "L1+E1+B1I (all)"),
+                 (1568250000, "L1+B1I wideband"),
                  (1575420000, "L1/E1/B1C"), (1176450000, "L5/E5a"),
                  (1227600000, "E5b"), (1207140000, "B2b"),
                  (1278750000, "E6/B3")]
@@ -905,8 +906,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_band_group(self) -> QtWidgets.QGroupBox:
         g = QtWidgets.QGroupBox("Диапазон/сессия и BeiDou B1I")
         f = QtWidgets.QGridLayout(g)
+        self._band_updating = False
         self.cmb_band = QtWidgets.QComboBox()
-        for key in ("l1", "b1i", "wide"):
+        for key in ("l1", "b1i", "all"):
             preset = BAND_PRESETS[key]
             self.cmb_band.addItem(preset.title, key)
         self._guard_combo(self.cmb_band)
@@ -926,16 +928,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_auto_b1i = QtWidgets.QCheckBox("Авто-подбор fs/центра под B1I")
         self.cb_auto_b1i.setChecked(True)
         self.cb_auto_b1i.setToolTip(
-            "Устаревшее: авто-подбор широкой полосы 30 Мвыб/с под B1I. "
-            "В сессии «l1» B1I теперь не расширяет полосу, а отключается; "
-            "используйте сессии «b1i» или «wide».")
+            "Устаревшее: авто-подбор широкой полосы под B1I (если B1I не "
+            "помещается). В сессии «l1» B1I отключается; в сессии «all» "
+            "центр/fs вычисляются под включённые системы.")
         f.addWidget(self.cb_auto_b1i, 3, 0, 1, 2)
         self.lbl_auto_b1i = QtWidgets.QLabel(
             "B1I не помещается в полосу L1 (1575.42 МГц, 2.6 Мвыб/с). "
             "Для B1I выберите сессию «b1i» (только BeiDou, 1561.098 МГц, "
-            "4.092 Мвыб/с) или «wide» (все системы, 1568 МГц, 30 Мвыб/с — "
-            "только для IQ-файлов). В сессии «l1» B1I отключается с "
-            "предупреждением, fs на 30 Мвыб/с не переключается.")
+            "4.092 Мвыб/с) или «all» (единый поток всех систем, центр/fs "
+            "вычисляются, ≈1571.33 МГц / 25 Мвыб/с). В сессии «l1» B1I "
+            "отключается с предупреждением.")
         self.lbl_auto_b1i.setWordWrap(True)
         f.addWidget(self.lbl_auto_b1i, 4, 0, 1, 2)
         f.addWidget(self._group_reset_btn(
@@ -943,30 +945,67 @@ class MainWindow(QtWidgets.QMainWindow):
             "Сбросить диапазон/сессию и параметры B1I"),
             5, 0, 1, 2)
 
-        self.cmb_band.currentIndexChanged.connect(self._on_band_changed)
+        self.cmb_band.currentIndexChanged.connect(self._on_band_selected)
+        for cb in (self.cb_ca, self.cb_l1c, self.cb_gal, self.cb_qzss,
+                   self.cb_sbas, self.cb_bds):
+            cb.stateChanged.connect(self._on_signal_toggled)
         self._on_band_changed()
         return g
 
-    def _on_band_changed(self) -> None:
-        """Apply the selected band preset to fs/centre and the signal boxes."""
+    def _on_band_selected(self, *_args) -> None:
+        """Band combo changed: apply the preset (forcing all systems for `all`)."""
+        self._on_band_changed(force_all=True)
+
+    def _on_signal_toggled(self, *_args) -> None:
+        """Recompute the combined band note while in the `all` session."""
+        if getattr(self, "_band_updating", False):
+            return
         key = self.cmb_band.currentData() or "l1"
-        preset = BAND_PRESETS.get(key, BAND_PRESETS["l1"])
-        self._set_combo_hz(self.cmb_fs, preset.fs)
-        self._set_combo_hz(self.cmb_fc, preset.center_freq)
-        if key == "b1i":
-            self.cb_ca.setChecked(False)
-            self.cb_l1c.setChecked(False)
-            self.cb_gal.setChecked(False)
-            self.cb_qzss.setChecked(False)
-            self.cb_sbas.setChecked(False)
-            self.cb_bds.setChecked(True)
-        elif key == "wide":
-            for cb in (self.cb_ca, self.cb_l1c, self.cb_gal, self.cb_qzss,
-                       self.cb_sbas, self.cb_bds):
-                cb.setChecked(True)
-        else:  # l1
-            self.cb_bds.setChecked(False)
-        self.lbl_band.setText(preset.note)
+        if key in ("all", "wide"):
+            self._on_band_changed(force_all=False)
+
+    def _on_band_changed(self, force_all: bool = True) -> None:
+        """Apply the selected band preset to fs/centre and the signal boxes."""
+        if getattr(self, "_band_updating", False):
+            return
+        self._band_updating = True
+        try:
+            key = self.cmb_band.currentData() or "l1"
+            if key in ("all", "wide"):
+                if force_all:
+                    for cb in (self.cb_ca, self.cb_l1c, self.cb_gal,
+                               self.cb_qzss, self.cb_sbas, self.cb_bds):
+                        cb.setChecked(True)
+                plan = compute_combined_band(
+                    enable_ca=self.cb_ca.isChecked(),
+                    enable_l1c=self.cb_l1c.isChecked(),
+                    enable_galileo=self.cb_gal.isChecked(),
+                    enable_qzss=self.cb_qzss.isChecked(),
+                    enable_sbas=self.cb_sbas.isChecked(),
+                    enable_beidou=self.cb_bds.isChecked())
+                self._set_combo_hz(self.cmb_fs, plan.fs)
+                self._set_combo_hz(self.cmb_fc, plan.center_freq)
+                self.lbl_band.setText(
+                    "Единый поток (одна полоса, общий TX LO B210):\n"
+                    + plan.describe()
+                    + "\nЦентр/fs можно изменить вручную; при ручном значении "
+                      "авто-подбор под B1I не применяется.")
+                return
+            preset = BAND_PRESETS.get(key, BAND_PRESETS["l1"])
+            self._set_combo_hz(self.cmb_fs, preset.fs)
+            self._set_combo_hz(self.cmb_fc, preset.center_freq)
+            if key == "b1i":
+                self.cb_ca.setChecked(False)
+                self.cb_l1c.setChecked(False)
+                self.cb_gal.setChecked(False)
+                self.cb_qzss.setChecked(False)
+                self.cb_sbas.setChecked(False)
+                self.cb_bds.setChecked(True)
+            else:  # l1
+                self.cb_bds.setChecked(False)
+            self.lbl_band.setText(preset.note)
+        finally:
+            self._band_updating = False
 
     def _reset_band_group(self) -> None:
         self.cb_auto_b1i.setChecked(True)
@@ -1995,6 +2034,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------
     def _collect(self) -> SimConfig:
+        band = self.cmb_band.currentData() or "l1"
+        fs = self._combo_hz(self.cmb_fs, 2.6e6)
+        center = self._combo_hz(self.cmb_fc, 1575.42e6)
+        # For the combined session, detect a manual edit so the runner keeps it
+        # instead of overwriting with the computed band.
+        fs_override = center_override = False
+        if band in ("all", "wide"):
+            plan = compute_combined_band(
+                enable_ca=self.cb_ca.isChecked(),
+                enable_l1c=self.cb_l1c.isChecked(),
+                enable_galileo=self.cb_gal.isChecked(),
+                enable_qzss=self.cb_qzss.isChecked(),
+                enable_sbas=self.cb_sbas.isChecked(),
+                enable_beidou=self.cb_bds.isChecked())
+            fs_override = abs(fs - plan.fs) > 1.0
+            center_override = abs(center - plan.center_freq) > 1.0
         return SimConfig(
             nav_file=self.ed_nav.text().strip(),
             lat=self.ed_lat.value(), lon=self.ed_lon.value(),
@@ -2002,9 +2057,11 @@ class MainWindow(QtWidgets.QMainWindow):
             motion_file=self.ed_motion.text().strip(),
             start_text=self._start_text(),
             duration=self.sp_dur.value(),
-            fs=self._combo_hz(self.cmb_fs, 2.6e6),
-            center_freq=self._combo_hz(self.cmb_fc, 1575.42e6),
-            band=(self.cmb_band.currentData() or "l1"),
+            fs=fs,
+            center_freq=center,
+            band=band,
+            fs_override=fs_override,
+            center_override=center_override,
             enable_ca=self.cb_ca.isChecked(), enable_l1c=self.cb_l1c.isChecked(),
             enable_galileo=self.cb_gal.isChecked(),
             enable_qzss=self.cb_qzss.isChecked(),

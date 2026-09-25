@@ -39,6 +39,10 @@ def test_high_fs_tx_silent_at_low_fs_and_without_usrp() -> None:
     runner, logs = _runner(2.6e6)
     runner._warn_high_fs_tx()
     assert logs == []
+    # The computed combined band (~25 Msps) is below the 30 Msps failure point.
+    combined, clog = _runner(25.0e6)
+    combined._warn_high_fs_tx()
+    assert clog == []
     runner2, logs2 = _runner(30.0e6, use_usrp=False)
     runner2._warn_high_fs_tx()
     assert logs2 == []

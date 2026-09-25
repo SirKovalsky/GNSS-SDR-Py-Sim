@@ -25,11 +25,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="start time 'YYYY/MM/DD,hh:mm:ss' or 'now'")
     p.add_argument("-d", "--duration", type=float, default=60.0,
                    help="duration [s] (0 = until stopped)")
-    p.add_argument("--band", default="l1", choices=["l1", "b1i", "wide"],
+    p.add_argument("--band", default="l1",
+                   choices=["l1", "b1i", "all", "wide"],
                    help="полоса/сессия: l1 — L1/E1, центр 1575.42 МГц, "
                         "2.6 Мвыб/с (по умолч.); b1i — только BeiDou B1I, "
-                        "центр 1561.098 МГц, 4.092 Мвыб/с; wide — все "
-                        "системы, центр 1568 МГц, 30 Мвыб/с (для IQ-файлов)")
+                        "центр 1561.098 МГц, 4.092 Мвыб/с; all — единый поток "
+                        "всех систем (L1/E1 + B1I), центр/fs вычисляются "
+                        "(≈1571.33 МГц / 25 Мвыб/с); wide — синоним all")
     p.add_argument("-s", "--sample-rate", type=float, default=None,
                    help="sampling frequency [Hz] (по умолчанию — из --band)")
     p.add_argument("-f", "--center-freq", type=float, default=None,
@@ -176,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
         nav_file=args.nav, lat=lat, lon=lon, height=hgt,
         motion_file=args.motion, start_text=args.start, duration=args.duration,
         fs=fs, center_freq=center, band=args.band,
+        fs_override=args.sample_rate is not None,
+        center_override=args.center_freq is not None,
         enable_ca=not args.no_ca, enable_l1c=not args.no_l1c,
         enable_galileo=not args.no_galileo, enable_qzss=not args.no_qzss,
         enable_sbas=not args.no_sbas, enable_beidou=not args.no_beidou,

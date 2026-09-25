@@ -19,7 +19,9 @@ from gnss_sim.beidou_nav import (  # noqa: E402
     FRAME_BITS, NH_CODE, PREAMBLE, SUBFRAME_BITS, bch_decode, bch_encode,
     d1_frame_block, d1_subframe, deinterleave, interleave, parse_subframe,
 )
-from gnss_sim.config import BAND_PRESETS, SimConfig, band_preset  # noqa: E402
+from gnss_sim.config import (  # noqa: E402
+    BAND_PRESETS, SimConfig, band_preset, compute_combined_band,
+)
 from gnss_sim.constants import R2D  # noqa: E402
 from gnss_sim.engine import SignalEngine  # noqa: E402
 from gnss_sim.gpstime import date2gps  # noqa: E402
@@ -42,19 +44,58 @@ def _app():
 def test_band_presets_recommended_values() -> None:
     l1 = band_preset("l1")
     b1i = band_preset("b1i")
-    wide = band_preset("wide")
+    allp = band_preset("all")
     assert l1.center_freq == pytest.approx(1575.42e6)
     assert l1.fs == pytest.approx(2.6e6) and l1.beidou is False
     assert b1i.center_freq == pytest.approx(1561.098e6)
     assert b1i.fs in (4.092e6, 6.138e6) and b1i.beidou is True
     assert b1i.systems == ("C",)
-    assert wide.center_freq == pytest.approx(1568.0e6)
-    assert wide.fs == pytest.approx(30.0e6) and wide.tx_ok is False
+    # Combined stream: centre/fs computed from every enabled system.
+    assert allp.center_freq == pytest.approx(1571.328e6, abs=1e4)
+    assert allp.fs == pytest.approx(25.0e6, abs=1.0)
+    assert allp.tx_ok is True and allp.beidou is True
+    assert allp.systems == ("G", "E", "J", "S", "C")
     assert band_preset(None).key == "l1"
-    assert band_preset("WIDE").key == "wide"
-    assert set(BAND_PRESETS) == {"l1", "b1i", "wide"}
+    # `wide` is a backward-compatible alias of `all`.
+    assert band_preset("wide").key == "all"
+    assert band_preset("WIDE").key == "all"
+    assert set(BAND_PRESETS) == {"l1", "b1i", "all"}
     assert SimConfig().band == "l1"
     assert SimConfig().b1i_data == "d1"
+    assert SimConfig().fs_override is False
+    assert SimConfig().center_override is False
+
+
+def test_compute_combined_band_all_five() -> None:
+    plan = compute_combined_band()
+    # min = B1I low, max = L1C/E1 high (BOC(6,1) main lobes).
+    assert plan.low == pytest.approx(1561.098e6 - 2.046e6)
+    assert plan.high == pytest.approx(1575.42e6 + 8.184e6)
+    assert plan.center_freq == pytest.approx((plan.low + plan.high) / 2.0)
+    assert plan.fs == pytest.approx(25.0e6, abs=1.0)
+    assert plan.span == pytest.approx(24.552e6, abs=1.0)
+    # A single B1I-only stream stays narrow.
+    b1i = compute_combined_band(
+        enable_ca=False, enable_l1c=False, enable_galileo=False,
+        enable_qzss=False, enable_sbas=False, enable_beidou=True)
+    assert b1i.center_freq == pytest.approx(1561.098e6)
+    assert b1i.fs == pytest.approx(4.092e6, abs=1.0)
+    # L1 only (no B1I) does not include the 1561 MHz band.
+    l1 = compute_combined_band(enable_beidou=False)
+    assert l1.low == pytest.approx(1575.42e6 - 8.184e6)
+    assert l1.center_freq == pytest.approx(1575.42e6)
+    assert l1.fs >= 16.368e6
+    # Respects B210 limits.
+    for plan in (compute_combined_band(), b1i, l1):
+        assert 2.6e6 <= plan.fs <= 56.0e6
+
+
+def test_compute_combined_band_narrow_ca_only() -> None:
+    plan = compute_combined_band(
+        enable_ca=True, enable_l1c=False, enable_galileo=False,
+        enable_qzss=False, enable_sbas=False, enable_beidou=False)
+    assert plan.center_freq == pytest.approx(1575.42e6)
+    assert plan.fs == pytest.approx(2.6e6, abs=1.0)
 
 
 def test_runner_band_l1_drops_b1i_without_widening() -> None:
@@ -80,15 +121,44 @@ def test_runner_band_b1i_sets_narrowband_beidou_only() -> None:
     assert any("Сессия b1i" in m for m in logs)
 
 
-def test_runner_band_wide_warns_for_tx() -> None:
-    cfg = SimConfig(fs=2.6e6, center_freq=1575.42e6, band="wide",
+def test_runner_band_all_computes_combined_stream() -> None:
+    cfg = SimConfig(fs=2.6e6, center_freq=1575.42e6, band="all",
                     use_usrp=True)
     logs: list[str] = []
     SimulationRunner(cfg, log=logs.append)._apply_band()
-    assert cfg.fs == pytest.approx(30.0e6)
-    assert cfg.center_freq == pytest.approx(1568.0e6)
+    assert cfg.fs == pytest.approx(25.0e6, abs=1.0)
+    assert cfg.center_freq == pytest.approx(1571.328e6, abs=1e4)
     assert cfg.enable_beidou is True
-    assert any("ВНИМАНИЕ" in m and "wide" in m for m in logs)
+    text = "\n".join(logs)
+    assert "Сессия all" in text and "единый поток" in text
+    # No high-fs warning at the computed ~25 Msps.
+    assert "ВНИМАНИЕ" not in text
+
+
+def test_runner_band_all_alias_and_explicit_override() -> None:
+    # `wide` is an alias of `all`.
+    cfg = SimConfig(fs=2.6e6, center_freq=1575.42e6, band="wide")
+    SimulationRunner(cfg, log=lambda m: None)._apply_band()
+    assert cfg.fs == pytest.approx(25.0e6, abs=1.0)
+
+    # Explicit -s/-f are honoured (not overwritten by the computed preset),
+    # and the B1I auto-band must not fight the explicit narrow settings.
+    cfg = SimConfig(fs=10.0e6, center_freq=1570.0e6, band="all",
+                    fs_override=True, center_override=True)
+    runner = SimulationRunner(cfg, log=lambda m: None)
+    runner._apply_band()
+    runner._apply_b1i_band()
+    assert cfg.fs == pytest.approx(10.0e6)
+    assert cfg.center_freq == pytest.approx(1570.0e6)
+
+
+def test_runner_band_all_subset_only_b1i() -> None:
+    cfg = SimConfig(fs=2.6e6, center_freq=1575.42e6, band="all",
+                    enable_ca=False, enable_l1c=False, enable_galileo=False,
+                    enable_qzss=False, enable_sbas=False)
+    SimulationRunner(cfg, log=lambda m: None)._apply_band()
+    assert cfg.fs == pytest.approx(4.092e6, abs=1.0)
+    assert cfg.center_freq == pytest.approx(1561.098e6)
 
 
 def test_runner_band_unknown_falls_back_to_l1() -> None:
@@ -108,6 +178,8 @@ def test_cli_band_sets_radio_and_allows_override() -> None:
     assert args.band == "b1i"
     args = p.parse_args(["--band", "wide", "-s", "10e6"])
     assert args.sample_rate == pytest.approx(10e6)
+    args = p.parse_args(["--band", "all"])
+    assert args.band == "all"
     args = p.parse_args(["--b1i-data", "placeholder"])
     assert args.b1i_data == "placeholder"
 
@@ -130,11 +202,24 @@ def test_gui_band_controls() -> None:
         assert win.cb_ca.isChecked() is False
         assert "B1I" in win.lbl_band.text()
 
-        win.cmb_band.setCurrentIndex(2)        # wide
+        win.cmb_band.setCurrentIndex(2)        # all
         cfg = win._collect()
-        assert cfg.band == "wide" and cfg.fs == pytest.approx(30.0e6)
+        assert cfg.band == "all" and cfg.fs == pytest.approx(25.0e6, abs=1.0)
+        assert cfg.center_freq == pytest.approx(1571.328e6, abs=1e4)
         assert win.cb_bds.isChecked() is True
-        assert "wide" in win.lbl_band.text().lower() or "Все" in win.lbl_band.text()
+        assert "Единый поток" in win.lbl_band.text()
+        # Disabling a system in the `all` session is respected (not forced back).
+        win.cb_sbas.setChecked(False)
+        assert win.cb_sbas.isChecked() is False
+        assert win._collect().enable_sbas is False
+        win.cb_sbas.setChecked(True)
+        # Manually editing fs/centre marks them as explicit overrides.
+        win._set_combo_hz(win.cmb_fs, 10e6)
+        cfg = win._collect()
+        assert cfg.fs_override is True and cfg.fs == pytest.approx(10e6)
+        win.cmb_band.setCurrentIndex(0)
+        win.cmb_band.setCurrentIndex(2)  # back to computed values
+        assert win._collect().fs_override is False
 
         win.cmb_b1i_data.setCurrentText("placeholder")
         assert win._collect().b1i_data == "placeholder"

@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-from .config import SimConfig, band_preset
+from .config import SimConfig, band_preset, compute_combined_band
 from .constants import R2D
 from .engine import (
     SignalEngine,
@@ -42,8 +42,14 @@ _EST_SYNTH_RATE_SPS = 2.0e6
 #: Warn when the estimated TX pre-generation exceeds this many seconds.
 _PREGEN_WARN_SECONDS = 30.0
 #: Warn about USB3 drops (underflow / LIBUSB_TRANSFER_NO_DEVICE) above this
-#: sample rate when transmitting to a B210.
-_HIGH_FS_TX_WARN_HZ = 20.0e6
+#: sample rate when transmitting to a B210.  30 Msps was the observed failure
+#: point; the computed combined band (~25 Msps) is expected to be stable.
+_HIGH_FS_TX_WARN_HZ = 30.0e6
+#: Bytes per sample of the pre-generated TX RAM segment (complex64).
+_TX_RAM_BYTES = 8
+#: Cap on the TX write block (seconds): smaller writes feed the B210 more
+#: smoothly on Windows/USB3 and measurably reduce TX underflows.
+_TX_BLOCK_SECONDS = 0.1
 #: Default «контроль передачи» threshold (dB above the RX noise floor).
 _TX_CHECK_MARGIN_DB = 6.0
 
@@ -284,23 +290,24 @@ class SimulationRunner:
             pass
 
     def _warn_high_fs_tx(self) -> None:
-        """Warn about USB3 drops when transmitting a high-``fs`` stream.
+        """Warn about USB3 drops when transmitting a very high-``fs`` stream.
 
         The observed B210 failure at 30 Msps is an underflow that ends in
-        ``LIBUSB_TRANSFER_NO_DEVICE``.  Do not let that run pass silently.
+        ``LIBUSB_TRANSFER_NO_DEVICE``; the computed combined ``all`` band
+        (~25 Msps) stays below that and is verified stable over the air.
         """
         cfg = self.cfg
         if not cfg.use_usrp:
             return
         fs = float(cfg.fs or 0.0)
-        if fs <= _HIGH_FS_TX_WARN_HZ:
+        if fs < _HIGH_FS_TX_WARN_HZ:
             return
         self._logf(
             f"ВНИМАНИЕ: высокая fs {fs / 1e6:.1f} Мвыб/с для передачи на B210 "
             "по USB3 — канал может не успевать: возможны underflow и обрыв "
             "потока (LIBUSB_TRANSFER_NO_DEVICE). Это наблюдалось при "
-            "30 Мвыб/с. Если B1I не нужен — отключите BeiDou/авто-B1I или "
-            "уменьшите fs (для L1/E1 достаточно 2.6 Мвыб/с).")
+            "30 Мвыб/с. Для объединённого потока используйте --band all "
+            "(~25 Мвыб/с) или уменьшите fs.")
 
     def _report_underflows(self) -> None:
         """Report the sink's TX underflow count (0 = silent)."""
@@ -312,7 +319,11 @@ class SimulationRunner:
         except Exception:  # noqa: BLE001
             return
         if uf > 0:
-            self._logf(f"ВНИМАНИЕ: {uf} underflow")
+            self._logf(
+                f"ВНИМАНИЕ: {uf} underflow при передаче — в потоке возможны "
+                "короткие разрывы. Уменьшите fs (-s), block-ms (~100 мс) или "
+                "проверьте USB3/питание B210. Обрыва LIBUSB_TRANSFER_NO_DEVICE "
+                "не было.")
 
     def _make_xyz_fn(self):
         cfg = self.cfg
@@ -360,7 +371,7 @@ class SimulationRunner:
             if cfg.duration and cfg.duration > 0 and not self._loop:
                 gb = cfg.duration * cfg.fs * bps / 1e9
                 self._logf(f"Ожидаемый размер файла: {gb:.1f} ГБ "
-                           f"({cfg.duration:.0f} с × {cfg.fs / 1e6:.2f} Мвыб/с × "
+                           f"({cfg.duration:.0f} с x {cfg.fs / 1e6:.2f} Мвыб/с x "
                            f"{bps} Б/отсчёт)")
             sink = FileSink(cfg.output, fmt=cfg.output_format, fs=cfg.fs,
                             center_freq=cfg.center_freq, scale=cfg.output_scale,
@@ -387,6 +398,10 @@ class SimulationRunner:
         self._logf(f"RAM: доступно {sysinfo.human(avail)} из "
                    f"{sysinfo.human(total)}; бюджет {sysinfo.human(int(budget))} "
                    f"(до {max_seg:.0f} с сигнала @ {bytes_per_s / 1e6:.1f} МБ/с)")
+        if cfg.use_usrp and budget > 0 and cfg.fs:
+            tx_cap = budget / _TX_RAM_BYTES / cfg.fs
+            self._logf(f"TX-сегмент в RAM (complex64, 8 Б/отсчёт): до "
+                       f"{tx_cap:.0f} с")
 
         req = cfg.duration if cfg.duration and cfg.duration > 0 else 0.0
         self._loop = bool(cfg.loop)
@@ -440,8 +455,10 @@ class SimulationRunner:
         ``l1`` (default) keeps the historic narrow L1 band and, when BeiDou is
         enabled, drops B1I with a clear message instead of silently widening
         to 30 Msps (which destabilises B210 TX over USB3).  ``b1i`` is a
-        BeiDou-only narrowband session; ``wide`` restores every constellation
-        in one 30 Msps band and is intended for IQ files.
+        BeiDou-only narrowband session.  ``all`` (alias ``wide``) is an
+        explicit choice for one combined stream carrying every constellation
+        simultaneously; its centre/``fs`` are computed from the *enabled*
+        systems (a B210 has one shared TX LO, so all bands must be one stream).
         """
         cfg = self.cfg
         key = str(getattr(cfg, "band", "l1") or "l1").strip().lower()
@@ -451,8 +468,18 @@ class SimulationRunner:
             preset = band_preset("l1")
             key = "l1"
 
-        changed: list[str] = []
-        if key != "l1":
+        if key == "l1":
+            if cfg.enable_beidou:
+                cfg.enable_beidou = False
+                self._logf(
+                    "Сессия l1: BeiDou B1I (1561.098 МГц) не помещается в "
+                    "полосу L1 и отключён — это НЕ переключает fs на 30 "
+                    "Мвыб/с. Для B1I выберите сессию «b1i» (только B1I) или "
+                    "«all» (все системы одновременно).")
+            return
+
+        if key == "b1i":
+            changed: list[str] = []
             if abs(cfg.fs - preset.fs) > 1.0:
                 changed.append(f"fs {cfg.fs / 1e6:.3f} -> "
                                f"{preset.fs / 1e6:.3f} Мвыб/с")
@@ -461,16 +488,6 @@ class SimulationRunner:
                 changed.append(f"центр {cfg.center_freq / 1e6:.3f} -> "
                                f"{preset.center_freq / 1e6:.3f} МГц")
                 cfg.center_freq = preset.center_freq
-
-        if key == "l1":
-            if cfg.enable_beidou:
-                cfg.enable_beidou = False
-                self._logf(
-                    "Сессия l1: BeiDou B1I (1561.098 МГц) не помещается в "
-                    "полосу L1 и отключён — это НЕ переключает fs на 30 "
-                    "Мвыб/с. Для B1I выберите сессию «b1i» (только B1I) или "
-                    "«wide» (все системы, для IQ-файлов).")
-        elif key == "b1i":
             cfg.enable_beidou = True
             cfg.enable_ca = cfg.enable_l1c = False
             cfg.enable_galileo = cfg.enable_qzss = cfg.enable_sbas = False
@@ -478,18 +495,37 @@ class SimulationRunner:
                        f"центр {cfg.center_freq / 1e6:.3f} МГц, "
                        f"fs {cfg.fs / 1e6:.3f} Мвыб/с"
                        + ((" (" + "; ".join(changed) + ")") if changed else ""))
-        else:  # wide
-            cfg.enable_beidou = True
-            self._logf("Сессия wide: все системы, "
-                       f"центр {cfg.center_freq / 1e6:.3f} МГц, "
-                       f"fs {cfg.fs / 1e6:.3f} Мвыб/с"
-                       + ((" (" + "; ".join(changed) + ")") if changed else ""))
-            if cfg.use_usrp:
-                self._logf(
-                    "ВНИМАНИЕ: сессия wide (30 Мвыб/с) + передача на B210 — "
-                    "канал USB3 может не успевать (underflow / "
-                    "LIBUSB_TRANSFER_NO_DEVICE). Для эфира надёжнее отдельные "
-                    "сессии l1 и b1i; wide предназначена для IQ-файлов.")
+            return
+
+        # key in ("all", "wide"): one computed combined stream.
+        cfg.enable_beidou = True
+        plan = compute_combined_band(
+            enable_ca=cfg.enable_ca, enable_l1c=cfg.enable_l1c,
+            enable_galileo=cfg.enable_galileo, enable_qzss=cfg.enable_qzss,
+            enable_sbas=cfg.enable_sbas, enable_beidou=True)
+        changed = []
+        if getattr(cfg, "fs_override", False):
+            changed.append(f"fs {cfg.fs / 1e6:.3f} Мвыб/с (задано явно)")
+        elif abs(cfg.fs - plan.fs) > 1.0:
+            changed.append(f"fs {cfg.fs / 1e6:.3f} -> "
+                           f"{plan.fs / 1e6:.3f} Мвыб/с")
+            cfg.fs = plan.fs
+        if getattr(cfg, "center_override", False):
+            changed.append(f"центр {cfg.center_freq / 1e6:.3f} МГц (задано явно)")
+        elif abs(cfg.center_freq - plan.center_freq) > 1.0:
+            changed.append(f"центр {cfg.center_freq / 1e6:.3f} -> "
+                           f"{plan.center_freq / 1e6:.3f} МГц")
+            cfg.center_freq = plan.center_freq
+
+        self._logf("Сессия all: единый поток GPS L1 C/A + L1C + Galileo E1 + "
+                   "QZSS L1 + SBAS + BeiDou B1I")
+        self._logf("Полоса all (расчёт): " + plan.describe())
+        if changed:
+            self._logf("  итог: " + "; ".join(changed))
+        if cfg.use_usrp:
+            self._logf(
+                f"TX: единый поток {cfg.fs / 1e6:.2f} Мвыб/с, центр "
+                f"{cfg.center_freq / 1e6:.3f} МГц на общем TX LO B210")
 
     def _apply_b1i_band(self, by_sv=None, iono=None, xyz_fn=None) -> None:
         """Auto-pick a centre/fs that keeps BeiDou B1I with L1/E1.
@@ -506,6 +542,13 @@ class SimulationRunner:
         """
         cfg = self.cfg
         if not cfg.enable_beidou or b1i_band_fits(cfg.fs, cfg.center_freq):
+            return
+        # In the explicit `all`/`wide` session an explicit -s/-f wins: do not
+        # silently widen the band the user asked for (B1I will be dropped and
+        # reported by the engine instead).
+        key = str(getattr(cfg, "band", "") or "").strip().lower()
+        if key in ("all", "wide") and (getattr(cfg, "fs_override", False)
+                                       or getattr(cfg, "center_override", False)):
             return
         if by_sv is not None:
             has_beidou = any(str(key).startswith("C") for key in by_sv)
@@ -788,6 +831,9 @@ class SimulationRunner:
         cfg = self.cfg
         assert self.engine is not None and self.sink is not None
         block = max(1, int(cfg.fs * cfg.block_ms / 1000.0))
+        if cfg.use_usrp:
+            # Smaller TX writes keep the USRP fed smoothly (fewer underflows).
+            block = min(block, max(1, int(cfg.fs * _TX_BLOCK_SECONDS)))
         duration = cfg.duration if cfg.duration and cfg.duration > 0 else None
         produced = 0
 
@@ -886,7 +932,9 @@ class SimulationRunner:
             "светодиод TX загорится по её завершении")
         while got < target and not self._stop.is_set():
             n = min(block, target - got)
-            b = self.engine.generate_block(n)
+            # Store the RAM segment as complex64 (half of complex128) so a
+            # 25 Msps combined segment stays comfortably in memory.
+            b = np.asarray(self.engine.generate_block(n), dtype=np.complex64)
             self._emit_spectrum("TX", b)
             blocks.append(b)
             got += n
@@ -898,6 +946,15 @@ class SimulationRunner:
                 last_log = now
                 self._logf(f"Предгенерация сегмента: {pct}% "
                            f"({got / fs:.1f} с из {target / fs:.1f} с)")
+        elapsed = max(1e-9, time.time() - t0)
+        rate = got / elapsed
+        self._logf(f"Синтез: {got / fs:.2f} с сигнала за {elapsed:.1f} с "
+                   f"({rate / 1e6:.2f} Мвыб/с, {rate / fs:.2f}x realtime)")
+        if got > 0 and rate < fs:
+            self._logf(
+                f"ВНИМАНИЕ: синтез медленнее реального времени "
+                f"({rate / fs:.2f}x) — прямая передача без предгенерации "
+                f"уходила бы в underflow; здесь сегмент предгенерён в RAM.")
         return blocks, got
 
     def _write_ram_blocks(self, blocks: list, target: int | None, float_t0: float,
@@ -934,7 +991,7 @@ class SimulationRunner:
         gen_s = target / _EST_SYNTH_RATE_SPS
         if gen_s <= _PREGEN_WARN_SECONDS:
             return
-        gb = target * 16 / 1e9
+        gb = target * _TX_RAM_BYTES / 1e9
         self._logf(
             f"ВНИМАНИЕ: TX-сегмент {target / fs:.0f} с @ "
             f"{fs / 1e6:.2f} Мвыб/с (~{gb:.1f} ГБ RAM) — предгенерация "
@@ -947,11 +1004,14 @@ class SimulationRunner:
         cfg = self.cfg
         assert self.engine is not None
         budget = int(getattr(self, "_ram_budget_bytes", 0) or 0)
-        max_samples = budget // 16 if budget > 0 else 0  # engine = complex128
+        # RAM segment is stored as complex64 (_TX_RAM_BYTES bytes/sample).
+        max_samples = budget // _TX_RAM_BYTES if budget > 0 else 0
         if target is not None and max_samples > 0 and target <= max_samples:
+            est_s = target / _EST_SYNTH_RATE_SPS
             self._logf(
                 f"TX: предгенерация {target / cfg.fs:.2f} с в RAM "
-                f"(~{sysinfo.human(target * 16)}), затем передача из памяти")
+                f"(~{sysinfo.human(target * _TX_RAM_BYTES)}), затем передача "
+                f"из памяти; оценка предгенерации ~{est_s:.0f} с")
             self._warn_large_tx_segment(target)
             blocks, got = self._generate_to_ram(target, block)
             if got < target:
@@ -961,7 +1021,7 @@ class SimulationRunner:
                            "на B210 без синтеза между блоками")
             return self._write_ram_blocks(blocks, got, t0, loop=False)
         if target is not None:
-            fit_s = (budget / 16 / cfg.fs) if budget > 0 else 0.0
+            fit_s = (budget / _TX_RAM_BYTES / cfg.fs) if budget > 0 else 0.0
             self._logf(
                 f"TX: {target / cfg.fs:.1f} с не помещается в бюджет RAM "
                 f"(до {fit_s:.1f} с) — синтез и передача параллельно "
