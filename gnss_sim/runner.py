@@ -865,6 +865,12 @@ class SimulationRunner:
             seg_total = int(self._segment_seconds * cfg.fs)
             buf: list = []
             got = 0
+            next_pct = 5
+            last_log = 0.0
+            # «генерация» is a pure IQ-file run (no radio); a B210 run only
+            # pre-synthesises the segment first, so it says «предгенерация».
+            label = ("Идёт предгенерация" if cfg.use_usrp
+                     else "Идёт генерация")
             # Check the stop event for every generated block so «Стоп» reacts
             # within roughly one block_ms, not after the whole segment.
             while got < seg_total:
@@ -872,28 +878,39 @@ class SimulationRunner:
                     break
                 n = min(block, seg_total - got)
                 b = self.engine.generate_block(n)
-                if self._stop.is_set():
-                    # Keep the completed block (it is already synthesised) and
-                    # leave immediately.
-                    buf.append(b)
-                    got += n
-                    break
-                self._emit_spectrum("TX", b)
-                buf.append(b)
                 got += n
-            self._logf(f"Сегмент {got / cfg.fs:.1f} с сгенерирован в память")
-
-            if not cfg.use_usrp:
-                # one loopable segment is written once to the file
-                total = produced + got
-                for b in buf:
+                stopped = self._stop.is_set()
+                if cfg.use_usrp:
+                    # TX needs the whole segment in RAM for the endless loop.
+                    self._emit_spectrum("TX", b)
+                    buf.append(b)
+                else:
+                    # Pure IQ-file run: write every produced block straight
+                    # away, so the progress bar tracks generation (and the bar
+                    # does not stay empty for a long segment, nor jump).
                     self.sink.write(b)
+                    self._emit_spectrum("TX", b)
                     produced += len(b)
-                    if self._progress is not None:
+                    if self._progress is not None and seg_total:
                         wall = max(1e-9, time.time() - t0)
-                        self._progress(produced / total, produced / cfg.fs,
-                                       wall, (produced / cfg.fs) / wall)
-            else:
+                        sim_s = got / cfg.fs
+                        self._progress(got / seg_total, sim_s, wall,
+                                       sim_s / wall if wall else 0.0)
+                pct = int(100 * got / seg_total) if seg_total else 0
+                now = time.time()
+                if pct >= next_pct or now - last_log >= 2.0:
+                    while next_pct <= pct:
+                        next_pct += 5
+                    last_log = now
+                    self._logf(f"{label}: {pct}% "
+                               f"({got / cfg.fs:.1f} из "
+                               f"{seg_total / cfg.fs:.1f} с)")
+                if stopped:
+                    break
+            where = "в память" if cfg.use_usrp else "в файл"
+            self._logf(f"Сегмент {got / cfg.fs:.1f} с сгенерирован {where}")
+
+            if cfg.use_usrp:
                 # TX + loop (the segment branch is only entered when looping):
                 # stream the RAM segment continuously until «Стоп».  ``duration``
                 # is deliberately ignored as a stop condition here; it still
@@ -916,6 +933,8 @@ class SimulationRunner:
                 # not fit) run synthesis and send in parallel via a bounded
                 # queue.  Otherwise UHD underflows between blocks.
                 return self._run_tx_stream(total, block, t0)
+            next_pct = 5
+            last_log = 0.0
             while not self._stop.is_set():
                 n = block
                 if total is not None:
@@ -931,6 +950,16 @@ class SimulationRunner:
                     sim_s = produced / cfg.fs
                     frac = (produced / total) if total else 0.0
                     self._progress(frac, sim_s, wall, sim_s / wall)
+                if total is not None:
+                    pct = int(100 * produced / total)
+                    now = time.time()
+                    if pct >= next_pct or now - last_log >= 2.0:
+                        while next_pct <= pct:
+                            next_pct += 5
+                        last_log = now
+                        self._logf(f"Идёт генерация: {pct}% "
+                                   f"({produced / cfg.fs:.1f} из "
+                                   f"{total / cfg.fs:.1f} с)")
         return produced
 
     # ------------------------------------------------------------------

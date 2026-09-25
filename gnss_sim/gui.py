@@ -610,11 +610,18 @@ class MainWindow(QtWidgets.QMainWindow):
         return None
 
     def _update_start_range(self) -> None:
-        """Bind the start-time widget to the cached ephemeris coverage (B4)."""
+        """Bind the start-time widget to the cached ephemeris coverage (B4).
+
+        When the selected RINEX does not cover «now» (for example an old
+        ephemeris) the «Сейчас (UTC)» checkbox is disabled/unchecked and the
+        start is moved into the ``toe ±6 h`` window, so a run can never silently
+        start outside the coverage.  The window is always shown in the label.
+        """
         if not hasattr(self, "ed_start") or not hasattr(self, "lbl_start_cover"):
             return
+        from .config import parse_start_time
         try:
-            from .config import parse_start_time
+            now = parse_start_time("now")
             start = parse_start_time(self._start_text())
         except Exception:  # noqa: BLE001
             return
@@ -622,26 +629,56 @@ class MainWindow(QtWidgets.QMainWindow):
         if not by_sv:
             self.lbl_start_cover.setText(
                 "Покрытие эфемерид: неизвестно (будет автоскачивание)")
+            if hasattr(self, "chk_now"):
+                self.chk_now.setEnabled(True)
             self._refresh_start_date_label()
             return
         from .rinex import check_start_coverage, ephemeris_toe_span
         span = ephemeris_toe_span(by_sv)
         if span is None:
             self.lbl_start_cover.setText("Покрытие эфемерид: нет данных")
+            if hasattr(self, "chk_now"):
+                self.chk_now.setEnabled(True)
             self._refresh_start_date_label()
             return
         lo, hi = span
         lo_dt = self._gps_to_qdt(lo, -6 * 3600.0)
         hi_dt = self._gps_to_qdt(hi, +6 * 3600.0)
-        if lo_dt.isValid() and hi_dt.isValid() and lo_dt < hi_dt:
-            self.ed_start.setDateTimeRange(lo_dt, hi_dt)
-            self.lbl_start_cover.setText(
-                "Покрытие эфемерид (toe ±6 ч): "
-                f"{lo_dt.toString('yyyy/MM/dd HH:mm')} … "
-                f"{hi_dt.toString('yyyy/MM/dd HH:mm')}")
+        if not (lo_dt.isValid() and hi_dt.isValid() and lo_dt < hi_dt):
+            self.lbl_start_cover.setText("Покрытие эфемерид: нет данных")
+            self._refresh_start_date_label()
+            return
+        self.ed_start.setDateTimeRange(lo_dt, hi_dt)
+        window = (f"{lo_dt.toString('yyyy/MM/dd HH:mm')} … "
+                  f"{hi_dt.toString('yyyy/MM/dd HH:mm')}")
+        start_dt = self._gps_to_qdt(start)
         note = check_start_coverage(start, by_sv)
-        if note:
-            self.lbl_start_cover.setText(note)
+        now_note = check_start_coverage(now, by_sv)
+        moved = None
+        if now_note is not None:
+            # The RINEX does not cover «now»: the checkbox cannot be used.
+            if hasattr(self, "chk_now"):
+                self.chk_now.setChecked(False)
+                self.chk_now.setEnabled(False)
+            if note is not None:
+                # The current start is outside too: move to the first toe.
+                moved = lo
+                self.ed_start.setDateTime(self._gps_to_qdt(lo))
+        else:
+            if hasattr(self, "chk_now"):
+                self.chk_now.setEnabled(True)
+            if note is not None:
+                # Manual start outside the window: snap to the nearest edge.
+                moved = lo if start_dt < lo_dt else hi
+                self.ed_start.setDateTime(self._gps_to_qdt(moved))
+        text = "Покрытие эфемерид (toe ±6 ч): " + window
+        if moved is not None:
+            md = self._gps_to_qdt(moved)
+            text += (". Старт вне диапазона — переведён на "
+                     f"{md.toString('yyyy/MM/dd HH:mm')}")
+            if now_note is not None:
+                text += " («Сейчас (UTC)» недоступно: RINEX не покрывает now)"
+        self.lbl_start_cover.setText(text)
         # The date may have been clamped into the coverage range.
         self._refresh_start_date_label()
 
@@ -706,6 +743,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                      0, 0, 0)
         self.ed_start.setDateTime(moved)
         self._set_nav_mode_note(latest)
+        self._update_start_range()
         self._refresh_start_date_label()
 
     def _correct_multignss_start(self, cfg: SimConfig) -> bool:
@@ -993,18 +1031,41 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reset_band_group,
             "Сбросить данные B1I и объединение"),
             5, 0, 1, 2)
-        self.cb_combine.stateChanged.connect(self._refresh_derived)
+        self.cb_combine.stateChanged.connect(self._on_combine_toggled)
+        self._refresh_derived()
         return g
 
     # ------------------------------------------------------------------
+    def _on_combine_toggled(self, on: bool) -> None:
+        """Sync the Advanced «Объединять L1+B1I» opt-in with Basic «B1I».
+
+        The Advanced control only makes sense when BeiDou B1I is selected.  When
+        it is ticked, B1I is selected in the Basic tab too, so the two tabs can
+        never disagree (the other direction — B1I off collapses the opt-in — is
+        handled in :meth:`_refresh_derived`).
+        """
+        if on and not self.cb_bds.isChecked():
+            self.cb_bds.setChecked(True)  # triggers _refresh_derived
+        self._refresh_derived()
+
     def _refresh_derived(self, *_args) -> None:
         """Recompute the read-only band/centre/fs and RINEX note.
 
-        The «Сигналы» checkboxes are the single source of truth; this method
-        never changes their state.
+        The «Сигналы» checkboxes are the single source of truth for the band;
+        the only Advanced state this changes is collapsing the «Объединять
+        L1+B1I» opt-in (and disabling the B1I-only controls) when B1I is off, so
+        the Basic and Advanced tabs stay consistent.
         """
         if not hasattr(self, "lbl_band") or not hasattr(self, "lbl_fs"):
             return
+        # Cross-tab B1I sync (bidirectional invariant):
+        #   «Объединять L1+B1I» checked  ->  B1I must be selected in Basic.
+        #   B1I unchecked in Basic        ->  collapse the Advanced opt-in.
+        if (hasattr(self, "cb_combine") and self.cb_combine.isChecked()
+                and not self.cb_bds.isChecked()):
+            self.cb_combine.blockSignals(True)
+            self.cb_combine.setChecked(False)
+            self.cb_combine.blockSignals(False)
         combine = (self.cb_combine.isChecked()
                    if hasattr(self, "cb_combine") else False)
         enables = {
@@ -1015,6 +1076,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "enable_sbas": self.cb_sbas.isChecked(),
             "enable_beidou": self.cb_bds.isChecked(),
         }
+        # Enable the Advanced B1I controls only while B1I is selected; the
+        # combine opt-in additionally needs an L1/E1 carrier to merge with.
+        if hasattr(self, "cb_combine"):
+            bds = enables["enable_beidou"]
+            l1_family = any(enables[k] for k in (
+                "enable_ca", "enable_l1c", "enable_galileo",
+                "enable_qzss", "enable_sbas"))
+            self.cb_combine.setEnabled(bool(bds and l1_family))
+            if hasattr(self, "cmb_b1i_data"):
+                self.cmb_b1i_data.setEnabled(bool(bds))
+            if hasattr(self, "cb_auto_b1i"):
+                self.cb_auto_b1i.setEnabled(bool(bds))
         band = derive_band_key(combine=combine, **enables)
         plan = derive_band_plan(combine=combine, **enables)
         if not any(enables.values()):
@@ -1275,6 +1348,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress.setFormat("%p%")
         v.addWidget(self.progress)
+        self.lbl_progress = QtWidgets.QLabel("Готово")
+        self.lbl_progress.setWordWrap(True)
+        v.addWidget(self.lbl_progress)
 
         v.addWidget(QtWidgets.QLabel("Видимые спутники"))
         self.table = QtWidgets.QTableWidget(0, 5)
@@ -1636,6 +1712,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.clear()
         self.table.setRowCount(0)
         self.progress.setValue(0)
+        if hasattr(self, "lbl_progress"):
+            self.lbl_progress.setText("Подготовка…")
         self.btn_start.setEnabled(False)
         self.btn_gen.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -1979,21 +2057,32 @@ class MainWindow(QtWidgets.QMainWindow):
     # Log / callbacks
     # ==================================================================
     def _append_log(self, text: str) -> None:
-        """Append a log line, colouring warnings/errors (B1)."""
-        message = str(text)
-        low = message.lower()
-        color = None
-        if "ошибк" in low or "error" in low or "исключени" in low:
-            color = _LOG_ERROR_COLOR
-        elif "вниман" in low or "warning" in low or "предупреж" in low:
-            color = _LOG_WARN_COLOR
-        if color and hasattr(self.log, "appendHtml"):
-            import html
-            safe = html.escape(message).replace("\n", "<br>")
-            self.log.appendHtml(
-                f'<span style="color:{color};">{safe}</span>')
-        else:
-            self.log.appendPlainText(message)
+        """Append log lines, colouring only genuine warnings/errors.
+
+        Native UHD stderr is captured and forwarded in arbitrary multi-line
+        chunks, so the payload is split first: otherwise a single ``[WARNING]``
+        line would colour the *whole* chunk (and Qt ``appendHtml`` renders it as
+        one orange block, hiding the plain native lines).  Each line is added as
+        its own paragraph, and plain lines use ``appendPlainText`` so the colour
+        can never leak to the following lines.
+        """
+        import html
+        lines = str(text).splitlines()
+        if not lines:
+            lines = [""]
+        for line in lines:
+            low = line.lower()
+            color = None
+            if ("ошибк" in low or "error" in low or "исключени" in low):
+                color = _LOG_ERROR_COLOR
+            elif ("вниман" in low or "warning" in low or "предупреж" in low):
+                color = _LOG_WARN_COLOR
+            if color and hasattr(self.log, "appendHtml"):
+                safe = html.escape(line)
+                self.log.appendHtml(
+                    f'<span style="color:{color};">{safe}</span>')
+            else:
+                self.log.appendPlainText(line)
 
     def _on_progress(self, frac: float, sim_s: float, wall: float,
                      rate: float) -> None:
@@ -2002,6 +2091,14 @@ class MainWindow(QtWidgets.QMainWindow):
         except (TypeError, ValueError):
             value = 0
         self.progress.setValue(max(0, min(1000, value)))
+        # Make it explicit whether the bar tracks IQ-file generation (no radio)
+        # or B210 transmission.
+        tx = bool(self._run_cfg is not None and self._run_cfg.use_usrp)
+        verb = "Передача" if tx else "Генерация"
+        self.progress.setFormat(("передача " if tx else "генерация ") + "%p%")
+        if hasattr(self, "lbl_progress"):
+            self.lbl_progress.setText(
+                f"{verb}: {value / 10:.0f}% ({sim_s:.1f} с)")
         self.setWindowTitle(
             f"{_APP_TITLE} — {sim_s:.1f} с / {wall:.1f} с ({rate:.2f}x)")
 
@@ -2020,8 +2117,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stop.setEnabled(False)
         if err:
             QtWidgets.QMessageBox.critical(self, "Ошибка", str(err))
+            if hasattr(self, "lbl_progress"):
+                self.lbl_progress.setText(f"Ошибка: {err}")
         else:
             self.progress.setValue(1000)
+            if hasattr(self, "lbl_progress"):
+                self.lbl_progress.setText("Готово")
         self._update_channel_validity()
 
     # ------------------------------------------------------------------
