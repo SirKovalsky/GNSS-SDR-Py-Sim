@@ -245,6 +245,8 @@ class Bridge(QtCore.QObject):
     channels = QtCore.pyqtSignal(list)
     finished = QtCore.pyqtSignal(object)
     spectrum = QtCore.pyqtSignal(str, object, float)
+    #: TX/RX level: ``(label, peak_dbfs, rms_dbfs, clips)``.
+    level = QtCore.pyqtSignal(str, float, float, int)
     askNav = QtCore.pyqtSignal(str, float)
 
 
@@ -334,6 +336,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge.channels.connect(self._on_channels)
         self.bridge.finished.connect(self._on_finished)
         self.bridge.spectrum.connect(self._on_spectrum)
+        self.bridge.level.connect(self._on_level)
         self.bridge.askNav.connect(self._on_ask_nav)
         self._ask_event = threading.Event()
         self._ask_result = [False]
@@ -951,17 +954,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_el = QtWidgets.QDoubleSpinBox(); self.sp_el.setRange(0, 90)
         self.sp_el.setValue(5.0); self.sp_el.setSuffix(" °")
         _row(f2, 8, "Маска элевации", self.sp_el)
+        # Amplitude: auto by default (derived from the number of channels /
+        # summed per-channel amplitudes so a multi-system scene has headroom);
+        # unchecking «Авто» exposes the historic explicit single factor.
         self.sp_amp = QtWidgets.QDoubleSpinBox(); self.sp_amp.setRange(0.001, 0.9)
         self.sp_amp.setSingleStep(0.05); self.sp_amp.setValue(0.15)
-        _row(f2, 9, "Амплитуда", self.sp_amp)
+        self.sp_amp.setEnabled(False)
+        self.cb_amp_auto = QtWidgets.QCheckBox("Авто")
+        self.cb_amp_auto.setChecked(True)
+        self.cb_amp_auto.setToolTip(
+            "Автоматический единый масштаб по числу каналов/сумме амплитуд: "
+            "многосистемная сцена получает ~0.06–0.10 (с запасом до клиппинга), "
+            "GPS-only L1 C/A остаётся на прежнем уровне. Снимите галочку, чтобы "
+            "задать один явный множитель (как раньше).")
+        self.cb_amp_auto.toggled.connect(
+            lambda on: self.sp_amp.setEnabled(not on))
+        amp_row = QtWidgets.QHBoxLayout()
+        amp_row.addWidget(self.sp_amp)
+        amp_row.addWidget(self.cb_amp_auto)
+        _row(f2, 9, "Амплитуда", self._wrap(amp_row))
+        self.cb_headroom = QtWidgets.QCheckBox("Ограничивать пик (anti-clip)")
+        self.cb_headroom.setChecked(True)
+        self.cb_headroom.setToolTip(
+            "Автоматический запас по уровню: пик композитного сигнала "
+            "приводится к целевому значению, чтобы ЦАП B210 не клиппировал. "
+            "Для предгенерённого сегмента применяется один точный масштаб.")
+        self.sp_headroom = QtWidgets.QDoubleSpinBox()
+        self.sp_headroom.setRange(0.1, 0.95)
+        self.sp_headroom.setSingleStep(0.05)
+        self.sp_headroom.setValue(0.7)
+        self.sp_headroom.setToolTip("Целевой пик (доля полной шкалы), по умолч. 0.7")
+        self.cb_headroom.toggled.connect(self.sp_headroom.setEnabled)
+        hr_row = QtWidgets.QHBoxLayout()
+        hr_row.addWidget(self.cb_headroom)
+        hr_row.addWidget(self.sp_headroom)
+        hr_row.addStretch(1)
+        _row(f2, 10, "Запас уровня", self._wrap(hr_row))
         # Read-only derived session: band key, centre and fs.
         self.lbl_band = QtWidgets.QLabel()
         self.lbl_band.setTextFormat(QtCore.Qt.RichText)
         self.lbl_band.setWordWrap(True)
-        f2.addWidget(self.lbl_band, 10, 0, 1, 2)
+        f2.addWidget(self.lbl_band, 11, 0, 1, 2)
         f2.addWidget(self._group_reset_btn(self._reset_signals_group,
                                            "Сбросить только сигналы"),
-                     11, 0, 1, 2)
+                     12, 0, 1, 2)
         return g_sig
 
     def _reset_signals_group(self) -> None:
@@ -971,7 +1007,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_bds.setChecked(False)  # default: B1I off (narrow L1 session)
         self.cmb_l1c_data.setCurrentText("zeros")
         self.sp_el.setValue(5.0)
+        self.cb_amp_auto.setChecked(True)
         self.sp_amp.setValue(0.15)
+        self.cb_headroom.setChecked(True)
+        self.sp_headroom.setValue(0.7)
         if hasattr(self, "lbl_band"):
             self._refresh_derived()
 
@@ -1476,6 +1515,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_progress = QtWidgets.QLabel("Готово")
         self.lbl_progress.setWordWrap(True)
         v.addWidget(self.lbl_progress)
+        # Compact transmit/receive level indicator (peak/RMS dBFS + clipping/
+        # underflow), updated periodically by the runner (never per sample).
+        self.lbl_tx_level = QtWidgets.QLabel("Уровень TX: —")
+        self.lbl_tx_level.setToolTip(
+            "Уровень передаваемого сигнала (пик и RMS в dBFS, как в SDR_Scan: "
+            "комплексный тон 1.0 = 0 dBFS). Показывается число отсчётов с "
+            "|x|>1 (клип) и underflow B210. Обновляется ~2 раза/с.")
+        v.addWidget(self.lbl_tx_level)
 
         v.addWidget(QtWidgets.QLabel("Видимые спутники"))
         self.table = QtWidgets.QTableWidget(0, 5)
@@ -1851,6 +1898,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_tx.setFormat("%p%")
         if hasattr(self, "lbl_progress"):
             self.lbl_progress.setText("Подготовка…")
+        if hasattr(self, "lbl_tx_level"):
+            self.lbl_tx_level.setText("Уровень TX: —")
         # A reused IQ file has no synthesis step: when it is streamed to the
         # radio show the transmission bar straight away (the runner emits only
         # an overall fraction there, which ``_on_progress`` feeds to it).
@@ -1873,6 +1922,7 @@ class MainWindow(QtWidgets.QMainWindow):
             spectrum=self.bridge.spectrum.emit,
             ask=self._ask_nav_update,
             phase=self.bridge.phase.emit,
+            level=self.bridge.level.emit,
         )
         self.runner.start()
 
@@ -1953,6 +2003,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_spectrum.setText(self.spectrum_widget.describe())
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"Спектр: {exc}")
+
+    def _on_level(self, label: str, peak_dbfs: float, rms_dbfs: float,
+                  clips: int) -> None:
+        """Update the compact TX/RX level label (peak/RMS dBFS + клип/underflow)."""
+        if not hasattr(self, "lbl_tx_level"):
+            return
+        txt = (f"{label}: пик {peak_dbfs:.1f} dBFS, RMS {rms_dbfs:.1f} dBFS")
+        if clips:
+            txt += f", КЛИП {int(clips)}"
+        uf = 0
+        try:
+            sink = getattr(self.runner, "sink", None)
+            if sink is not None:
+                uf = int(getattr(sink, "underflows", 0) or 0)
+        except Exception:  # noqa: BLE001
+            uf = 0
+        if uf:
+            txt += f", underflow {uf}"
+        self.lbl_tx_level.setText(txt)
 
     # ==================================================================
     # u-blox
@@ -2413,7 +2482,11 @@ class MainWindow(QtWidgets.QMainWindow):
             combine=combine,
             nav_mode=nav_mode,
             **enables,
-            el_mask=self.sp_el.value(), amp_scale=self.sp_amp.value(),
+            el_mask=self.sp_el.value(),
+            amp_scale=(None if self.cb_amp_auto.isChecked()
+                       else self.sp_amp.value()),
+            headroom=self.cb_headroom.isChecked(),
+            headroom_target=self.sp_headroom.value(),
             iono_enable=self.cb_iono.isChecked(),
             l1c_data=self.cmb_l1c_data.currentText(),
             b1i_data=self.cmb_b1i_data.currentText(),

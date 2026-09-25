@@ -457,6 +457,22 @@ class SignalEngine:
             ch.galileo_frame_start = g0
             ch.galileo_bits = self._galileo_block_bits(ch, g0)
 
+    def set_amp_scale(self, scale: float) -> None:
+        """Re-scale every channel amplitude for the current geometry.
+
+        Used by the runner to apply the automatic scene-wide amplitude derived
+        from the allocated channels (``cfg.amp_scale is None``).  The per-block
+        synthesis also recomputes ``ch.amp`` from ``self.amp_scale``, so this
+        keeps the logged ``channel_info`` amplitudes consistent.
+        """
+        self.amp_scale = float(scale)
+        xyz = self.xyz_fn(self.g)
+        for ch in self.channels:
+            rho = self._geometry(ch, self.g, xyz)
+            ch.azel = rho.azel
+            ch.amp = (20200000.0 / rho.d) * _ant_gain(
+                rho.azel[1] * R2D) * self.amp_scale
+
     def _allocate_sbas(self, xyz: np.ndarray) -> list[Channel]:
         lat, lon, _h = xyz2llh(xyz)
         user_lon = lon * R2D

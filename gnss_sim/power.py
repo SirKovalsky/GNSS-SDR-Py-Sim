@@ -25,11 +25,184 @@ B210 построен на одном AD9361: отдельные LO для RX и
 
 from __future__ import annotations
 
-from typing import Iterable
+import math
+from dataclasses import dataclass
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 
 _EPS = 1e-24
+
+# ----------------------------------------------------------------------
+# Automatic baseband headroom (anti-clip) control
+# ----------------------------------------------------------------------
+#: Default safe composite peak the transmitted block/segment is scaled to.
+DEFAULT_HEADROOM_TARGET = 0.7
+#: Default estimated composite peak (before headroom) the automatic per-scene
+#: amplitude targets; kept just under full scale so a typical scene does not
+#: clip even before :class:`HeadroomController` runs.
+DEFAULT_AUTO_AMP_PEAK = 1.0
+#: Clamp range of the automatic amplitude: keeps a GPS-only scene usable and
+#: stops a many-channel scene from going too quiet.
+AUTO_AMP_MIN = 0.02
+AUTO_AMP_MAX = 0.15
+#: Empirical margin for ``peak / (amp * sum(per-channel amplitudes))`` measured
+#: on real multi-GNSS scenes (≈0.74…1.34); the value is chosen so the estimated
+#: pre-headroom peak stays below full scale.
+AUTO_AMP_PEAK_RATIO = 1.5
+
+
+@dataclass(frozen=True)
+class LevelStats:
+    """Peak/RMS/clip statistics of a complex baseband block (same amplitude
+    reference as :func:`rms_dbfs`: a unit-amplitude complex tone is 0 dBFS)."""
+
+    peak: float = 0.0
+    rms: float = 0.0
+    clips: int = 0
+    samples: int = 0
+
+    @property
+    def peak_dbfs(self) -> float:
+        return 20.0 * math.log10(self.peak) if self.peak > 0.0 else float("-inf")
+
+    @property
+    def rms_dbfs(self) -> float:
+        return 20.0 * math.log10(self.rms) if self.rms > 0.0 else float("-inf")
+
+
+def _magnitudes(x) -> np.ndarray:
+    return np.abs(np.asarray(x)).ravel().astype(np.float64, copy=False)
+
+
+def level_stats(samples) -> LevelStats:
+    """Peak, RMS and clipped-sample count (``|x| > 1``) of ``samples``."""
+    mag = _magnitudes(samples)
+    if mag.size == 0:
+        return LevelStats()
+    peak = float(mag.max())
+    rms = float(np.sqrt(np.mean(mag * mag)))
+    clips = int(np.count_nonzero(mag > 1.0))
+    return LevelStats(peak, rms, clips, int(mag.size))
+
+
+def combine_levels(blocks: Sequence) -> LevelStats:
+    """Level statistics over several blocks (energy-weighted RMS)."""
+    peak = 0.0
+    clips = 0
+    n = 0
+    energy = 0.0
+    for b in blocks:
+        mag = _magnitudes(b)
+        if mag.size == 0:
+            continue
+        peak = max(peak, float(mag.max()))
+        clips += int(np.count_nonzero(mag > 1.0))
+        n += int(mag.size)
+        energy += float(np.dot(mag, mag))
+    rms = math.sqrt(energy / n) if n else 0.0
+    return LevelStats(peak, rms, clips, n)
+
+
+def auto_amp_scale(weights: Iterable[float],
+                   target: float = DEFAULT_AUTO_AMP_PEAK) -> float:
+    """Single scene-wide amplitude derived from the per-channel weights.
+
+    ``weights`` are the geometry/antenna weighted per-channel amplitudes (the
+    composite peak grows roughly linearly with their sum).  The result is
+    clamped to ``AUTO_AMP_MIN..AUTO_AMP_MAX`` so a GPS-only scene stays loud
+    and a many-channel scene does not become too quiet.
+    """
+    total = float(sum(w for w in weights if w and w > 0.0))
+    if total <= 0.0:
+        return AUTO_AMP_MAX
+    value = float(target) / (AUTO_AMP_PEAK_RATIO * total)
+    return float(min(AUTO_AMP_MAX, max(AUTO_AMP_MIN, value)))
+
+
+class HeadroomController:
+    """Anti-clip scaler for the composite baseband.
+
+    ``process_segment`` is used when the whole block/segment is pre-generated
+    into RAM: the exact global peak is measured and **one** scale is applied to
+    every sample (no level discontinuity on the air).  ``process_block`` is the
+    streaming fallback: the scale starts from the first block and only ever
+    decreases when a later block would clip, so no sample exceeds 1.0.
+    """
+
+    def __init__(self, target: float = DEFAULT_HEADROOM_TARGET,
+                 enabled: bool = True, log: Callable[[str], None] | None = None,
+                 name: str = "TX") -> None:
+        self.target = float(target)
+        self.enabled = bool(enabled) and self.target > 0.0
+        self.name = str(name)
+        self._log = log
+        self.scale = 1.0
+        self._logged = False
+
+    def _logf(self, msg: str) -> None:
+        if self._log is not None:
+            try:
+                self._log(msg)
+            except Exception:  # noqa: BLE001 - logging must not break a run
+                pass
+
+    @staticmethod
+    def _scale_block(x, scale: float):
+        if scale == 1.0:
+            return x
+        a = np.asarray(x)
+        out = a * scale
+        if out.dtype != a.dtype:
+            out = out.astype(a.dtype, copy=False)
+        return out
+
+    @staticmethod
+    def _fmt(st: LevelStats) -> str:
+        return (f"пик {st.peak:.3f} (пик {st.peak_dbfs:.1f} dBFS), "
+                f"RMS {st.rms:.3f} ({st.rms_dbfs:.1f} dBFS), "
+                f"клип {st.clips}")
+
+    def _report(self, before: LevelStats, after: LevelStats, scale: float,
+                stream: bool) -> None:
+        where = "поток" if stream else "сегмент"
+        self._logf(
+            f"{self.name} headroom ({where}): масштаб {scale:.4f} "
+            f"(цель пика {self.target:.3f}); до: {self._fmt(before)}; "
+            f"после: {self._fmt(after)}")
+
+    def process_segment(self, blocks: list) -> tuple[list, float]:
+        """Scale a whole pre-generated segment by one exact factor."""
+        if not self.enabled or not blocks:
+            return blocks, 1.0
+        before = combine_levels(blocks)
+        scale = (1.0 if before.peak <= self.target
+                 else self.target / before.peak)
+        if scale != 1.0:
+            for i in range(len(blocks)):
+                blocks[i] = self._scale_block(blocks[i], scale)
+        after = before if scale == 1.0 else combine_levels(blocks)
+        self.scale = scale
+        self._report(before, after, scale, stream=False)
+        return blocks, scale
+
+    def process_block(self, block):
+        """Scale one streaming block (scale never increases above 1.0)."""
+        if not self.enabled:
+            return block
+        st = level_stats(block)
+        if st.samples == 0:
+            return block
+        if st.peak > 0.0:
+            need = self.target / st.peak
+            if need < self.scale:
+                self.scale = need
+        out = self._scale_block(block, self.scale)
+        if not self._logged:
+            self._logged = True
+            after = level_stats(out)
+            self._report(st, after, self.scale, stream=True)
+        return out
 
 
 def rms_dbfs(x: np.ndarray) -> float:

@@ -22,7 +22,15 @@ from .gpstime import GpsTime
 from .iqfile import FileSink, IqFileSource, NullSink, Sink
 from .motion import interpolation_fn, load_user_motion
 from .orbit import llh2xyz
-from .power import PowerRegulator, delay_profile, rms_dbfs
+from .power import (
+    DEFAULT_HEADROOM_TARGET,
+    HeadroomController,
+    PowerRegulator,
+    auto_amp_scale,
+    delay_profile,
+    level_stats,
+    rms_dbfs,
+)
 from .rinex import (
     check_start_coverage,
     parse_nav_file,
@@ -38,10 +46,14 @@ ProgressFn = Callable[[float, float, float, float], None]
 #: the completed loop count for cyclic transmission and ``cyclic`` marks it.
 PhaseFn = Callable[[str, float, int, float, bool], None]
 SpectrumFn = Callable[[str, np.ndarray, float], None]
+#: TX/RX level callback: ``(label, peak_dbfs, rms_dbfs, clips)``.
+LevelFn = Callable[[str, float, float, int], None]
 AskFn = Callable[[str, float], bool]
 
 _MAX_SPEC_SAMPLES = 65536
 _SPEC_INTERVAL = 0.5
+#: Minimum wall-time between two GUI level updates (never per sample).
+_LEVEL_INTERVAL = 0.5
 #: Conservative synthesis-rate estimate (samples/s) used to warn about long TX
 #: pre-generation; real CPU/GPU synthesis is usually faster.
 _EST_SYNTH_RATE_SPS = 2.0e6
@@ -258,6 +270,7 @@ class SimulationRunner:
         spectrum: SpectrumFn | None = None,
         ask: AskFn | None = None,
         phase: PhaseFn | None = None,
+        level: LevelFn | None = None,
     ) -> None:
         self.cfg = cfg
         self._log = log
@@ -267,7 +280,9 @@ class SimulationRunner:
         self._finished = finished
         self._spectrum = spectrum
         self._ask = ask
+        self._level = level
         self._spec_last: dict[str, float] = {}
+        self._level_last: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.engine: SignalEngine | None = None
@@ -280,6 +295,7 @@ class SimulationRunner:
         self._ram_budget_bytes = 0
         self._max_seg_seconds = 0.0
         self._source: IqFileSource | None = None
+        self._headroom: HeadroomController | None = None
 
     # ------------------------------------------------------------------
     def _logf(self, msg: str) -> None:
@@ -309,27 +325,82 @@ class SimulationRunner:
 
         return emit
 
+    def _emit_level(self, label: str, samples: np.ndarray) -> None:
+        """Отдать уровень блока (peak/RMS/клип) в GUI, не чаще 0.5 с."""
+        fn = self._level
+        if fn is None:
+            return
+        now = time.time()
+        if now - self._level_last.get(label, 0.0) < _LEVEL_INTERVAL:
+            return
+        self._level_last[label] = now
+        try:
+            st = level_stats(samples)
+            fn(label, st.peak_dbfs, st.rms_dbfs, st.clips)
+        except Exception:  # noqa: BLE001 - индикатор не должен ломать TX
+            pass
+
     def _emit_spectrum(self, label: str, samples: np.ndarray) -> None:
         """Отдать ~0.5-секундный блок (не более 65536 отсчётов) в график.
 
         Вызывается из потока генерации; ошибки графика не должны прерывать
-        синтез, поэтому любые исключения глотаются.
+        синтез, поэтому любые исключения глотаются.  Уровень (peak/RMS/клип)
+        обновляется тем же вызовом, даже когда график отключён.
         """
+        if self._spectrum is None and self._level is None:
+            return
+        x = np.asarray(samples)
+        if x.size == 0:
+            return
+        self._emit_level(label, x)
         if self._spectrum is None:
             return
         now = time.time()
         if now - self._spec_last.get(label, 0.0) < _SPEC_INTERVAL:
             return
         self._spec_last[label] = now
-        x = np.asarray(samples)
-        if x.size == 0:
-            return
         if x.size > _MAX_SPEC_SAMPLES:
             x = x[:_MAX_SPEC_SAMPLES]
         try:
             self._spectrum(label, x, self.cfg.fs)
         except Exception:  # noqa: BLE001
             pass
+
+    def _headroom_ctl(self) -> HeadroomController:
+        """Lazily build the anti-clip controller for this run."""
+        if self._headroom is None:
+            cfg = self.cfg
+            self._headroom = HeadroomController(
+                target=float(getattr(cfg, "headroom_target",
+                                     DEFAULT_HEADROOM_TARGET)),
+                enabled=bool(getattr(cfg, "headroom", True)),
+                log=self._logf)
+        return self._headroom
+
+    def _apply_auto_amp(self, engine: SignalEngine) -> None:
+        """Derive a scene-wide amplitude when ``cfg.amp_scale`` is ``None``.
+
+        The per-channel amplitudes set by :meth:`SignalEngine._allocate` use the
+        provisional scale; the weights (amplitude / provisional) let us pick one
+        scale so the estimated composite peak stays below full scale (the
+        headroom controller then trims it to the target).  An explicit
+        ``cfg.amp_scale`` is honoured unchanged.
+        """
+        cfg = self.cfg
+        if cfg.amp_scale is not None:
+            return
+        try:
+            channels = list(engine.channels)
+            provisional = float(engine.amp_scale) or 0.15
+        except Exception:  # noqa: BLE001 - fake engines in tests
+            return
+        weights = [c.amp / provisional for c in channels]
+        scale = auto_amp_scale(weights)
+        engine.set_amp_scale(scale)
+        self._logf(
+            f"Амплитуда: авто (по {len(channels)} каналам) — масштаб "
+            f"{scale:.4f} (сумма весов {sum(weights):.2f}); явно задать: "
+            f"--amp / поле «Амплитуда»")
 
     def _warn_high_fs_tx(self) -> None:
         """Warn about USB3 drops when transmitting a very high-``fs`` stream.
@@ -745,6 +816,8 @@ class SimulationRunner:
         self._apply_band()
         self._apply_b1i_band(by_sv, iono, xyz_fn)
 
+        provisional_amp = (0.15 if cfg.amp_scale is None
+                           else float(cfg.amp_scale))
         self.engine = SignalEngine(
             by_sv, iono, xyz_fn, self._start, cfg.fs,
             center_freq=cfg.center_freq,
@@ -752,9 +825,10 @@ class SimulationRunner:
             enable_galileo=cfg.enable_galileo, enable_qzss=cfg.enable_qzss,
             enable_sbas=cfg.enable_sbas, enable_beidou=cfg.enable_beidou,
             el_mask=cfg.el_mask / R2D,
-            amp_scale=cfg.amp_scale, iono_enable=cfg.iono_enable,
+            amp_scale=provisional_amp, iono_enable=cfg.iono_enable,
             l1c_data=cfg.l1c_data, b1i_data=cfg.b1i_data,
             backend=cfg.backend)
+        self._apply_auto_amp(self.engine)
         self._logf(f"Бэкенд синтеза: {self.engine.backend}"
                    + (f" ({self.engine.gpu_name})" if self.engine.gpu_name else ""))
         if cfg.enable_beidou:
@@ -877,6 +951,7 @@ class SimulationRunner:
                     break
                 if b.size > remain:
                     b = b[:remain]
+            self._emit_spectrum("TX", b)
             self.sink.write(b)
             produced += b.size
             if self._progress is not None:
@@ -924,12 +999,15 @@ class SimulationRunner:
                 stopped = self._stop.is_set()
                 if cfg.use_usrp:
                     # TX needs the whole segment in RAM for the endless loop.
-                    self._emit_spectrum("TX", b)
+                    # The anti-clip scale is applied to the whole segment once,
+                    # after synthesis (one exact factor, no TX level jump), so
+                    # the spectrum/level is emitted only once streaming starts.
                     buf.append(b)
                 else:
                     # Pure IQ-file run: write every produced block straight
                     # away, so the progress bar tracks generation (and the bar
                     # does not stay empty for a long segment, nor jump).
+                    b = self._headroom_ctl().process_block(b)
                     self.sink.write(b)
                     self._emit_spectrum("TX", b)
                     produced += len(b)
@@ -954,6 +1032,8 @@ class SimulationRunner:
             self._logf(f"Сегмент {got / cfg.fs:.1f} с сгенерирован {where}")
 
             if cfg.use_usrp:
+                # One exact anti-clip scale for the whole pre-generated segment.
+                self._headroom_ctl().process_segment(buf)
                 # TX + loop (the segment branch is only entered when looping):
                 # stream the RAM segment continuously until «Стоп».  ``duration``
                 # is deliberately ignored as a stop condition here; it still
@@ -967,6 +1047,7 @@ class SimulationRunner:
                         if self._stop.is_set():
                             break
                         self.sink.write(b)
+                        self._emit_spectrum("TX", b)
                         produced += len(b)
                         within += len(b)
                         if self._phase is not None:
@@ -1000,6 +1081,7 @@ class SimulationRunner:
                     if n <= 0:
                         break
                 samples = self.engine.generate_block(n)
+                samples = self._headroom_ctl().process_block(samples)
                 self.sink.write(samples)
                 self._emit_spectrum("TX", samples)
                 produced += n
@@ -1043,7 +1125,6 @@ class SimulationRunner:
             # Store the RAM segment as complex64 (half of complex128) so a
             # 25 Msps combined segment stays comfortably in memory.
             b = np.asarray(self.engine.generate_block(n), dtype=np.complex64)
-            self._emit_spectrum("TX", b)
             blocks.append(b)
             got += n
             # Advance the GUI/CLI progress bar while nothing is transmitted
@@ -1092,6 +1173,7 @@ class SimulationRunner:
                 if self._stop.is_set():
                     break
                 self.sink.write(b)
+                self._emit_spectrum("TX", b)
                 produced += len(b)
                 within += len(b)
                 if self._phase is not None:
@@ -1162,6 +1244,8 @@ class SimulationRunner:
             else:
                 self._logf("TX: сегмент в RAM готов — потоковая передача "
                            "на B210 без синтеза между блоками")
+            # One exact anti-clip scale for the whole pre-generated segment.
+            self._headroom_ctl().process_segment(blocks)
             return self._write_ram_blocks(blocks, got, t0, loop=False,
                                           base=0.5, span=0.5)
         if target is not None:
@@ -1195,7 +1279,6 @@ class SimulationRunner:
                         break
                     n = block if target is None else min(block, target - got)
                     b = self.engine.generate_block(n)
-                    self._emit_spectrum("TX", b)
                     while not stop.is_set():
                         try:
                             q.put((b, n), timeout=0.1)
@@ -1226,7 +1309,9 @@ class SimulationRunner:
             if item is None:
                 break
             b, n = item
+            b = self._headroom_ctl().process_block(b)
             self.sink.write(b)
+            self._emit_spectrum("TX", b)
             produced += n
             if self._progress is not None:
                 wall = max(1e-9, time.time() - t0)

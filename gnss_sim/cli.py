@@ -91,8 +91,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "(NH20+BCH), placeholder — постоянный +1 (по умолч. d1)")
     p.add_argument("--el-mask", type=float, default=5.0,
                    help="elevation mask [deg]")
-    p.add_argument("--amp", type=float, default=0.15,
-                   help="overall amplitude scale (float, <1)")
+    p.add_argument("--amp", type=float, default=None,
+                   help="общий масштаб амплитуды (один на все каналы, <1). "
+                        "По умолчанию — авто: масштаб подбирается по числу "
+                        "каналов/сумме амплитуд так, чтобы композитный пик был "
+                        "≈0.7 (многосистемная сцена ~0.06–0.10, GPS-only "
+                        "остаётся на прежнем уровне). Задайте явно, чтобы "
+                        "получить ровно этот множитель")
+    p.add_argument("--headroom", type=float, default=0.7, metavar="TARGET",
+                   help="целевой пик композитного baseband (anti-clip), "
+                        "по умолчанию 0.7. Один общий масштаб на сегмент, "
+                        "чтобы ЦАП B210 не клиппировал")
+    p.add_argument("--no-headroom", action="store_true",
+                   help="отключить автоматический запас по уровню (anti-clip)")
     p.add_argument("--no-iono", action="store_true",
                    help="disable ionospheric delay")
     p.add_argument("--tx", action="store_true",
@@ -209,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         cddis_password=args.cddis_password, cddis_token=args.cddis_token,
         nav_mode=args.nav_mode,
         el_mask=args.el_mask, amp_scale=args.amp,
+        headroom=not args.no_headroom, headroom_target=args.headroom,
         iono_enable=not args.no_iono, l1c_data=args.l1c_data,
         b1i_data=args.b1i_data, auto_b1i=args.auto_b1i,
         output=args.output, output_format=args.format, output_scale=args.scale,

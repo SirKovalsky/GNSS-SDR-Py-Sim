@@ -337,7 +337,16 @@ class SimConfig:
     enable_sbas: bool = True
     enable_beidou: bool = True
     el_mask: float = 5.0
-    amp_scale: float = 0.15
+    #: Overall amplitude scale.  ``None`` (default) derives one scene-wide
+    #: scale from the allocated channels / their summed amplitudes so a
+    #: multi-system scene already has headroom; an explicit float keeps the
+    #: historic single-factor behaviour (CLI ``--amp``, GUI «Амплитуда»).
+    amp_scale: float | None = None
+    #: Automatic anti-clip headroom for the composite baseband (default ON):
+    #: the pre-generated segment gets one exact scale (peak ≈ ``headroom_target``)
+    #: and streaming TX tracks a scale that only ever decreases.
+    headroom: bool = True
+    headroom_target: float = 0.7
     iono_enable: bool = True
     l1c_data: str = "zeros"
     #: BeiDou B1I data: ``d1`` (real broadcast message) or ``placeholder``
