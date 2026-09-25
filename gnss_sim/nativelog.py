@@ -140,9 +140,14 @@ def install_native_stderr_filter(force: bool = False) -> bool:
         return False
     try:
         read_fd, write_fd = os.pipe()
-        _redirect_windows_stderr_handle(write_fd)
         _saved_stderr_fd = os.dup(2)
         os.dup2(write_fd, 2)
+        # Point STD_ERROR_HANDLE at fd 2 *after* the duplication and before the
+        # original write handle is closed: SetStdHandle stores a raw handle and
+        # does not duplicate it, so pointing it at ``write_fd`` and then
+        # ``os.close(write_fd)`` left UHD's own CRT writing to a closed handle
+        # (native lines never reached the journal).  fd 2 stays valid.
+        _redirect_windows_stderr_handle(2)
         os.close(write_fd)
     except Exception:  # noqa: BLE001 - keep working with a raw console
         return False

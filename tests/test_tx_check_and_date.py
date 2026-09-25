@@ -192,7 +192,11 @@ def test_gui_start_date_is_locked_only_time_editable() -> None:
             QtCore.QEvent.KeyPress, QtCore.Qt.Key_Up, QtCore.Qt.NoModifier))
         assert (win.ed_start.currentSection()
                 == QtWidgets.QDateTimeEdit.HourSection)
-        # The read-only label always shows the resolved date.
+        # The read-only label always shows the resolved date.  Widen the widget
+        # range so a cached coverage file cannot clamp the chosen value.
+        win.ed_start.setDateTimeRange(
+            QtCore.QDateTime(2000, 1, 1, 0, 0, 0),
+            QtCore.QDateTime(2100, 1, 1, 0, 0, 0))
         win.chk_now.setChecked(False)
         win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 24, 13, 45, 30))
         win._refresh_start_date_label()

@@ -278,12 +278,14 @@ def has_merged_for_start(start: GpsTime, cache_dir: str | None = None) -> bool:
 
 
 def merged_start_for_date(start: GpsTime, day, cache_dir: str | None = None,
-                          margin_hours: float = 6.0) -> GpsTime:
+                          margin_hours: float = 0.0) -> GpsTime:
     """Move ``start`` to ``day`` keeping the time-of-day.
 
     When the merged file for ``day`` is cached and parseable, the result is
-    clamped into its ephemeris toe span (±``margin_hours``) so it stays inside
-    :func:`gnss_sim.rinex.check_start_coverage`.
+    clamped into its **actual RINEX epoch window** (earliest…latest record
+    epoch) so it stays inside :func:`gnss_sim.rinex.check_start_coverage`.  The
+    old ``toe ± 6 h`` margin is gone: it produced a window that disagreed with
+    the file and allowed starts outside the real data.
     """
     _y, _m, _d, hh, mm, ss = gps2date(start)
     moved = date2gps(day.year, day.month, day.day, hh, mm, ss)
@@ -291,9 +293,9 @@ def merged_start_for_date(start: GpsTime, day, cache_dir: str | None = None,
         doy = doy_from_date(day.year, day.month, day.day)
         path = cached_nav_set_for_date(day.year, doy, cache_dir)
         if _is_merged_path(path):
-            from .rinex import ephemeris_toe_span, parse_nav_file
+            from .rinex import ephemeris_epoch_span, parse_nav_file
             by_sv, _iono = parse_nav_file(str(path))
-            span = ephemeris_toe_span(by_sv)
+            span = ephemeris_epoch_span(by_sv)
             if span is not None:
                 lo, hi = span
                 margin = max(0.0, float(margin_hours)) * 3600.0
@@ -309,7 +311,7 @@ def merged_start_for_date(start: GpsTime, day, cache_dir: str | None = None,
 def latest_merged_start(start: GpsTime, now=None,
                         cache_dir: str | None = None,
                         max_back_days: int = 7,
-                        margin_hours: float = 6.0) -> GpsTime | None:
+                        margin_hours: float = 0.0) -> GpsTime | None:
     """Return ``start`` moved to the latest merged-RINEX day, or ``None``.
 
     ``None`` means no move is needed: either the requested date already has a

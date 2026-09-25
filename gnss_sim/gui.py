@@ -237,6 +237,8 @@ class Bridge(QtCore.QObject):
     #: Native UHD stderr text, forwarded from the fd-2 reader thread.
     native = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(float, float, float, float)
+    #: Separate phase progress: ``(kind, frac, loops, sim_s, cyclic)``.
+    phase = QtCore.pyqtSignal(str, float, int, float, bool)
     channels = QtCore.pyqtSignal(list)
     finished = QtCore.pyqtSignal(object)
     spectrum = QtCore.pyqtSignal(str, object, float)
@@ -325,6 +327,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bridge.log.connect(self._append_log)
         self.bridge.native.connect(self._append_native_log)
         self.bridge.progress.connect(self._on_progress)
+        self.bridge.phase.connect(self._on_phase)
         self.bridge.channels.connect(self._on_channels)
         self.bridge.finished.connect(self._on_finished)
         self.bridge.spectrum.connect(self._on_spectrum)
@@ -626,8 +629,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         When the selected RINEX does not cover «now» (for example an old
         ephemeris) the «Сейчас (UTC)» checkbox is disabled/unchecked and the
-        start is moved into the ``toe ±6 h`` window, so a run can never silently
-        start outside the coverage.  The window is always shown in the label.
+        start is moved to the RINEX start, so a run can never silently start
+        outside the file.  The window is the actual RINEX epoch span
+        (earliest…latest record epoch) and is always shown in the label.
         """
         if not hasattr(self, "ed_start") or not hasattr(self, "lbl_start_cover"):
             return
@@ -654,8 +658,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.chk_now.setEnabled(True)
             self._refresh_start_date_label()
             return
-        from .rinex import check_start_coverage, ephemeris_toe_span
-        span = ephemeris_toe_span(by_sv)
+        from .rinex import check_start_coverage, ephemeris_epoch_span
+        span = ephemeris_epoch_span(by_sv)
         if span is None:
             self.lbl_start_cover.setText("Покрытие эфемерид: нет данных")
             if hasattr(self, "chk_now"):
@@ -663,12 +667,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_start_date_label()
             return
         lo, hi = span
-        lo_dt = self._gps_to_qdt(lo, -6 * 3600.0)
-        hi_dt = self._gps_to_qdt(hi, +6 * 3600.0)
-        if not (lo_dt.isValid() and hi_dt.isValid() and lo_dt < hi_dt):
+        # The window is the ACTUAL RINEX epoch span [earliest, latest], never
+        # the old ``toe ± 6 h`` heuristic: the label and the widget must show
+        # one consistent source of truth (the file), or a start can slip
+        # outside the real ephemeris validity.
+        lo_dt = self._gps_to_qdt(lo)
+        hi_dt = self._gps_to_qdt(hi)
+        if not (lo_dt.isValid() and hi_dt.isValid() and lo_dt <= hi_dt):
             self.lbl_start_cover.setText("Покрытие эфемерид: нет данных")
             self._refresh_start_date_label()
             return
+        # A single-epoch file has a degenerate window: pin the widget to it so
+        # the one valid start time is still selectable.
         self.ed_start.setDateTimeRange(lo_dt, hi_dt)
         window = (f"{lo_dt.toString('yyyy/MM/dd HH:mm')} … "
                   f"{hi_dt.toString('yyyy/MM/dd HH:mm')}")
@@ -682,7 +692,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.chk_now.setChecked(False)
                 self.chk_now.setEnabled(False)
             if note is not None:
-                # The current start is outside too: move to the first toe.
+                # The current start is outside the file too: pull it to the
+                # RINEX start so the date label reflects the file (fixes the
+                # stale 2026/09/25 date when a 2026-09-23 file is loaded).
                 moved = lo
                 self.ed_start.setDateTime(self._gps_to_qdt(lo))
         else:
@@ -692,7 +704,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Manual start outside the window: snap to the nearest edge.
                 moved = lo if start_dt < lo_dt else hi
                 self.ed_start.setDateTime(self._gps_to_qdt(moved))
-        text = "Покрытие эфемерид (toe ±6 ч): " + window
+        text = "Покрытие эфемерид (RINEX): " + window
         if moved is not None:
             md = self._gps_to_qdt(moved)
             text += (". Старт вне диапазона — переведён на "
@@ -1356,6 +1368,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_progress.setWordWrap(True)
         v.addWidget(self.lbl_progress)
 
+        # Separate TX phase indicators: pre-generation has its own value, and
+        # transmission has a second bar that reaches 100 % only when the real
+        # stream is done (for cyclic TX it wraps every loop and shows
+        # elapsed/loop count instead of freezing at 100 %).
+        self.progress_pre = QtWidgets.QProgressBar()
+        self.progress_pre.setRange(0, 1000)
+        self.progress_pre.setFormat("предгенерация %p%")
+        self.progress_pre.setVisible(False)
+        self.lbl_progress_pre = QtWidgets.QLabel()
+        self.lbl_progress_pre.setWordWrap(True)
+        self.lbl_progress_pre.setVisible(False)
+        v.addWidget(self.progress_pre)
+        v.addWidget(self.lbl_progress_pre)
+        self.progress_tx = QtWidgets.QProgressBar()
+        self.progress_tx.setRange(0, 1000)
+        self.progress_tx.setFormat("передача %p%")
+        self.progress_tx.setVisible(False)
+        self.lbl_progress_tx = QtWidgets.QLabel()
+        self.lbl_progress_tx.setWordWrap(True)
+        self.lbl_progress_tx.setVisible(False)
+        v.addWidget(self.progress_tx)
+        v.addWidget(self.lbl_progress_tx)
+
         v.addWidget(QtWidgets.QLabel("Видимые спутники"))
         self.table = QtWidgets.QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
@@ -1650,9 +1685,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log(
                 "CDDIS: загружено " + str(len(paths)) + " посистемных "
                 "файлов: " + ", ".join(paths))
-            return
-        self.ed_nav.setText(str(path))
-        self._append_log(f"CDDIS: загружено -> {path}")
+        else:
+            self.ed_nav.setText(str(path))
+            self._append_log(f"CDDIS: загружено -> {path}")
+        # The downloaded RINEX resolves the coverage window: refresh the
+        # start-time range/date at once so no stale date is left behind.
+        self._update_start_range()
+        self._refresh_start_date_label()
 
     # ==================================================================
     # RINEX reuse question (thread-safe) and runner launch
@@ -1718,6 +1757,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setValue(0)
         if hasattr(self, "lbl_progress"):
             self.lbl_progress.setText("Подготовка…")
+        # Separate phase bars: only meaningful for a B210 transmission.
+        tx = bool(getattr(cfg, "use_usrp", False))
+        for bar, lab in ((getattr(self, "progress_pre", None),
+                          getattr(self, "lbl_progress_pre", None)),
+                         (getattr(self, "progress_tx", None),
+                          getattr(self, "lbl_progress_tx", None))):
+            if bar is not None:
+                bar.setValue(0)
+                bar.setVisible(tx)
+            if lab is not None:
+                lab.setText("")
+                lab.setVisible(tx)
         self.btn_start.setEnabled(False)
         self.btn_gen.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -1734,6 +1785,7 @@ class MainWindow(QtWidgets.QMainWindow):
             finished=self.bridge.finished.emit,
             spectrum=self.bridge.spectrum.emit,
             ask=self._ask_nav_update,
+            phase=self.bridge.phase.emit,
         )
         self.runner.start()
 
@@ -2136,6 +2188,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(
             f"{_APP_TITLE} — {sim_s:.1f} с / {wall:.1f} с ({rate:.2f}x)")
 
+    def _on_phase(self, kind: str, frac: float,
+                  loops: int, sim_s: float, cyclic: bool) -> None:
+        """Drive the separate pre-generation / transmission progress bars.
+
+        Pre-generation (``"pregen"``) has its own 0…100 % value.  Transmission
+        (``"tx"``) has a second 0…100 % bar over the *actual* stream; for a
+        cyclic transmission it wraps every loop and is labelled
+        «циклическая передача» with the elapsed time and loop count, so it
+        never freezes at 100 % while the signal keeps playing.
+        """
+        try:
+            value = int(round(float(frac or 0.0) * 1000.0))
+        except (TypeError, ValueError):
+            value = 0
+        value = max(0, min(1000, value))
+        if kind == "pregen":
+            bar = getattr(self, "progress_pre", None)
+            lab = getattr(self, "lbl_progress_pre", None)
+            if bar is not None:
+                bar.setVisible(True)
+                bar.setValue(value)
+            if lab is not None:
+                lab.setVisible(True)
+                lab.setText(f"Предгенерация: {value / 10:.0f}% "
+                            f"({sim_s:.1f} с сигнала)")
+            return
+        if kind != "tx":
+            return
+        bar = getattr(self, "progress_tx", None)
+        lab = getattr(self, "lbl_progress_tx", None)
+        if bar is not None:
+            bar.setVisible(True)
+            bar.setValue(value)
+            bar.setFormat(("циклическая передача %p%" if cyclic
+                           else "передача %p%"))
+        if lab is not None:
+            lab.setVisible(True)
+            if cyclic:
+                lab.setText(f"Циклическая передача: {value / 10:.0f}% "
+                            f"(проход {int(loops) + 1}, {sim_s:.1f} с)")
+            else:
+                lab.setText(f"Передача: {value / 10:.0f}% ({sim_s:.1f} с)")
+
     def _on_channels(self, chans: list) -> None:
         self.table.setRowCount(len(chans))
         for i, c in enumerate(chans):
@@ -2157,6 +2252,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.progress.setValue(1000)
             if hasattr(self, "lbl_progress"):
                 self.lbl_progress.setText("Готово")
+            # A finished (non-cyclic) transmission reaches 100 % exactly once,
+            # when the stream is actually done.
+            for bar in (getattr(self, "progress_pre", None),
+                        getattr(self, "progress_tx", None)):
+                if bar is not None and bar.isVisible():
+                    bar.setValue(1000)
         self._update_channel_validity()
 
     # ------------------------------------------------------------------

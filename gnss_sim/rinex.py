@@ -517,6 +517,11 @@ def ephemeris_toe_span(
 
     BeiDou ``toe`` values are normalised from BDT to GPS (see
     :func:`ephemeris_toe_gps`) so the span is meaningful for a mixed RINEX.
+
+    .. note::
+       This is *not* the coverage window used by the GUI/runner any more: the
+       authoritative window is :func:`ephemeris_epoch_span`, built from the
+       actual RINEX record epochs (``toc``), not from ``toe ± 6 h``.
     """
     toes = [ephemeris_toe_gps(e) for sets in by_sv.values() for e in sets]
     if not toes:
@@ -526,14 +531,43 @@ def ephemeris_toe_span(
     return lo, hi
 
 
+def ephemeris_epoch_span(
+        by_sv: dict[str, list[Ephemeris]]) -> tuple[GpsTime, GpsTime] | None:
+    """Return the actual RINEX epoch window ``(start, end)`` in GPS time.
+
+    The lower bound is the **earliest ephemeris epoch** in the file and the
+    upper bound the **latest** one (the record ``toc`` written by the receiver
+    network), which is what the start-time field must be bound to.  The old
+    ``toe ± 6 h`` heuristic produced windows that disagreed with the file and
+    let a simulation start before/after the real data.
+
+    Synthetic ephemerides used in tests set only ``toe`` (their ``toc`` stays
+    at the GPS epoch); those records fall back to :func:`ephemeris_toe_gps` so
+    the helper keeps working for hand-built fixtures.
+    """
+    epochs: list[GpsTime] = []
+    for sets in by_sv.values():
+        for eph in sets:
+            if eph.toc.week > 0 or eph.toc.sec > 0:
+                epochs.append(eph.toc)
+            else:
+                epochs.append(ephemeris_toe_gps(eph))
+    if not epochs:
+        return None
+    return min(epochs, key=_abs_gps), max(epochs, key=_abs_gps)
+
+
 def check_start_coverage(
         start: GpsTime, by_sv: dict[str, list[Ephemeris]],
-        margin_hours: float = 6.0) -> str | None:
-    """Return a Russian error string when ``start`` is outside the toe span.
+        margin_hours: float = 0.0) -> str | None:
+    """Return a Russian error string when ``start`` is outside the RINEX span.
 
-    ``None`` means the start time is (probably) covered by the ephemerides.
+    ``None`` means the start time is covered by the actual RINEX epochs.  The
+    bounds come from :func:`ephemeris_epoch_span` (earliest/latest record
+    epoch).  ``margin_hours`` is kept for callers that want a small tolerance
+    but defaults to ``0`` — the GUI/runner must not extend the file validity.
     """
-    span = ephemeris_toe_span(by_sv)
+    span = ephemeris_epoch_span(by_sv)
     if span is None:
         return None
     lo, hi = span
@@ -544,9 +578,10 @@ def check_start_coverage(
             y, mo, d, hh, mi, _ss = gps2date(g)
             return f"{y:04d}/{mo:02d}/{d:02d} {hh:02d}:{mi:02d}"
 
+        tol = f" (±{margin_hours:.0f} ч)" if margin_hours else ""
         return (f"Время старта {_fmt(start)} вне диапазона эфемерид "
-                f"{_fmt(lo)}…{_fmt(hi)} (±{margin_hours:.0f} ч). "
-                f"Выберите дату внутри этого диапазона или другой "
+                f"{_fmt(lo)}…{_fmt(hi)}{tol}. "
+                f"Выберите время внутри этого диапазона или другой "
                 f"RINEX-файл (для Galileo/BeiDou нужен merged "
                 f"BRDC00IGS_R_…).")
     return None

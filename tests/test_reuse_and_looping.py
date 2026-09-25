@@ -183,7 +183,8 @@ def test_auto_segment_explicit_and_indefinite() -> None:
 # ======================================================================
 def test_start_time_coverage_validation() -> None:
     by_sv, _iono = rinex.parse_nav_file(_NAV)
-    inside = date2gps(2026, 9, 25, 12, 0, 0)
+    # brdc2680.26n covers its actual RINEX epochs (2026/09/25 00:00…06:14).
+    inside = date2gps(2026, 9, 25, 3, 0, 0)
     assert rinex.check_start_coverage(inside, by_sv) is None
     outside = date2gps(2020, 1, 1, 0, 0, 0)
     msg = rinex.check_start_coverage(outside, by_sv)
@@ -234,7 +235,8 @@ def test_gui_validate_start_rejects_out_of_range(monkeypatch) -> None:
         cfg.nav_file = _NAV
         assert win._validate_start(cfg) is False
         assert warnings["n"] == 1
-        win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 25, 12, 0, 0))
+        # Inside the actual RINEX epoch window (2026/09/25 00:00…06:14).
+        win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 25, 3, 0, 0))
         cfg = win._collect()
         cfg.nav_file = _NAV
         assert win._validate_start(cfg) is True

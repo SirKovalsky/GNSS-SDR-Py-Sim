@@ -21,7 +21,7 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from gnss_sim.config import SimConfig, parse_start_time  # noqa: E402
-from gnss_sim.gpstime import date2gps  # noqa: E402
+from gnss_sim.gpstime import date2gps, inc_gps_time  # noqa: E402
 from gnss_sim.iqfile import Sink  # noqa: E402
 from gnss_sim.rinex import Ephemeris  # noqa: E402
 from gnss_sim.runner import SimulationRunner  # noqa: E402
@@ -190,9 +190,13 @@ def test_update_start_range_reenables_now_when_covered() -> None:
     win = MainWindow()
     try:
         win.chk_now.setEnabled(False)
-        eph = Ephemeris()
-        eph.toe = parse_start_time("now")
-        win._coverage_by_sv = lambda *a, **k: {"G01": [eph]}
+        # Two epochs around «now» give a real (non-degenerate) RINEX window
+        # that covers the current time exactly, as a daily file would.
+        now = parse_start_time("now")
+        before, after = Ephemeris(), Ephemeris()
+        before.toe = inc_gps_time(now, -3600.0)
+        after.toe = inc_gps_time(now, +3600.0)
+        win._coverage_by_sv = lambda *a, **k: {"G01": [before, after]}
         win._update_start_range()
         assert win.chk_now.isEnabled()
     finally:

@@ -32,6 +32,11 @@ from . import sysinfo
 
 StatusFn = Callable[[str], None]
 ProgressFn = Callable[[float, float, float, float], None]
+#: Phase progress callback: ``(kind, frac, loops, sim_s, cyclic)``.
+#: ``kind`` is ``"pregen"`` (RAM synthesis, own 0…1 value) or ``"tx"``
+#: (actual transmission, 0…1 within the current segment/loop).  ``loops`` is
+#: the completed loop count for cyclic transmission and ``cyclic`` marks it.
+PhaseFn = Callable[[str, float, int, float, bool], None]
 SpectrumFn = Callable[[str, np.ndarray, float], None]
 AskFn = Callable[[str, float], bool]
 
@@ -252,10 +257,12 @@ class SimulationRunner:
         finished: Callable[[str | None], None] | None = None,
         spectrum: SpectrumFn | None = None,
         ask: AskFn | None = None,
+        phase: PhaseFn | None = None,
     ) -> None:
         self.cfg = cfg
         self._log = log
         self._progress = progress
+        self._phase = phase
         self._channels = channels
         self._finished = finished
         self._spectrum = spectrum
@@ -931,6 +938,12 @@ class SimulationRunner:
                     sim_s = got / cfg.fs
                     self._progress(gen_span * got / seg_total, sim_s, wall,
                                    sim_s / wall if wall else 0.0)
+                if self._phase is not None and seg_total:
+                    # Pre-generation has its OWN 0…1 value (separate from the
+                    # transmission bar the user sees once TX starts).
+                    if cfg.use_usrp:
+                        self._phase("pregen", got / seg_total, 0,
+                                    got / cfg.fs, False)
                 if seg_total:
                     log_progress(int(100 * got / seg_total),
                                  f"{got / cfg.fs:.1f} из "
@@ -946,12 +959,22 @@ class SimulationRunner:
                 # is deliberately ignored as a stop condition here; it still
                 # bounds file output and non-loop TX.
                 stream_t0 = time.time()
+                segment_len = seg_total or 1
+                within = 0
+                loops = 0
                 while not self._stop.is_set():
                     for b in buf:
                         if self._stop.is_set():
                             break
                         self.sink.write(b)
                         produced += len(b)
+                        within += len(b)
+                        if self._phase is not None:
+                            # Cyclic TX: the transmission bar wraps every loop
+                            # (0…1 per segment) so it keeps updating instead of
+                            # freezing at 100 %; the label shows elapsed/loops.
+                            self._phase("tx", (within % segment_len) / segment_len,
+                                        loops, produced / cfg.fs, True)
                     if self._progress is not None:
                         wall = max(1e-9, time.time() - t0)
                         sim_s = produced / cfg.fs
@@ -959,6 +982,8 @@ class SimulationRunner:
                         frac = gen_span + (1.0 - gen_span) * (
                             1.0 - math.exp(-t / _TX_STREAM_TAU_S))
                         self._progress(frac, sim_s, wall, sim_s / wall)
+                    loops += 1
+                    within = 0
         else:
             total = int(duration * cfg.fs) if duration else None
             if cfg.use_usrp:
@@ -1028,6 +1053,9 @@ class SimulationRunner:
                 sim_s = got / fs
                 frac = frac_scale * ((got / target) if target else 0.0)
                 self._progress(frac, sim_s, wall, sim_s / wall)
+            if self._phase is not None:
+                self._phase("pregen", (got / target) if target else 1.0,
+                            0, got / fs, False)
             pct = int(100 * got / target) if target else 100
             log_progress(pct, f"{got / fs:.1f} с из {target / fs:.1f} с")
         elapsed = max(1e-9, time.time() - t0)
@@ -1055,6 +1083,9 @@ class SimulationRunner:
         cfg = self.cfg
         produced = 0
         stream_t0 = time.time()
+        segment_len = sum(int(np.asarray(b).size) for b in blocks) or 1
+        within = 0
+        loops = 0
         while not self._stop.is_set():
             for b in blocks:
                 # Honour «Стоп» within one block, not after the whole segment.
@@ -1062,6 +1093,15 @@ class SimulationRunner:
                     break
                 self.sink.write(b)
                 produced += len(b)
+                within += len(b)
+                if self._phase is not None:
+                    if target:
+                        pfrac = min(1.0, produced / target)
+                        cyclic = False
+                    else:
+                        pfrac = (within % segment_len) / segment_len
+                        cyclic = bool(loop)
+                    self._phase("tx", pfrac, loops, produced / cfg.fs, cyclic)
                 if target is not None and produced >= target:
                     break
             if self._progress is not None:
@@ -1081,6 +1121,8 @@ class SimulationRunner:
                 break
             if not loop:
                 break
+            loops += 1
+            within = 0
         return produced
 
     def _warn_large_tx_segment(self, target: int) -> None:
@@ -1195,6 +1237,14 @@ class SimulationRunner:
                     t = max(0.0, time.time() - stream_t0)
                     frac = 1.0 - math.exp(-t / _TX_STREAM_TAU_S)
                 self._progress(frac, sim_s, wall, sim_s / wall)
+            if self._phase is not None:
+                if target:
+                    self._phase("tx", min(1.0, produced / target), 0,
+                                produced / cfg.fs, False)
+                else:
+                    t = max(0.0, time.time() - stream_t0)
+                    self._phase("tx", 1.0 - math.exp(-t / _TX_STREAM_TAU_S),
+                                0, produced / cfg.fs, True)
             if stop.is_set():
                 break
         thread.join(timeout=10.0)

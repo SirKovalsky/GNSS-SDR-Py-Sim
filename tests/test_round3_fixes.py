@@ -270,6 +270,9 @@ def test_start_time_editable_date_locked() -> None:
     try:
         win.chk_now.setChecked(False)
         win.ed_nav.setText(_MERGED)
+        # Bind the widget range to the merged RINEX window first ...
+        win._update_start_range()
+        # ... then pick a start inside it; the second call must not move it.
         win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 24, 18, 0, 0))
         win._update_start_range()
         cover = win.lbl_start_cover.text()
