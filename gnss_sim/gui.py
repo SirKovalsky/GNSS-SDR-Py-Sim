@@ -16,7 +16,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import track as trackmod
 from . import ublox
-from .config import SimConfig
+from .config import BAND_PRESETS, SimConfig
 from .mapview import OsmMap
 from .runner import SimulationRunner
 from .spectrum import SpectrumWidget
@@ -903,32 +903,76 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_backend.setCurrentText("auto")
 
     def _build_band_group(self) -> QtWidgets.QGroupBox:
-        g = QtWidgets.QGroupBox("Полоса и BeiDou B1I")
+        g = QtWidgets.QGroupBox("Диапазон/сессия и BeiDou B1I")
         f = QtWidgets.QGridLayout(g)
+        self.cmb_band = QtWidgets.QComboBox()
+        for key in ("l1", "b1i", "wide"):
+            preset = BAND_PRESETS[key]
+            self.cmb_band.addItem(preset.title, key)
+        self._guard_combo(self.cmb_band)
+        _row(f, 0, "Диапазон/сессия", self.cmb_band)
+        self.lbl_band = QtWidgets.QLabel()
+        self.lbl_band.setWordWrap(True)
+        f.addWidget(self.lbl_band, 1, 0, 1, 2)
+
+        self.cmb_b1i_data = QtWidgets.QComboBox()
+        self.cmb_b1i_data.addItems(["d1", "placeholder"])
+        self.cmb_b1i_data.setToolTip(
+            "Данные BeiDou B1I: d1 — реальное сообщение D1 (NH20+BCH+эфемериды), "
+            "placeholder — постоянный +1 (но со структурой NH20).")
+        self._guard_combo(self.cmb_b1i_data)
+        _row(f, 2, "Данные B1I", self.cmb_b1i_data)
+
         self.cb_auto_b1i = QtWidgets.QCheckBox("Авто-подбор fs/центра под B1I")
         self.cb_auto_b1i.setChecked(True)
         self.cb_auto_b1i.setToolTip(
-            "BeiDou B1I (1561.098 МГц) не попадает в узкую полосу вокруг L1 "
-            "(1575.42 МГц). При включённой галочке программа сама выберет "
-            "центр 1568 МГц и fs 30 Мвыб/с, чтобы генерировать B1I вместе с "
-            "L1/E1. Выключите, чтобы оставить ручные значения (B1I будет "
-            "пропущен с предупреждением).")
-        f.addWidget(self.cb_auto_b1i, 0, 0, 1, 2)
+            "Устаревшее: авто-подбор широкой полосы 30 Мвыб/с под B1I. "
+            "В сессии «l1» B1I теперь не расширяет полосу, а отключается; "
+            "используйте сессии «b1i» или «wide».")
+        f.addWidget(self.cb_auto_b1i, 3, 0, 1, 2)
         self.lbl_auto_b1i = QtWidgets.QLabel(
-            "Если B1I включён и не помещается в текущую полосу, центр/fs "
-            "подбираются автоматически (центр 1568 МГц, fs 30 Мвыб/с); какие "
-            "сигналы сохранены — пишется в журнал. При отключённой галочке "
-            "ручные значения не меняются, B1I пропускается с предупреждением.")
+            "B1I не помещается в полосу L1 (1575.42 МГц, 2.6 Мвыб/с). "
+            "Для B1I выберите сессию «b1i» (только BeiDou, 1561.098 МГц, "
+            "4.092 Мвыб/с) или «wide» (все системы, 1568 МГц, 30 Мвыб/с — "
+            "только для IQ-файлов). В сессии «l1» B1I отключается с "
+            "предупреждением, fs на 30 Мвыб/с не переключается.")
         self.lbl_auto_b1i.setWordWrap(True)
-        f.addWidget(self.lbl_auto_b1i, 1, 0, 1, 2)
+        f.addWidget(self.lbl_auto_b1i, 4, 0, 1, 2)
         f.addWidget(self._group_reset_btn(
             self._reset_band_group,
-            "Сбросить только автоподбор полосы B1I"),
-            2, 0, 1, 2)
+            "Сбросить диапазон/сессию и параметры B1I"),
+            5, 0, 1, 2)
+
+        self.cmb_band.currentIndexChanged.connect(self._on_band_changed)
+        self._on_band_changed()
         return g
+
+    def _on_band_changed(self) -> None:
+        """Apply the selected band preset to fs/centre and the signal boxes."""
+        key = self.cmb_band.currentData() or "l1"
+        preset = BAND_PRESETS.get(key, BAND_PRESETS["l1"])
+        self._set_combo_hz(self.cmb_fs, preset.fs)
+        self._set_combo_hz(self.cmb_fc, preset.center_freq)
+        if key == "b1i":
+            self.cb_ca.setChecked(False)
+            self.cb_l1c.setChecked(False)
+            self.cb_gal.setChecked(False)
+            self.cb_qzss.setChecked(False)
+            self.cb_sbas.setChecked(False)
+            self.cb_bds.setChecked(True)
+        elif key == "wide":
+            for cb in (self.cb_ca, self.cb_l1c, self.cb_gal, self.cb_qzss,
+                       self.cb_sbas, self.cb_bds):
+                cb.setChecked(True)
+        else:  # l1
+            self.cb_bds.setChecked(False)
+        self.lbl_band.setText(preset.note)
 
     def _reset_band_group(self) -> None:
         self.cb_auto_b1i.setChecked(True)
+        self.cmb_b1i_data.setCurrentText("d1")
+        self.cmb_band.setCurrentIndex(0)
+        self._on_band_changed()
 
     def _build_cddis_group(self) -> QtWidgets.QGroupBox:
         g = QtWidgets.QGroupBox("Источник эфемерид (CDDIS / BKG)")
@@ -1340,6 +1384,18 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.setCurrentIndex(0)
         self._guard_combo(combo)
         return combo
+
+    @staticmethod
+    def _set_combo_hz(combo: QtWidgets.QComboBox, hz: float) -> None:
+        """Select (or type) a numeric Hz value in an editable combo box."""
+        target = str(int(round(float(hz))))
+        for i in range(combo.count()):
+            text = (combo.itemText(i) or "").strip()
+            token = text.split()[0] if text.split() else ""
+            if token == target:
+                combo.setCurrentIndex(i)
+                return
+        combo.setCurrentText(target)
 
     @staticmethod
     def _combo_hz(combo: QtWidgets.QComboBox, default: float) -> float:
@@ -1948,6 +2004,7 @@ class MainWindow(QtWidgets.QMainWindow):
             duration=self.sp_dur.value(),
             fs=self._combo_hz(self.cmb_fs, 2.6e6),
             center_freq=self._combo_hz(self.cmb_fc, 1575.42e6),
+            band=(self.cmb_band.currentData() or "l1"),
             enable_ca=self.cb_ca.isChecked(), enable_l1c=self.cb_l1c.isChecked(),
             enable_galileo=self.cb_gal.isChecked(),
             enable_qzss=self.cb_qzss.isChecked(),
@@ -1956,6 +2013,7 @@ class MainWindow(QtWidgets.QMainWindow):
             el_mask=self.sp_el.value(), amp_scale=self.sp_amp.value(),
             iono_enable=self.cb_iono.isChecked(),
             l1c_data=self.cmb_l1c_data.currentText(),
+            b1i_data=self.cmb_b1i_data.currentText(),
             auto_download=self.cb_auto.isChecked(),
             download_source=self.cmb_source.currentText(),
             nav_mode=("merged" if self.cmb_nav_mode.currentIndex() == 1

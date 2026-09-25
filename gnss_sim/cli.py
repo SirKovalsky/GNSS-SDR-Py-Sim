@@ -25,10 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="start time 'YYYY/MM/DD,hh:mm:ss' or 'now'")
     p.add_argument("-d", "--duration", type=float, default=60.0,
                    help="duration [s] (0 = until stopped)")
-    p.add_argument("-s", "--sample-rate", type=float, default=2.6e6,
-                   help="sampling frequency [Hz] (default 2.6e6)")
-    p.add_argument("-f", "--center-freq", type=float, default=1575.42e6,
-                   help="TX center frequency [Hz]")
+    p.add_argument("--band", default="l1", choices=["l1", "b1i", "wide"],
+                   help="полоса/сессия: l1 — L1/E1, центр 1575.42 МГц, "
+                        "2.6 Мвыб/с (по умолч.); b1i — только BeiDou B1I, "
+                        "центр 1561.098 МГц, 4.092 Мвыб/с; wide — все "
+                        "системы, центр 1568 МГц, 30 Мвыб/с (для IQ-файлов)")
+    p.add_argument("-s", "--sample-rate", type=float, default=None,
+                   help="sampling frequency [Hz] (по умолчанию — из --band)")
+    p.add_argument("-f", "--center-freq", type=float, default=None,
+                   help="TX center frequency [Hz] (по умолчанию — из --band)")
     p.add_argument("-o", "--output", default="",
                    help="output IQ file (empty = no file)")
     p.add_argument("--iq-input", default="",
@@ -73,6 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="bearer-токен Earthdata (вместо логина/пароля)")
     p.add_argument("--l1c-data", default="zeros", choices=["zeros", "cnav2"],
                    help="L1Cd data source")
+    p.add_argument("--b1i-data", dest="b1i_data", default="d1",
+                   choices=["d1", "placeholder"],
+                   help="данные BeiDou B1I: d1 — реальное сообщение D1 "
+                        "(NH20+BCH), placeholder — постоянный +1 (по умолч. d1)")
     p.add_argument("--el-mask", type=float, default=5.0,
                    help="elevation mask [deg]")
     p.add_argument("--amp", type=float, default=0.15,
@@ -156,11 +165,17 @@ def main(argv: list[str] | None = None) -> int:
             print("  ошибка:", exc)
         return 0
 
+    from .config import band_preset
+    preset = band_preset(args.band) or band_preset("l1")
+    fs = preset.fs if args.sample_rate is None else args.sample_rate
+    center = (preset.center_freq if args.center_freq is None
+              else args.center_freq)
+
     lat, lon, hgt = (float(x) for x in args.location.split(","))
     cfg = SimConfig(
         nav_file=args.nav, lat=lat, lon=lon, height=hgt,
         motion_file=args.motion, start_text=args.start, duration=args.duration,
-        fs=args.sample_rate, center_freq=args.center_freq,
+        fs=fs, center_freq=center, band=args.band,
         enable_ca=not args.no_ca, enable_l1c=not args.no_l1c,
         enable_galileo=not args.no_galileo, enable_qzss=not args.no_qzss,
         enable_sbas=not args.no_sbas, enable_beidou=not args.no_beidou,
@@ -170,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         nav_mode=args.nav_mode,
         el_mask=args.el_mask, amp_scale=args.amp,
         iono_enable=not args.no_iono, l1c_data=args.l1c_data,
-        auto_b1i=args.auto_b1i,
+        b1i_data=args.b1i_data, auto_b1i=args.auto_b1i,
         output=args.output, output_format=args.format, output_scale=args.scale,
         iq_input=args.iq_input, iq_in_ram=args.iq_ram,
         use_usrp=args.tx, uhd_args=args.uhd_args, tx_channel=args.tx_channel,

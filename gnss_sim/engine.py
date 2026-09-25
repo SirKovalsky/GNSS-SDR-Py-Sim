@@ -40,6 +40,7 @@ def cuda_available() -> bool:
 from .beidou import (
     B1I_CODE_CHIPS, B1I_CODE_RATE, CARR_FREQ_B1I, generate_b1i,
 )
+from .beidou_nav import NH_CODE, d1_frame_block
 from .ca_code import code_bipolar
 from .constants import (
     CARR_FREQ_L1, CODE_FREQ_CA, L1C_CODE_LEN, LAMBDA_L1, R2D,
@@ -228,6 +229,9 @@ class Channel:
     # SBAS 250 bps data (DO-229): repeating int8 bit block + 6 s frame epoch
     sbas_frame_start: GpsTime | None = None
     sbas_bits: np.ndarray | None = None
+    # BeiDou B1I D1 data (50 bps channel bits) + 30 s frame epoch
+    b1i_frame_start: GpsTime | None = None
+    b1i_bits: np.ndarray | None = None
 
     @property
     def name(self) -> str:
@@ -273,6 +277,7 @@ class SignalEngine:
         amp_scale: float = 0.15,
         iono_enable: bool = True,
         l1c_data: str = "zeros",
+        b1i_data: str = "d1",
         backend: str = "auto",
     ) -> None:
         self.by_sv = by_sv
@@ -291,6 +296,9 @@ class SignalEngine:
         self.el_mask = el_mask
         self.amp_scale = amp_scale
         self.l1c_data = l1c_data
+        self.b1i_data = ("d1" if str(b1i_data).strip().lower()
+                         in ("d1", "real", "nav", "") else "placeholder")
+        self._nh = np.asarray(NH_CODE, dtype=np.int8)
         if backend == "cpu":
             self.backend = "cpu"
         elif backend == "cuda" or (backend == "auto" and cuda_available()):
@@ -425,6 +433,10 @@ class SignalEngine:
               + 6.0 - rng / SPEED_OF_LIGHT) * 1000.0
         if ch.kind == "beidou":
             ch.b1_phase = (ms % 1.0) * B1I_CODE_CHIPS
+            # D1 frame epoch aligned to 30 s (frame = 5 subframes x 6 s).
+            b0 = GpsTime(self.g.week, float(int(self.g.sec // 30) * 30))
+            ch.b1i_frame_start = b0
+            ch.b1i_bits = self._b1i_frame_bits(ch, b0)
         else:
             ch.ca_phase = (ms % 1.0) * 1023.0
         ch.l1c_phase = (ms % 10.0) * 1023.0
@@ -491,6 +503,16 @@ class SignalEngine:
         return inav_bit_block(ch.eph, gst_week=frame_start.week,
                               gst_tow=frame_start.sec)
 
+    def _b1i_frame_bits(self, ch: Channel, frame_start: GpsTime) -> np.ndarray | None:
+        """Real BeiDou B1I D1 frame (1500 channel bits = 30 s at 50 bps).
+
+        Returns ``None`` in ``placeholder`` mode (the engine then transmits a
+        constant +1 data bit, still NH20-framed).
+        """
+        if self.b1i_data != "d1" or ch.eph is None:
+            return None
+        return d1_frame_block(ch.eph, frame_start.sec)
+
     # ------------------------------------------------------------------
     def _roll_frames(self) -> None:
         g = self.g
@@ -535,6 +557,16 @@ class SignalEngine:
                             ch.galileo_frame_start.sec - 604800.0)
                     ch.galileo_bits = self._galileo_block_bits(
                         ch, ch.galileo_frame_start)
+            if ch.b1i_frame_start is not None:
+                while sub_gps_time(g, ch.b1i_frame_start) >= 30.0:
+                    ch.b1i_frame_start = GpsTime(
+                        ch.b1i_frame_start.week,
+                        ch.b1i_frame_start.sec + 30.0)
+                    if ch.b1i_frame_start.sec >= 604800.0:
+                        ch.b1i_frame_start = GpsTime(
+                            ch.b1i_frame_start.week + 1,
+                            ch.b1i_frame_start.sec - 604800.0)
+                    ch.b1i_bits = self._b1i_frame_bits(ch, ch.b1i_frame_start)
 
     # ------------------------------------------------------------------
     def _device(self, arr, xp, cache: bool = True):
@@ -637,12 +669,28 @@ class SignalEngine:
         return code * data * carrier
 
     def _b1i_term(self, ch, g, t, f_code, carrier, xp):
+        """BPSK(2) B1I: primary code x NH20 (1 kbps) x D1 data (50 bps)."""
         ca = self._device(ch.ca, xp)
+        nh = self._device(self._nh, xp)
         cp = ch.b1_phase + f_code * t
         chip = xp.floor(cp).astype(xp.int64) % B1I_CODE_CHIPS
         code = ca[chip].astype(xp.float64)
-        data = xp.ones_like(t)                        # placeholder D1/D2 data
-        return code * data * carrier
+        if ch.b1i_frame_start is not None:
+            base = g.sec - ch.b1i_frame_start.sec
+        else:
+            base = g.sec
+        sec = base + t
+        # NH20: one chip per 1 ms ranging-code period, 20 ms period.
+        nh_idx = xp.floor(sec * 1000.0).astype(xp.int64) % NH_CODE.shape[0]
+        nh_bit = (1.0 - 2.0 * nh[nh_idx]).astype(xp.float64)
+        if ch.b1i_bits is not None:
+            bits = self._device(ch.b1i_bits, xp, cache=False)
+            # One D1 channel bit spans 20 ms (50 bps).
+            sym = xp.floor(sec * 50.0).astype(xp.int64) % bits.shape[0]
+            data = (1.0 - 2.0 * bits[sym]).astype(xp.float64)
+        else:
+            data = xp.ones_like(t)                    # placeholder +1 data
+        return code * nh_bit * data * carrier
 
     def _synthesise(self, nsamp: int, xp, complex_dtype, real_dtype) -> np.ndarray:
         dt = 1.0 / self.fs

@@ -9,7 +9,7 @@ from typing import Callable
 
 import numpy as np
 
-from .config import SimConfig
+from .config import SimConfig, band_preset
 from .constants import R2D
 from .engine import (
     SignalEngine,
@@ -434,6 +434,63 @@ class SimulationRunner:
                     self._logf("ВНИМАНИЕ: свободного места на диске может "
                                "не хватить")
 
+    def _apply_band(self) -> None:
+        """Resolve ``cfg.band`` into centre/``fs`` and the enabled systems.
+
+        ``l1`` (default) keeps the historic narrow L1 band and, when BeiDou is
+        enabled, drops B1I with a clear message instead of silently widening
+        to 30 Msps (which destabilises B210 TX over USB3).  ``b1i`` is a
+        BeiDou-only narrowband session; ``wide`` restores every constellation
+        in one 30 Msps band and is intended for IQ files.
+        """
+        cfg = self.cfg
+        key = str(getattr(cfg, "band", "l1") or "l1").strip().lower()
+        preset = band_preset(key)
+        if preset is None:
+            self._logf(f"Неизвестный диапазон '{key}' — используется l1")
+            preset = band_preset("l1")
+            key = "l1"
+
+        changed: list[str] = []
+        if key != "l1":
+            if abs(cfg.fs - preset.fs) > 1.0:
+                changed.append(f"fs {cfg.fs / 1e6:.3f} -> "
+                               f"{preset.fs / 1e6:.3f} Мвыб/с")
+                cfg.fs = preset.fs
+            if abs(cfg.center_freq - preset.center_freq) > 1.0:
+                changed.append(f"центр {cfg.center_freq / 1e6:.3f} -> "
+                               f"{preset.center_freq / 1e6:.3f} МГц")
+                cfg.center_freq = preset.center_freq
+
+        if key == "l1":
+            if cfg.enable_beidou:
+                cfg.enable_beidou = False
+                self._logf(
+                    "Сессия l1: BeiDou B1I (1561.098 МГц) не помещается в "
+                    "полосу L1 и отключён — это НЕ переключает fs на 30 "
+                    "Мвыб/с. Для B1I выберите сессию «b1i» (только B1I) или "
+                    "«wide» (все системы, для IQ-файлов).")
+        elif key == "b1i":
+            cfg.enable_beidou = True
+            cfg.enable_ca = cfg.enable_l1c = False
+            cfg.enable_galileo = cfg.enable_qzss = cfg.enable_sbas = False
+            self._logf("Сессия b1i: только BeiDou B1I, "
+                       f"центр {cfg.center_freq / 1e6:.3f} МГц, "
+                       f"fs {cfg.fs / 1e6:.3f} Мвыб/с"
+                       + ((" (" + "; ".join(changed) + ")") if changed else ""))
+        else:  # wide
+            cfg.enable_beidou = True
+            self._logf("Сессия wide: все системы, "
+                       f"центр {cfg.center_freq / 1e6:.3f} МГц, "
+                       f"fs {cfg.fs / 1e6:.3f} Мвыб/с"
+                       + ((" (" + "; ".join(changed) + ")") if changed else ""))
+            if cfg.use_usrp:
+                self._logf(
+                    "ВНИМАНИЕ: сессия wide (30 Мвыб/с) + передача на B210 — "
+                    "канал USB3 может не успевать (underflow / "
+                    "LIBUSB_TRANSFER_NO_DEVICE). Для эфира надёжнее отдельные "
+                    "сессии l1 и b1i; wide предназначена для IQ-файлов.")
+
     def _apply_b1i_band(self, by_sv=None, iono=None, xyz_fn=None) -> None:
         """Auto-pick a centre/fs that keeps BeiDou B1I with L1/E1.
 
@@ -579,6 +636,7 @@ class SimulationRunner:
 
         xyz_fn = self._make_xyz_fn()
 
+        self._apply_band()
         self._apply_b1i_band(by_sv, iono, xyz_fn)
 
         self.engine = SignalEngine(
@@ -589,7 +647,8 @@ class SimulationRunner:
             enable_sbas=cfg.enable_sbas, enable_beidou=cfg.enable_beidou,
             el_mask=cfg.el_mask / R2D,
             amp_scale=cfg.amp_scale, iono_enable=cfg.iono_enable,
-            l1c_data=cfg.l1c_data, backend=cfg.backend)
+            l1c_data=cfg.l1c_data, b1i_data=cfg.b1i_data,
+            backend=cfg.backend)
         self._logf(f"Бэкенд синтеза: {self.engine.backend}"
                    + (f" ({self.engine.gpu_name})" if self.engine.gpu_name else ""))
         if cfg.enable_beidou:
