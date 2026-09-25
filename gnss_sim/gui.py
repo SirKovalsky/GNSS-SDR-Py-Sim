@@ -7,6 +7,19 @@ lets you click a haul route and turns it into a mining dump-truck motion file.
 
 from __future__ import annotations
 
+from .nativelog import (install_native_stderr_filter, quiet_uhd,
+                        set_native_stderr_sink)
+
+# UHD must be imported *before* PyQt5 on Windows (creating a USRP after Qt has
+# loaded can crash with 0xC0000005); quiet it and capture its native stderr
+# before it loads.
+quiet_uhd()
+install_native_stderr_filter()
+try:  # pragma: no cover - platform dependent
+    import uhd  # noqa: F401
+except Exception:
+    pass
+
 import math
 import os
 import sys
@@ -16,7 +29,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import track as trackmod
 from . import ublox
-from .config import BAND_PRESETS, SimConfig, compute_combined_band
+from .config import (SimConfig, compute_combined_band, derive_band_key,
+                     derive_nav_mode)
 from .mapview import OsmMap
 from .runner import SimulationRunner
 from .spectrum import SpectrumWidget
@@ -40,17 +54,6 @@ _MERGED_RINEX_PREFIX = "BRDC00IGS_R_"
 #: Log colours (B1): errors red, warnings amber.
 _LOG_ERROR_COLOR = "#d32f2f"
 _LOG_WARN_COLOR = "#b26a00"
-
-#: Standard sample rates (Hz) offered by the editable combo box.
-_SAMPLE_RATES = [200000, 250000, 500000, 1000000, 1023000, 2000000, 2046000,
-                 2500000, 2600000, 4000000, 5000000, 10000000, 20460000,
-                 25000000, 30720000, 40000000, 50000000, 56000000, 61440000]
-#: Standard centre frequencies (Hz, label) for the editable combo box.
-_CENTER_FREQS = [(1561098000, "B1I"), (1571328000, "L1+E1+B1I (all)"),
-                 (1568250000, "L1+B1I wideband"),
-                 (1575420000, "L1/E1/B1C"), (1176450000, "L5/E5a"),
-                 (1227600000, "E5b"), (1207140000, "B2b"),
-                 (1278750000, "E6/B3")]
 
 
 class _DateLockedDateTimeEdit(QtWidgets.QDateTimeEdit):
@@ -123,7 +126,13 @@ USRP B210 в эфир.</p>
 <li><b>«Стоп»</b> — остановить генерацию/передачу.</li>
 </ul>
 
-<h3>Сигналы</h3>
+<h3>Сигналы — единственный выбор систем</h3>
+<p>Галочки сигналов полностью определяют сеанс. Диапазон
+(<code>l1</code>/<code>b1i</code>/<code>all</code>), центральная частота, частота
+дискретизации и источник RINEX выводятся из них автоматически и показаны только
+для чтения (поля «Радиотракт (вычисляется)» и примечание в «Эфемериды и
+позиция»). Ручная пересборка полосы осталась только в CLI
+(<code>-s</code>/<code>-f</code>).</p>
 <ul>
 <li><b>GPS L1 C/A</b> — гражданский сигнал GPS.</li>
 <li><b>GPS L1C</b> — современный GPS-сигнал (TMBOC + BOC(1,1)), данные L1Cd
@@ -131,9 +140,20 @@ USRP B210 в эфир.</p>
 <li><b>Galileo E1</b> — сигнал Galileo (CBOC).</li>
 <li><b>QZSS L1 C/A</b>, <b>SBAS L1 C/A</b> — японский и SBAS
 (геостационарный) сигналы.</li>
-<li><b>BeiDou B1I</b> — китайский сигнал; вне полосы при узкой полосе
-пропускается.</li>
+<li><b>BeiDou B1I</b> — китайский сигнал (1561.098 МГц). Вместе с L1/E1 он
+автоматически образует <b>единый поток</b> (<code>all</code>, центр/fs
+вычисляются); один он даёт узкую сессию <code>b1i</code>.</li>
 </ul>
+<p>Источник RINEX тоже следует за системами: если отмечены Galileo/QZSS/BeiDou,
+нужен мультисистемный merged-файл, иначе достаточно GPS-файла.</p>
+
+<h3>Консоль, UHD и «U»/«O»</h3>
+<p>UHD по умолчанию печатает служебные строки в stderr (в PowerShell это
+оранжевый <code>NativeCommandError</code>); программа ставит
+<code>UHD_LOG_LEVEL=fatal</code> и перехватывает нативный stderr. Одиночные
+маркеры <code>U</code>/<code>O</code> (underflow/overflow B210) библиотека UHD
+пишет в обход уровня логов — они отфильтровываются, а настоящие ошибки
+попадают в журнал/на stdout.</p>
 
 <h3>Повторное использование готового IQ-файла</h3>
 <ul>
@@ -319,6 +339,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._nmea_timer.setInterval(500)
         self._nmea_timer.timeout.connect(self._update_ublox)
         self._build_ui()
+        # Native UHD text (minus the U/O markers) goes to the GUI log, never to
+        # the console.  run.py installs the fd-2 capture before importing UHD;
+        # this just points it at the log widget.
+        install_native_stderr_filter()
+        set_native_stderr_sink(self.bridge.log.emit)
 
     # ==================================================================
     # UI construction
@@ -378,6 +403,12 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addWidget(self._build_tx_group())
         left.addWidget(self._build_output_group())
         left.addWidget(self._build_rf_group())
+        # The «Сигналы» checkboxes are the single source of truth: every toggle
+        # refreshes the read-only band/centre/fs and RINEX-source note.
+        for cb in (self.cb_ca, self.cb_l1c, self.cb_gal, self.cb_qzss,
+                   self.cb_sbas, self.cb_bds):
+            cb.stateChanged.connect(self._refresh_derived)
+        self._refresh_derived()
         left.addStretch(1)
         return self._scroll(inner)
 
@@ -410,19 +441,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_auto.setChecked(True)
         f.addWidget(self.cb_auto, 1, 0, 1, 2)
 
-        # Explicit ephemeris-source choice (B3): the merged multi-GNSS file is
-        # only published for previous days; today only per-system files exist.
-        self.cmb_nav_mode = QtWidgets.QComboBox()
-        self.cmb_nav_mode.addItems([
-            "Авто (merged, затем посистемные)",
-            "Мультисистемный (G/E/J/C)",
-        ])
-        self._guard_combo(self.cmb_nav_mode)
-        _row(f, 2, "Режим эфемерид", self.cmb_nav_mode)
+        # The RINEX source mode (multi-GNSS vs GPS-only) is derived from the
+        # «Сигналы» checkboxes below and shown here read-only; there is no
+        # separate «Режим эфемерид» choice any more.
         self.lbl_nav_mode = QtWidgets.QLabel()
+        self.lbl_nav_mode.setTextFormat(QtCore.Qt.RichText)
         self.lbl_nav_mode.setWordWrap(True)
-        self._set_nav_mode_note()
-        f.addWidget(self.lbl_nav_mode, 3, 0, 1, 2)
+        self.lbl_nav_mode.setText(
+            "Источник RINEX будет выбран автоматически по системам.")
+        f.addWidget(self.lbl_nav_mode, 2, 0, 1, 2)
 
         self.ed_lat = QtWidgets.QDoubleSpinBox(); self.ed_lat.setRange(-90, 90)
         self.ed_lat.setDecimals(6); self.ed_lat.setValue(35.681298)
@@ -430,9 +457,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_lon.setDecimals(6); self.ed_lon.setValue(139.766247)
         self.ed_hgt = QtWidgets.QDoubleSpinBox(); self.ed_hgt.setRange(-1000, 20000)
         self.ed_hgt.setDecimals(1); self.ed_hgt.setValue(10.0)
-        _row(f, 4, "Широта, °", self.ed_lat)
-        _row(f, 5, "Долгота, °", self.ed_lon)
-        _row(f, 6, "Высота, м", self.ed_hgt)
+        _row(f, 3, "Широта, °", self.ed_lat)
+        _row(f, 4, "Долгота, °", self.ed_lon)
+        _row(f, 5, "Высота, м", self.ed_hgt)
         self.ed_motion = QtWidgets.QLineEdit("")
         self.ed_motion.setPlaceholderText("пусто = статичная позиция")
         btn_mot = QtWidgets.QPushButton("…")
@@ -442,7 +469,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                  "Motion (*.csv *.txt);;Все файлы (*)",
                                  "Все файлы (*)"))
         rmot = QtWidgets.QHBoxLayout(); rmot.addWidget(self.ed_motion); rmot.addWidget(btn_mot)
-        _row(f, 7, "Файл движения", self._wrap(rmot))
+        _row(f, 6, "Файл движения", self._wrap(rmot))
 
         # Start time: only the TIME is editable — the DATE is resolved from
         # the RINEX (read-only label) and from «Сейчас»/merged fallback.
@@ -463,31 +490,30 @@ class MainWindow(QtWidgets.QMainWindow):
         start_row.addWidget(QtWidgets.QLabel("Время (UTC):"))
         start_row.addWidget(self.ed_start)
         start_row.addWidget(self.chk_now)
-        _row(f, 8, "Время старта", self._wrap(start_row))
-        f.addWidget(self.lbl_start_date, 9, 0, 1, 2)
+        _row(f, 7, "Время старта", self._wrap(start_row))
+        f.addWidget(self.lbl_start_date, 8, 0, 1, 2)
         self.lbl_start_cover = QtWidgets.QLabel(
             "Покрытие эфемерид: неизвестно (будет автоскачивание)")
         self.lbl_start_cover.setWordWrap(True)
-        f.addWidget(self.lbl_start_cover, 10, 0, 1, 2)
+        f.addWidget(self.lbl_start_cover, 9, 0, 1, 2)
         self.sp_dur = QtWidgets.QDoubleSpinBox(); self.sp_dur.setRange(0, 86400)
         self.sp_dur.setValue(60.0); self.sp_dur.setSuffix(" с")
         self.sp_dur.setToolTip(
             "Сколько секунд записать/сгенерировать (0=∞, до «Стоп»). При TX с "
             "включённым зацикливанием эфир идёт непрерывно до «Стоп», а это "
             "поле задаёт длину файла / не-loop передачу.")
-        _row(f, 11, "Длительность (0=∞)", self.sp_dur)
+        _row(f, 10, "Длительность (0=∞)", self.sp_dur)
         f.addWidget(self._group_reset_btn(
             self._reset_nav_group,
             "Сбросить параметры эфемерид/позиции (CDDIS не затрагивается)"),
-            12, 0, 1, 2)
+            11, 0, 1, 2)
 
         self._refresh_start_date_label()
         self.ed_start.dateTimeChanged.connect(
             lambda *_: self._refresh_start_date_label())
 
-        # Coverage binding (B4): re-evaluate when the file/mode/«now» changes.
+        # Coverage binding (B4): re-evaluate when the file/«now» changes.
         self.ed_nav.editingFinished.connect(self._update_start_range)
-        self.cmb_nav_mode.currentIndexChanged.connect(self._on_nav_mode_changed)
         self.chk_now.toggled.connect(self._on_now_toggled)
         return g_nav
 
@@ -495,7 +521,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_nav_group(self) -> None:
         self.ed_nav.setText("")
         self.cb_auto.setChecked(True)
-        self.cmb_nav_mode.setCurrentIndex(0)
         self.ed_lat.setValue(35.681298)
         self.ed_lon.setValue(139.766247)
         self.ed_hgt.setValue(10.0)
@@ -622,12 +647,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------
     def _set_nav_mode_note(self, moved=None) -> None:
-        """Explain the merged-RINEX availability; optionally show a moved date."""
+        """Read-only note describing the derived RINEX source mode.
+
+        The mode is no longer a user choice: it follows the «Сигналы»
+        checkboxes (multi-GNSS if Galileo/QZSS/BeiDou are enabled, otherwise
+        GPS-only).  Optionally append the auto-moved start date.
+        """
         if not hasattr(self, "lbl_nav_mode"):
             return
-        text = ("Мультисистемный merged RINEX (G/E/J/C) публикуется только за "
-                "<b>прошедшие</b> сутки; за сегодня доступны только "
-                "посистемные файлы (brdc{DOY}0.{yy}{n,g,l,c,j}).")
+        multi = (getattr(self, "cb_gal", None) is not None
+                 and (self.cb_gal.isChecked() or self.cb_qzss.isChecked()
+                      or self.cb_bds.isChecked()))
+        if multi:
+            text = ("Источник RINEX: <b>мультисистемный merged (G/E/J/C)</b> — "
+                    "выбраны Galileo/QZSS/BeiDou. Такой файл публикуется "
+                    "только за <b>прошедшие</b> сутки; за сегодня берутся "
+                    "посистемные brdc{DOY}0.{yy}{n,g,l,c,j}.")
+        else:
+            text = ("Источник RINEX: <b>GPS-only</b> — выбраны только GPS "
+                    "L1/SBAS. Достаточно файла brdc{DOY}0.{yy}n; "
+                    "мультисистемный merged не требуется.")
         if moved is not None:
             text += (" Дата старта переведена на "
                      f"<b>{moved.year:04d}/{moved.month:02d}/{moved.day:02d}</b>.")
@@ -668,14 +707,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_start.setDateTime(moved)
         self._set_nav_mode_note(latest)
         self._refresh_start_date_label()
-
-    def _on_nav_mode_changed(self, index: int) -> None:
-        """React to the эфемериды-mode combo: merged mode follows the data."""
-        if int(index) == 1:
-            self._apply_multignss_date()
-        else:
-            self._set_nav_mode_note()
-        self._update_start_range()
 
     def _correct_multignss_start(self, cfg: SimConfig) -> bool:
         """Move a "today" start to the latest merged-RINEX day (no network).
@@ -727,7 +758,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------
     def _build_signals_group(self) -> QtWidgets.QGroupBox:
-        g_sig = QtWidgets.QGroupBox("Сигналы (общая несущая L1 1575.42 МГц)")
+        g_sig = QtWidgets.QGroupBox("Сигналы — единственный выбор систем")
         f2 = QtWidgets.QGridLayout(g_sig)
         self.cb_ca = QtWidgets.QCheckBox("GPS L1 C/A")
         self.cb_ca.setChecked(True)
@@ -739,10 +770,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_qzss.setChecked(True)
         self.cb_sbas = QtWidgets.QCheckBox("SBAS L1 C/A")
         self.cb_sbas.setChecked(True)
-        self.cb_bds = QtWidgets.QCheckBox("BeiDou B1I")
+        self.cb_bds = QtWidgets.QCheckBox("BeiDou B1I (1561.098 МГц)")
         self.cb_bds.setChecked(True)
+        _sig_tip = ("Единственный выбор систем: диапазон (l1/b1i/all), "
+                    "центр/fs и источник RINEX выводятся автоматически. "
+                    "Ручная пересборка полосы — только в CLI (-s/-f).")
         for i, w in enumerate((self.cb_ca, self.cb_l1c, self.cb_gal,
                                self.cb_qzss, self.cb_sbas, self.cb_bds)):
+            w.setToolTip(_sig_tip)
             f2.addWidget(w, i, 0, 1, 2)
         self.cmb_l1c_data = QtWidgets.QComboBox()
         self.cmb_l1c_data.addItems(["zeros", "cnav2"])
@@ -757,9 +792,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_amp = QtWidgets.QDoubleSpinBox(); self.sp_amp.setRange(0.001, 0.9)
         self.sp_amp.setSingleStep(0.05); self.sp_amp.setValue(0.15)
         _row(f2, 9, "Амплитуда", self.sp_amp)
+        # Read-only derived session: band key, centre and fs.
+        self.lbl_band = QtWidgets.QLabel()
+        self.lbl_band.setTextFormat(QtCore.Qt.RichText)
+        self.lbl_band.setWordWrap(True)
+        f2.addWidget(self.lbl_band, 10, 0, 1, 2)
         f2.addWidget(self._group_reset_btn(self._reset_signals_group,
                                            "Сбросить только сигналы"),
-                     10, 0, 1, 2)
+                     11, 0, 1, 2)
         return g_sig
 
     def _reset_signals_group(self) -> None:
@@ -769,6 +809,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_l1c_data.setCurrentText("zeros")
         self.sp_el.setValue(5.0)
         self.sp_amp.setValue(0.15)
+        if hasattr(self, "lbl_band"):
+            self._refresh_derived()
 
     def _build_output_group(self) -> QtWidgets.QGroupBox:
         g_out = QtWidgets.QGroupBox("Выход IQ")
@@ -883,12 +925,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_mem.setValue(0.0)
 
     def _build_rf_group(self) -> QtWidgets.QGroupBox:
-        g_rf = QtWidgets.QGroupBox("Радиотракт")
+        g_rf = QtWidgets.QGroupBox("Радиотракт (вычисляется)")
         f4 = QtWidgets.QGridLayout(g_rf)
-        self.cmb_fs = self._sample_combo(_SAMPLE_RATES, 2600000)
-        _row(f4, 0, "Частота дискр., Гц", self.cmb_fs)
-        self.cmb_fc = self._freq_combo(_CENTER_FREQS, 1575420000)
-        _row(f4, 1, "Центр. частота, Гц", self.cmb_fc)
+        self.lbl_fs = QtWidgets.QLabel()
+        self.lbl_fs.setTextFormat(QtCore.Qt.RichText)
+        _row(f4, 0, "Частота дискр.", self.lbl_fs)
+        self.lbl_fc = QtWidgets.QLabel()
+        self.lbl_fc.setTextFormat(QtCore.Qt.RichText)
+        _row(f4, 1, "Центр. частота", self.lbl_fc)
         self.cmb_backend = QtWidgets.QComboBox()
         self.cmb_backend.addItems(["auto", "cpu", "cuda"])
         self._guard_combo(self.cmb_backend)
@@ -899,23 +943,18 @@ class MainWindow(QtWidgets.QMainWindow):
         return g_rf
 
     def _reset_rf_group(self) -> None:
-        self.cmb_fs.setCurrentIndex(0)
-        self.cmb_fc.setCurrentIndex(0)
         self.cmb_backend.setCurrentText("auto")
 
     def _build_band_group(self) -> QtWidgets.QGroupBox:
-        g = QtWidgets.QGroupBox("Диапазон/сессия и BeiDou B1I")
+        g = QtWidgets.QGroupBox("Диапазон (вычисляется) и BeiDou B1I")
         f = QtWidgets.QGridLayout(g)
-        self._band_updating = False
-        self.cmb_band = QtWidgets.QComboBox()
-        for key in ("l1", "b1i", "all"):
-            preset = BAND_PRESETS[key]
-            self.cmb_band.addItem(preset.title, key)
-        self._guard_combo(self.cmb_band)
-        _row(f, 0, "Диапазон/сессия", self.cmb_band)
-        self.lbl_band = QtWidgets.QLabel()
-        self.lbl_band.setWordWrap(True)
-        f.addWidget(self.lbl_band, 1, 0, 1, 2)
+        note = QtWidgets.QLabel(
+            "Диапазон/центр/fs больше не выбираются вручную: они выводятся из "
+            "галочек «Сигналы» (l1 — L1/E1; b1i — только BeiDou B1I; all — "
+            "единый поток L1/E1 + B1I). Ручная пересборка полосы — в CLI "
+            "(<code>-s</code>/<code>-f</code>).")
+        note.setWordWrap(True)
+        f.addWidget(note, 0, 0, 1, 2)
 
         self.cmb_b1i_data = QtWidgets.QComboBox()
         self.cmb_b1i_data.addItems(["d1", "placeholder"])
@@ -923,95 +962,62 @@ class MainWindow(QtWidgets.QMainWindow):
             "Данные BeiDou B1I: d1 — реальное сообщение D1 (NH20+BCH+эфемериды), "
             "placeholder — постоянный +1 (но со структурой NH20).")
         self._guard_combo(self.cmb_b1i_data)
-        _row(f, 2, "Данные B1I", self.cmb_b1i_data)
+        _row(f, 1, "Данные B1I", self.cmb_b1i_data)
 
         self.cb_auto_b1i = QtWidgets.QCheckBox("Авто-подбор fs/центра под B1I")
         self.cb_auto_b1i.setChecked(True)
         self.cb_auto_b1i.setToolTip(
             "Устаревшее: авто-подбор широкой полосы под B1I (если B1I не "
-            "помещается). В сессии «l1» B1I отключается; в сессии «all» "
-            "центр/fs вычисляются под включённые системы.")
-        f.addWidget(self.cb_auto_b1i, 3, 0, 1, 2)
+            "помещается). При едином потоке (B1I + L1) центр/fs вычисляются "
+            "автоматически из выбранных систем.")
+        f.addWidget(self.cb_auto_b1i, 2, 0, 1, 2)
         self.lbl_auto_b1i = QtWidgets.QLabel(
-            "B1I не помещается в полосу L1 (1575.42 МГц, 2.6 Мвыб/с). "
-            "Для B1I выберите сессию «b1i» (только BeiDou, 1561.098 МГц, "
-            "4.092 Мвыб/с) или «all» (единый поток всех систем, центр/fs "
-            "вычисляются, ≈1571.33 МГц / 25 Мвыб/с). В сессии «l1» B1I "
-            "отключается с предупреждением.")
+            "B1I (1561.098 МГц) не помещается в узкую полосу L1. Отметьте "
+            "«BeiDou B1I» вместе с L1/E1 — программа сама соберёт единый поток "
+            "(центр/fs вычисляются) и возьмёт мультисистемный RINEX.")
         self.lbl_auto_b1i.setWordWrap(True)
-        f.addWidget(self.lbl_auto_b1i, 4, 0, 1, 2)
+        f.addWidget(self.lbl_auto_b1i, 3, 0, 1, 2)
         f.addWidget(self._group_reset_btn(
             self._reset_band_group,
-            "Сбросить диапазон/сессию и параметры B1I"),
-            5, 0, 1, 2)
-
-        self.cmb_band.currentIndexChanged.connect(self._on_band_selected)
-        for cb in (self.cb_ca, self.cb_l1c, self.cb_gal, self.cb_qzss,
-                   self.cb_sbas, self.cb_bds):
-            cb.stateChanged.connect(self._on_signal_toggled)
-        self._on_band_changed()
+            "Сбросить данные B1I и авто-подбор"),
+            4, 0, 1, 2)
         return g
 
-    def _on_band_selected(self, *_args) -> None:
-        """Band combo changed: apply the preset (forcing all systems for `all`)."""
-        self._on_band_changed(force_all=True)
+    # ------------------------------------------------------------------
+    def _refresh_derived(self, *_args) -> None:
+        """Recompute the read-only band/centre/fs and RINEX note.
 
-    def _on_signal_toggled(self, *_args) -> None:
-        """Recompute the combined band note while in the `all` session."""
-        if getattr(self, "_band_updating", False):
+        The «Сигналы» checkboxes are the single source of truth; this method
+        never changes their state.
+        """
+        if not hasattr(self, "lbl_band") or not hasattr(self, "lbl_fs"):
             return
-        key = self.cmb_band.currentData() or "l1"
-        if key in ("all", "wide"):
-            self._on_band_changed(force_all=False)
-
-    def _on_band_changed(self, force_all: bool = True) -> None:
-        """Apply the selected band preset to fs/centre and the signal boxes."""
-        if getattr(self, "_band_updating", False):
-            return
-        self._band_updating = True
-        try:
-            key = self.cmb_band.currentData() or "l1"
-            if key in ("all", "wide"):
-                if force_all:
-                    for cb in (self.cb_ca, self.cb_l1c, self.cb_gal,
-                               self.cb_qzss, self.cb_sbas, self.cb_bds):
-                        cb.setChecked(True)
-                plan = compute_combined_band(
-                    enable_ca=self.cb_ca.isChecked(),
-                    enable_l1c=self.cb_l1c.isChecked(),
-                    enable_galileo=self.cb_gal.isChecked(),
-                    enable_qzss=self.cb_qzss.isChecked(),
-                    enable_sbas=self.cb_sbas.isChecked(),
-                    enable_beidou=self.cb_bds.isChecked())
-                self._set_combo_hz(self.cmb_fs, plan.fs)
-                self._set_combo_hz(self.cmb_fc, plan.center_freq)
-                self.lbl_band.setText(
-                    "Единый поток (одна полоса, общий TX LO B210):\n"
-                    + plan.describe()
-                    + "\nЦентр/fs можно изменить вручную; при ручном значении "
-                      "авто-подбор под B1I не применяется.")
-                return
-            preset = BAND_PRESETS.get(key, BAND_PRESETS["l1"])
-            self._set_combo_hz(self.cmb_fs, preset.fs)
-            self._set_combo_hz(self.cmb_fc, preset.center_freq)
-            if key == "b1i":
-                self.cb_ca.setChecked(False)
-                self.cb_l1c.setChecked(False)
-                self.cb_gal.setChecked(False)
-                self.cb_qzss.setChecked(False)
-                self.cb_sbas.setChecked(False)
-                self.cb_bds.setChecked(True)
-            else:  # l1
-                self.cb_bds.setChecked(False)
-            self.lbl_band.setText(preset.note)
-        finally:
-            self._band_updating = False
+        enables = {
+            "enable_ca": self.cb_ca.isChecked(),
+            "enable_l1c": self.cb_l1c.isChecked(),
+            "enable_galileo": self.cb_gal.isChecked(),
+            "enable_qzss": self.cb_qzss.isChecked(),
+            "enable_sbas": self.cb_sbas.isChecked(),
+            "enable_beidou": self.cb_bds.isChecked(),
+        }
+        band = derive_band_key(**enables)
+        plan = compute_combined_band(**enables)
+        if not any(enables.values()):
+            self.lbl_band.setText(
+                "<b>Системы не выбраны</b> — отметьте хотя бы один сигнал.")
+            self.lbl_fs.setText("—")
+            self.lbl_fc.setText("—")
+        else:
+            self.lbl_band.setText(
+                f"<b>Диапазон (вычислен): {band}</b><br>{plan.describe()}")
+            self.lbl_fs.setText(f"<b>{plan.fs / 1e6:g}</b> Мвыб/с")
+            self.lbl_fc.setText(f"<b>{plan.center_freq / 1e6:.3f}</b> МГц")
+        self._set_nav_mode_note()
 
     def _reset_band_group(self) -> None:
         self.cb_auto_b1i.setChecked(True)
         self.cmb_b1i_data.setCurrentText("d1")
-        self.cmb_band.setCurrentIndex(0)
-        self._on_band_changed()
+        self._refresh_derived()
 
     def _build_cddis_group(self) -> QtWidgets.QGroupBox:
         g = QtWidgets.QGroupBox("Источник эфемерид (CDDIS / BKG)")
@@ -1402,52 +1408,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return g
 
     # ------------------------------------------------------------------
-    def _sample_combo(self, values, current) -> QtWidgets.QComboBox:
-        combo = QtWidgets.QComboBox()
-        combo.setEditable(True)
-        # First item reflects the default (its leading number parses cleanly).
-        combo.addItem(f"{int(current)} (по умолчанию)")
-        combo.addItems([str(int(v)) for v in values])
-        combo.setCurrentText(str(int(current)))
-        self._guard_combo(combo)
-        return combo
-
-    def _freq_combo(self, values, current) -> QtWidgets.QComboBox:
-        combo = QtWidgets.QComboBox()
-        combo.setEditable(True)
-        label = next((lbl for val, lbl in values
-                      if int(val) == int(current)), "")
-        combo.addItem(f"{int(current)} — {label} (по умолчанию)")
-        for value, lbl in values:
-            combo.addItem(f"{int(value)} — {lbl}")
-        combo.setCurrentIndex(0)
-        self._guard_combo(combo)
-        return combo
-
-    @staticmethod
-    def _set_combo_hz(combo: QtWidgets.QComboBox, hz: float) -> None:
-        """Select (or type) a numeric Hz value in an editable combo box."""
-        target = str(int(round(float(hz))))
-        for i in range(combo.count()):
-            text = (combo.itemText(i) or "").strip()
-            token = text.split()[0] if text.split() else ""
-            if token == target:
-                combo.setCurrentIndex(i)
-                return
-        combo.setCurrentText(target)
-
-    @staticmethod
-    def _combo_hz(combo: QtWidgets.QComboBox, default: float) -> float:
-        """Parse a numeric Hz value from an editable combo box."""
-        text = (combo.currentText() or "").strip()
-        token = text.split()[0] if text.split() else ""
-        for suffix in ("Гц", "Hz"):
-            token = token.replace(suffix, "")
-        try:
-            return float(token)
-        except ValueError:
-            return float(default)
-
     def _reset_defaults(self) -> None:
         """Reset every settings group; CDDIS credentials are preserved.
 
@@ -2034,22 +1994,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------
     def _collect(self) -> SimConfig:
-        band = self.cmb_band.currentData() or "l1"
-        fs = self._combo_hz(self.cmb_fs, 2.6e6)
-        center = self._combo_hz(self.cmb_fc, 1575.42e6)
-        # For the combined session, detect a manual edit so the runner keeps it
-        # instead of overwriting with the computed band.
-        fs_override = center_override = False
-        if band in ("all", "wide"):
-            plan = compute_combined_band(
-                enable_ca=self.cb_ca.isChecked(),
-                enable_l1c=self.cb_l1c.isChecked(),
-                enable_galileo=self.cb_gal.isChecked(),
-                enable_qzss=self.cb_qzss.isChecked(),
-                enable_sbas=self.cb_sbas.isChecked(),
-                enable_beidou=self.cb_bds.isChecked())
-            fs_override = abs(fs - plan.fs) > 1.0
-            center_override = abs(center - plan.center_freq) > 1.0
+        # «Сигналы» are the single source of truth: derive band, centre/fs and
+        # the RINEX source mode from the checked systems.
+        enables = dict(
+            enable_ca=self.cb_ca.isChecked(), enable_l1c=self.cb_l1c.isChecked(),
+            enable_galileo=self.cb_gal.isChecked(),
+            enable_qzss=self.cb_qzss.isChecked(),
+            enable_sbas=self.cb_sbas.isChecked(),
+            enable_beidou=self.cb_bds.isChecked())
+        band = derive_band_key(**enables)
+        plan = compute_combined_band(**enables)
+        fs = plan.fs
+        center = plan.center_freq
+        nav_mode = derive_nav_mode(enable_galileo=enables["enable_galileo"],
+                                   enable_qzss=enables["enable_qzss"],
+                                   enable_beidou=enables["enable_beidou"])
         return SimConfig(
             nav_file=self.ed_nav.text().strip(),
             lat=self.ed_lat.value(), lon=self.ed_lon.value(),
@@ -2060,21 +2019,16 @@ class MainWindow(QtWidgets.QMainWindow):
             fs=fs,
             center_freq=center,
             band=band,
-            fs_override=fs_override,
-            center_override=center_override,
-            enable_ca=self.cb_ca.isChecked(), enable_l1c=self.cb_l1c.isChecked(),
-            enable_galileo=self.cb_gal.isChecked(),
-            enable_qzss=self.cb_qzss.isChecked(),
-            enable_sbas=self.cb_sbas.isChecked(),
-            enable_beidou=self.cb_bds.isChecked(),
+            fs_override=False,
+            center_override=False,
+            nav_mode=nav_mode,
+            **enables,
             el_mask=self.sp_el.value(), amp_scale=self.sp_amp.value(),
             iono_enable=self.cb_iono.isChecked(),
             l1c_data=self.cmb_l1c_data.currentText(),
             b1i_data=self.cmb_b1i_data.currentText(),
             auto_download=self.cb_auto.isChecked(),
             download_source=self.cmb_source.currentText(),
-            nav_mode=("merged" if self.cmb_nav_mode.currentIndex() == 1
-                      else "auto"),
             auto_b1i=self.cb_auto_b1i.isChecked(),
             cddis_user=self.ed_cddis_user.text().strip(),
             cddis_password=self.ed_cddis_pass.text(),
@@ -2129,6 +2083,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    # Re-assert the quiet UHD level/log capture in case this entry point is used
+    # directly (``python -m gnss_sim.gui``); MainWindow points the sink at its
+    # own log widget.
+    quiet_uhd()
+    install_native_stderr_filter()
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
     win.show()

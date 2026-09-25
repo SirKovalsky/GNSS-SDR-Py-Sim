@@ -273,7 +273,10 @@ def test_cli_main_prepare_error_returns_1(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(cli, "SimulationRunner", BadRunner)
     assert cli.main([]) == 1
-    assert "нет устройства" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "нет устройства" in captured.out
+    # Simulator diagnostics never go to stderr (no orange PowerShell errors).
+    assert captured.err == ""
 
 
 # ======================================================================
@@ -327,22 +330,25 @@ def test_gui_start_coverage_binding() -> None:
 
 
 # ======================================================================
-# B3) Explicit multi-GNSS source choice
+# B3) RINEX source mode derived from the «Сигналы» checkboxes
 # ======================================================================
-def test_gui_nav_source_choice() -> None:
+def test_gui_nav_source_derived_from_signals() -> None:
     from gnss_sim.gui import MainWindow
     app = _app()
     win = MainWindow()
     try:
-        labels = [win.cmb_nav_mode.itemText(i)
-                  for i in range(win.cmb_nav_mode.count())]
-        assert any("Мультисистемный (G/E/J/C)" in text for text in labels)
-        note = win.lbl_nav_mode.text().lower()
-        assert "прошедш" in note and "посистемн" in note
-        win.cmb_nav_mode.setCurrentIndex(1)
+        # The «Режим эфемерид» combo is gone: mode follows the systems.
+        assert not hasattr(win, "cmb_nav_mode")
         cfg = win._collect()
         assert cfg.nav_mode == "merged"
         assert cfg.download_source == "auto"
+        assert "мультисистем" in win.lbl_nav_mode.text().lower()
+        # A GPS-only selection switches the source back to auto/GPS.
+        for cb in (win.cb_gal, win.cb_qzss, win.cb_bds):
+            cb.setChecked(False)
+        cfg = win._collect()
+        assert cfg.nav_mode == "auto"
+        assert "gps-only" in win.lbl_nav_mode.text().lower()
     finally:
         win.close()
     del app
@@ -439,7 +445,7 @@ def test_latest_multignss_date_prefers_cached_merged(tmp_path) -> None:
     del app
 
 
-def test_gui_multignss_mode_moves_start_date(monkeypatch) -> None:
+def test_gui_multignss_date_helper_moves_start(monkeypatch) -> None:
     from datetime import date
     from PyQt5 import QtCore
     from gnss_sim.gui import MainWindow
@@ -453,14 +459,11 @@ def test_gui_multignss_mode_moves_start_date(monkeypatch) -> None:
                                       QtCore.QDateTime(2100, 1, 1, 0, 0, 0))
         win.chk_now.setChecked(False)
         win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 25, 13, 45, 30))
-        win.cmb_nav_mode.setCurrentIndex(1)
+        win._apply_multignss_date()
         assert win.ed_start.date().toPyDate() == target
         assert win.ed_start.time().hour() == 13  # time-of-day preserved
         note = win.lbl_nav_mode.text()
         assert "прошедш" in note.lower() and "2026/09/24" in note
-        # Switching back to GPS-only leaves the date untouched.
-        win.cmb_nav_mode.setCurrentIndex(0)
-        assert win.ed_start.date().toPyDate() == target
     finally:
         win.close()
     del app
@@ -480,7 +483,6 @@ def test_gui_correct_multignss_start_moves_today(monkeypatch) -> None:
     try:
         win.ed_start.setDateTimeRange(QtCore.QDateTime(2000, 1, 1, 0, 0, 0),
                                       QtCore.QDateTime(2100, 1, 1, 0, 0, 0))
-        win.cmb_nav_mode.setCurrentIndex(1)
         win.chk_now.setChecked(False)
         win.ed_start.setDateTime(QtCore.QDateTime(
             today.year, today.month, today.day, 8, 0, 0))
@@ -533,3 +535,61 @@ def test_gui_b210_checkbox_on_basic_tab_and_hint() -> None:
     finally:
         win.close()
     del app
+
+
+# ======================================================================
+# Regression: monitor/duplex TX must not abort on the spectrum callback
+# ======================================================================
+def test_duplex_sink_spectrum_callback_takes_two_args(monkeypatch) -> None:
+    """``_DuplexSink`` passes ``_emit_spectrum(label, samples)``, not a 3rd fs.
+
+    Passing ``fs`` raised ``TypeError`` inside ``write`` and stopped every
+    GUI/CLI run that had RX monitoring / TX check enabled — i.e. no передача.
+    """
+    import gnss_sim.uhd_duplex as duplex_mod
+    from gnss_sim.config import SimConfig
+    from gnss_sim.runner import _DuplexSink
+
+    calls: list[str] = []
+
+    class FakeDuplex:
+        def __init__(self, **kwargs) -> None:
+            self.tx_gain = 0.0
+
+        def start(self) -> None:
+            pass
+
+        def measure_noise_floor(self, n: int) -> float:
+            return -60.0
+
+        def send(self, tx):
+            return np.zeros(len(tx), dtype=np.complex64)
+
+        def set_tx_gain(self, g: float) -> float:
+            return float(g)
+
+        def close(self) -> None:
+            pass
+
+        @property
+        def underflows(self) -> int:
+            return 0
+
+        @property
+        def overflows(self) -> int:
+            return 0
+
+        def describe(self) -> str:
+            return "fake duplex"
+
+        def get_info(self) -> dict:
+            return {}
+
+    monkeypatch.setattr(duplex_mod, "UhdDuplex", FakeDuplex)
+    cfg = SimConfig(use_usrp=True, monitor=True, tx_power_auto=False,
+                    fs=1.0e6, duration=0.1)
+    sink = _DuplexSink(cfg, log=lambda m: None,
+                       spectrum=lambda label, samples: calls.append(label))
+    sink.write(np.zeros(1000, dtype=np.complex64))
+    assert calls == ["RX"]
+    sink.close()

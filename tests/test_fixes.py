@@ -312,11 +312,11 @@ def test_gui_layout_controls_and_cb_auto_distinct() -> None:
         assert hasattr(win, "btn_cold") and hasattr(win, "btn_gen")
         assert win.btn_gen.text() == "Сгенерировать IQ"
 
-        win.cmb_fs.setCurrentText("1023000")
-        win.cmb_fc.setCurrentText("1176450000 — L5/E5a")
-        cfg = win._collect()
-        assert cfg.fs == 1023000.0
-        assert cfg.center_freq == 1176450000.0
+        # fs/centre are read-only derived labels (no manual combos any more);
+        # the default selection is every system -> the combined 25 Msps stream.
+        assert not hasattr(win, "cmb_fs") and not hasattr(win, "cmb_fc")
+        assert "25" in win.lbl_fs.text()
+        assert "1571" in win.lbl_fc.text()
 
         win.cb_auto.setChecked(False)
         win.cb_tx_auto.setChecked(True)

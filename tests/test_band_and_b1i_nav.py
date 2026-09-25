@@ -184,49 +184,62 @@ def test_cli_band_sets_radio_and_allows_override() -> None:
     assert args.b1i_data == "placeholder"
 
 
-def test_gui_band_controls() -> None:
+def test_gui_unified_signal_selection() -> None:
+    """«Сигналы» checkboxes are the only system choice; band/fs/nav derive."""
     from gnss_sim.gui import MainWindow
     app = _app()
     win = MainWindow()
     try:
-        assert win.cmb_band.currentData() == "l1"
-        # Default l1 session: B1I off, fs/centre are the L1 defaults.
-        assert win.cb_bds.isChecked() is False
-        assert win._collect().band == "l1"
-
-        win.cmb_band.setCurrentIndex(1)        # b1i
-        cfg = win._collect()
-        assert cfg.band == "b1i" and cfg.fs == pytest.approx(4.092e6)
-        assert cfg.center_freq == pytest.approx(1561.098e6)
+        # Default: all six systems checked -> one combined `all` stream.
         assert win.cb_bds.isChecked() is True
-        assert win.cb_ca.isChecked() is False
-        assert "B1I" in win.lbl_band.text()
-
-        win.cmb_band.setCurrentIndex(2)        # all
         cfg = win._collect()
-        assert cfg.band == "all" and cfg.fs == pytest.approx(25.0e6, abs=1.0)
+        assert cfg.band == "all"
+        assert cfg.fs == pytest.approx(25.0e6, abs=1.0)
         assert cfg.center_freq == pytest.approx(1571.328e6, abs=1e4)
-        assert win.cb_bds.isChecked() is True
-        assert "Единый поток" in win.lbl_band.text()
-        # Disabling a system in the `all` session is respected (not forced back).
-        win.cb_sbas.setChecked(False)
-        assert win.cb_sbas.isChecked() is False
-        assert win._collect().enable_sbas is False
-        win.cb_sbas.setChecked(True)
-        # Manually editing fs/centre marks them as explicit overrides.
-        win._set_combo_hz(win.cmb_fs, 10e6)
-        cfg = win._collect()
-        assert cfg.fs_override is True and cfg.fs == pytest.approx(10e6)
-        win.cmb_band.setCurrentIndex(0)
-        win.cmb_band.setCurrentIndex(2)  # back to computed values
-        assert win._collect().fs_override is False
+        assert cfg.nav_mode == "merged"
+        assert "all" in win.lbl_band.text()
+        assert "25" in win.lbl_fs.text()
 
+        # BeiDou only -> narrowband b1i, GPS-only systems off.
+        for cb in (win.cb_ca, win.cb_l1c, win.cb_gal, win.cb_qzss, win.cb_sbas):
+            cb.setChecked(False)
+        cfg = win._collect()
+        assert cfg.band == "b1i" and cfg.enable_beidou is True
+        assert cfg.fs == pytest.approx(4.092e6)
+        assert cfg.center_freq == pytest.approx(1561.098e6)
+        assert cfg.enable_ca is False and cfg.enable_galileo is False
+        assert "b1i" in win.lbl_band.text()
+
+        # BeiDou off + GPS L1 C/A only -> the historic narrow l1 session.
+        win.cb_bds.setChecked(False)
+        win.cb_ca.setChecked(True)
+        cfg = win._collect()
+        assert cfg.band == "l1" and cfg.enable_beidou is False
+        assert cfg.fs == pytest.approx(2.6e6, abs=1.0)
+        assert cfg.center_freq == pytest.approx(1575.42e6)
+        assert cfg.nav_mode == "auto"          # GPS-only RINEX source
+        assert "l1" in win.lbl_band.text()
+
+        # Enabling Galileo switches the RINEX source note to multi-system.
+        win.cb_gal.setChecked(True)
+        cfg = win._collect()
+        assert cfg.nav_mode == "merged"
+        assert "мультисистем" in win.lbl_nav_mode.text().lower()
+        # ... and the derived fs grows to cover the wider CBOC main lobes.
+        assert cfg.fs >= 16.368e6
+
+        # BeiDou B1I data stays a separate (non-system) choice.
         win.cmb_b1i_data.setCurrentText("placeholder")
         assert win._collect().b1i_data == "placeholder"
         win._reset_band_group()
-        assert win.cmb_band.currentData() == "l1"
         assert win.cmb_b1i_data.currentText() == "d1"
         assert win.cb_auto_b1i.isChecked() is True
+
+        # The redundant user-facing selectors are gone.
+        assert not hasattr(win, "cmb_band")
+        assert not hasattr(win, "cmb_nav_mode")
+        assert not hasattr(win, "cmb_fs")
+        assert not hasattr(win, "cmb_fc")
     finally:
         win.close()
     del app

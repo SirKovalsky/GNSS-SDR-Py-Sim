@@ -192,6 +192,46 @@ def band_preset(band: str | None) -> BandPreset | None:
     return BAND_PRESETS.get(key)
 
 
+def derive_band_key(
+    *,
+    enable_ca: bool = True,
+    enable_l1c: bool = True,
+    enable_galileo: bool = True,
+    enable_qzss: bool = True,
+    enable_sbas: bool = True,
+    enable_beidou: bool = True,
+) -> str:
+    """Derive the ``l1``/``b1i``/``all`` session from the enabled systems.
+
+    Single source of truth for the GUI: BeiDou B1I (1561.098 MHz) only -> ``b1i``;
+    B1I together with any L1/E1 carrier -> the one combined stream ``all``; no
+    B1I -> the historic narrow ``l1`` session.
+    """
+    l1_family = bool(enable_ca or enable_l1c or enable_galileo
+                     or enable_qzss or enable_sbas)
+    if enable_beidou and l1_family:
+        return "all"
+    if enable_beidou:
+        return "b1i"
+    return "l1"
+
+
+def derive_nav_mode(
+    *,
+    enable_galileo: bool = True,
+    enable_qzss: bool = True,
+    enable_beidou: bool = True,
+) -> str:
+    """Derive the RINEX source mode: ``merged`` (multi-GNSS) or ``auto`` (GPS).
+
+    Any non-GPS constellation (Galileo/QZSS/BeiDou) needs the merged
+    ``BRDC00IGS_R_…`` file, so the source mode follows the system selection and
+    is never a separate user choice.
+    """
+    return ("merged" if (enable_galileo or enable_qzss or enable_beidou)
+            else "auto")
+
+
 #: User-selectable session names (``wide`` stays as an alias of ``all``).
 BANDS = ("l1", "b1i", "all", "wide")
 

@@ -249,15 +249,17 @@ def test_combo_wheel_ignored_unless_popup_open() -> None:
             QtCore.QPointF(1, 1), QtCore.QPointF(1, 1), QtCore.QPoint(0, 0),
             QtCore.QPoint(0, 120), QtCore.Qt.NoButton,
             QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False)
-        before = win.cmb_fs.currentText()
-        guard = win.cmb_fs._wheel_guard  # noqa: SLF001
-        handled = guard.eventFilter(win.cmb_fs, event)
+        # The frequency/centre combos were replaced by read-only labels, but the
+        # remaining guarded combos (e.g. the synthesis backend) must still
+        # swallow a stray wheel while their popup is closed.
+        combo = win.cmb_backend
+        before = combo.currentText()
+        guard = combo._wheel_guard  # noqa: SLF001
+        handled = guard.eventFilter(combo, event)
         assert handled is True
-        assert win.cmb_fs.currentText() == before
-        # First item reflects the default value.
-        assert "(по умолчанию)" in win.cmb_fs.itemText(0)
-        assert win.cmb_fs.itemText(0).startswith("2600000")
-        assert win.cmb_fc.itemText(0).startswith("1575420000")
+        assert combo.currentText() == before
+        # fs/centre are no longer editable widgets at all.
+        assert not hasattr(win, "cmb_fs") and not hasattr(win, "cmb_fc")
     finally:
         win.close()
     del app

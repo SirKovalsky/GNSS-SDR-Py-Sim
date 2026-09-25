@@ -139,19 +139,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-devices", action="store_true",
                    help="list USRP devices and exit")
     p.add_argument("--uhd-log-level", default=None,
-                   help="уровень логов UHD (UHD_LOG_LEVEL): error/warning/info/"
-                        "debug; по умолчанию error, чтобы UHD не красил stderr "
-                        "PowerShell в оранжевый")
+                   help="уровень логов UHD (UHD_LOG_LEVEL): fatal/error/warning/"
+                        "info/debug; по умолчанию fatal — UHD не засоряет "
+                        "stderr и не красит консоль; нативный маркер underflow "
+                        "«U» отфильтровывается отдельно")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     # UHD logs ``[INFO]``/``[WARNING]`` to stderr; on Windows PowerShell paints
     # any native stderr output orange/red and turns it into
-    # ``NativeCommandError`` even when the process exit code is 0.  Keep only
-    # real errors by default (``--uhd-log-level`` or a user-set
-    # ``UHD_LOG_LEVEL`` wins).  Real errors still propagate via runner.error.
-    os.environ.setdefault("UHD_LOG_LEVEL", "error")
+    # ``NativeCommandError`` even when the process exit code is 0.  Keep UHD at
+    # ``fatal`` and capture its native stderr (the bare ``U``/``O`` markers
+    # bypass UHD_LOG_LEVEL) so all simulator diagnostics end up on stdout.
+    from .nativelog import install_native_stderr_filter, quiet_uhd
+
+    quiet_uhd()
+    install_native_stderr_filter()
 
     args = build_parser().parse_args(argv)
     if args.uhd_log_level:
@@ -224,7 +228,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runner.prepare()
     except Exception as exc:  # noqa: BLE001 - подготовка может упасть (UHD/RINEX)
-        print(f"Ошибка: {exc}", file=sys.stderr, flush=True)
+        # Diagnostics stay on stdout; native stderr is captured separately.
+        print(f"Ошибка: {exc}", flush=True)
         return 1
     runner.start()
     try:

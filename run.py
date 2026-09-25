@@ -8,10 +8,13 @@ precaution used by the SDR_Scan application).
 import os
 import sys
 
-# UHD paints ``[INFO]``/``[WARNING]`` on stderr (orange in PowerShell); keep
-# only real errors unless the user overrides UHD_LOG_LEVEL.  Must be set before
-# the first ``import uhd``.
-os.environ.setdefault("UHD_LOG_LEVEL", "error")
+# Keep UHD at its quietest level and make sure its native stderr (including the
+# bare ``U``/``O`` under/overflow markers that bypass UHD_LOG_LEVEL) never paints
+# the console orange.  Both must happen before the first ``import uhd``.
+from gnss_sim.nativelog import install_native_stderr_filter, quiet_uhd
+
+quiet_uhd()
+install_native_stderr_filter()
 
 try:  # pragma: no cover - platform dependent
     import uhd  # noqa: F401

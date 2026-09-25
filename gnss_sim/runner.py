@@ -65,11 +65,14 @@ class _DuplexSink(Sink):
     """
 
     def __init__(self, cfg: SimConfig, log: StatusFn | None = None,
-                 spectrum: SpectrumFn | None = None) -> None:
+                 spectrum: Callable[[str, np.ndarray], None] | None = None
+                 ) -> None:
         from .uhd_duplex import UhdDuplex
 
         self._cfg = cfg
         self._log = log
+        # ``spectrum`` is the runner's two-argument ``_emit_spectrum(label,
+        # samples)`` helper (it adds ``cfg.fs`` and throttling itself).
         self._spectrum = spectrum
         self._duplex = UhdDuplex(
             args=cfg.uhd_args, tx_channel=cfg.tx_channel,
@@ -122,7 +125,7 @@ class _DuplexSink(Sink):
             self._latest_tx = tx
             self._latest_rx = rx
             if self._cfg.monitor and self._spectrum is not None:
-                self._spectrum("RX", rx, self._cfg.fs)
+                self._spectrum("RX", rx)
             now = time.time()
             if self._cfg.monitor and now - self._last_monitor >= self._interval:
                 self._last_monitor = now
@@ -324,6 +327,9 @@ class SimulationRunner:
                 "короткие разрывы. Уменьшите fs (-s), block-ms (~100 мс) или "
                 "проверьте USB3/питание B210. Обрыва LIBUSB_TRANSFER_NO_DEVICE "
                 "не было.")
+        elif getattr(self.cfg, "use_usrp", False):
+            # Always state the count so a clean TX run is unambiguous.
+            self._logf("TX underflow за сеанс: 0")
 
     def _make_xyz_fn(self):
         cfg = self.cfg
