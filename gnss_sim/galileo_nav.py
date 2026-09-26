@@ -71,9 +71,13 @@ Assumptions / notes
 * Pages 7..10 (almanac) and 16+ (RedCED/RS/ISM) are not required to compute a
   position; the remaining pages of the 30 s sub-frame are filled with word
   type 0 (the I/NAV spare word).
-* The BGD-E1/E5b parameter is not preserved by the RINEX parser (the second
-  BGD is stored in ``Ephemeris.iodc`` and truncated); the E1/E5a value is
-  broadcast for both BGD fields.
+* The BGD-E5b/E1 parameter is broadcast from ``Ephemeris.bgd_e5b`` (RINEX
+  Galileo orbit-6 field 4); the E1/E5a value comes from ``Ephemeris.tgd``.  The
+  two are genuinely different, and duplicating E5a in the E5b field biased the
+  E1 clock correction of a real receiver.
+* The E1-B signal health and data-validity bits are decoded from the RINEX
+  9-bit Galileo ``SV health`` (see :func:`galileo_health`), so a satellite with
+  only its E5a/E5b health flagged is no longer advertised as E1-B "not OK".
 """
 
 from __future__ import annotations
@@ -467,8 +471,16 @@ def word_4(eph, sv_id: int | None = None) -> np.ndarray:
 def word_5(eph, gst_week: int, gst_tow: float, *,
            ai0: float = 0.0, ai1: float = 0.0, ai2: float = 0.0,
            bgd_e5a: float | None = None, bgd_e5b: float | None = None,
-           health_e1b: int = 0, health_e5b: int = 0) -> np.ndarray:
-    """Word type 5 - iono, BGD, signal health/data validity and GST."""
+           health_e1b: int = 0, health_e5b: int = 0,
+           dvs_e1b: int = 0, dvs_e5b: int = 0) -> np.ndarray:
+    """Word type 5 - iono, BGD, signal health/data validity and GST.
+
+    ``bgd_e5a``/``bgd_e5b`` default to the ephemeris values (``tgd`` is the
+    E5a/E1 BGD, ``bgd_e5b`` the separate E5b/E1 BGD).  Broadcasting the E5a
+    value in both fields biased the E1 clock correction on real receivers.
+    ``health_e1b``/``health_e5b`` are the 2-bit signal health status fields and
+    ``dvs_e1b``/``dvs_e5b`` the data validity status bits.
+    """
     w = [0] * DATA_JK_BITS
     _put_raw(w, 1, 6, 5)
     _put(w, 7, 11, ai0, LSB["ai0"], signed=False)
@@ -476,12 +488,14 @@ def word_5(eph, gst_week: int, gst_tow: float, *,
     _put(w, 29, 14, ai2, LSB["ai2"], signed=True)
     # region disturbance flags 43..47: all zero (no disturbance)
     bgd = eph.tgd if bgd_e5a is None else bgd_e5a
-    bgd_b = eph.tgd if bgd_e5b is None else bgd_e5b
+    bgd_b = (float(getattr(eph, "bgd_e5b", eph.tgd) or 0.0)
+             if bgd_e5b is None else bgd_e5b)
     _put(w, 48, 10, bgd, LSB["bgd"], signed=True)
     _put(w, 58, 10, bgd_b, LSB["bgd"], signed=True)
     _put_raw(w, 68, 2, int(health_e5b) & 0x3)
     _put_raw(w, 70, 2, int(health_e1b) & 0x3)
-    # data validity status 72, 73: zero (valid)
+    _put_raw(w, 72, 1, int(dvs_e5b) & 0x1)      # E5b data validity status
+    _put_raw(w, 73, 1, int(dvs_e1b) & 0x1)      # E1-B data validity status
     _put_raw(w, 74, 12, int(gst_week) % 4096)
     _put_raw(w, 86, 20, int(gst_tow) % 604800)
     return np.array(w, dtype=np.int8)
@@ -514,6 +528,45 @@ def _health(eph) -> int:
     return 0 if int(getattr(eph, "svhlth", 0)) == 0 else 1
 
 
+def galileo_health(eph) -> dict:
+    """Per-signal E1-B/E5b health and data-validity from the RINEX SV health.
+
+    The RINEX Galileo ``SV health`` is a 9-bit field (Galileo OS SIS ICD
+    5.1.9.3 / RINEX 3)::
+
+        bit 0      E1-B DVS
+        bits 1-2   E1-B HS  (0 = healthy)
+        bit 3      E5a DVS
+        bits 4-5   E5a HS
+        bit 6      E5b DVS
+        bits 7-8   E5b HS
+
+    The old code mapped *any* non-zero value to ``E1-B HS = 1``, so a satellite
+    whose E5a/E5b health was flagged (e.g. ``svhlth = 16``) was broadcast with
+    E1-B "not OK" and a real receiver dropped an otherwise usable E1 signal.
+    """
+    h = int(getattr(eph, "svhlth", 0) or 0) & 0x1FF
+    return {
+        "e1b_dvs": h & 0x1,
+        "e1b_hs": (h >> 1) & 0x3,
+        "e5b_dvs": (h >> 6) & 0x1,
+        "e5b_hs": (h >> 7) & 0x3,
+    }
+
+
+def _health_fields(eph) -> dict:
+    """Keyword arguments for :func:`word_5` derived from the ephemeris."""
+    h = galileo_health(eph)
+    return {
+        "health_e1b": h["e1b_hs"],
+        "health_e5b": h["e5b_hs"],
+        "dvs_e1b": h["e1b_dvs"],
+        "dvs_e5b": h["e5b_dvs"],
+        "bgd_e5a": eph.tgd,
+        "bgd_e5b": float(getattr(eph, "bgd_e5b", eph.tgd) or 0.0),
+    }
+
+
 # ----------------------------------------------------------------------
 # sub-frame / bit block
 # ----------------------------------------------------------------------
@@ -536,8 +589,7 @@ def inav_subframe(eph, *, gst_week: int, gst_tow: float,
         3: lambda: word_3(eph),
         4: lambda: word_4(eph),
         5: lambda: word_5(eph, gst_week, gst_tow, ai0=iono[0], ai1=iono[1],
-                          ai2=iono[2], health_e1b=_health(eph),
-                          health_e5b=_health(eph)),
+                          ai2=iono[2], **_health_fields(eph)),
         6: lambda: word_6(gst_tow, **(utc or {})),
     }
     pages = []

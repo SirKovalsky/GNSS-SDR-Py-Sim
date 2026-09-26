@@ -14,6 +14,8 @@ from typing import Any
 
 import numpy as np
 
+from .rtprio import boost_thread_priority
+
 _IS_WIN = sys.platform.startswith("win")
 _UHD_HINT = (
     "Не удалось импортировать модуль 'uhd'. Установите UHD:\n"
@@ -399,6 +401,7 @@ class UhdTxSink:
 
     def _sender_loop(self) -> None:
         """Drain the queue and push chunks to the USRP (one metadata object)."""
+        boost_thread_priority()
         q = self._queue
         assert q is not None
         ec = tx_error_code_enum(self._uhd)

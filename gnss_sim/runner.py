@@ -23,6 +23,7 @@ from .gpstime import GpsTime
 from .iqfile import FileSink, IqFileSource, NullSink, Sink
 from .motion import interpolation_fn, load_user_motion
 from .orbit import llh2xyz
+from .rtprio import boost_thread_priority
 from .power import (
     AUTO_AMP_MAX,
     DEFAULT_HEADROOM_TARGET,
@@ -72,8 +73,14 @@ _TX_BLOCK_SECONDS = 0.1
 #: Jitter buffer (seconds) for the live continuation of a time-continuous TX
 #: loop.  The first segment is pre-generated; later passes are synthesised by a
 #: producer thread while the previous ones stream, and this bounds how far
-#: ahead the producer may run (one segment + this buffer stays in RAM).
-_TX_LOOP_BUFFER_SECONDS = 5.0
+#: ahead the producer may run (one segment + this buffer stays in RAM).  A
+#: larger buffer absorbs occasional GPU/scheduler stalls without starving the
+#: B210 (the old 5 s cap underflowed on a ~400 s segment boundary); the value is
+#: capped by the RAM budget in :meth:`SimulationRunner._run_tx_segment_loop`.
+_TX_LOOP_BUFFER_SECONDS = 20.0
+#: Pre-roll (seconds) of jitter buffer kept for the bounded (non-loop) TX path,
+#: where synthesis and transmission run in parallel.
+_TX_BOUNDED_BUFFER_SECONDS = 4.0
 #: Synthesis chunk (seconds) for the live TX continuation.  CUDA throughput
 #: collapses for tiny blocks (per-call overhead), so the producer synthesises
 #: 0.5 s at a time and the consumer still writes ~0.1 s sub-blocks to the B210.
@@ -88,6 +95,26 @@ _PROGRESS_MILESTONES = (25, 50, 75, 100)
 _PROGRESS_LOG_INTERVAL_S = 30.0
 #: Time constant of the endless-TX streaming progress asymptote (``0.5 -> 1``).
 _TX_STREAM_TAU_S = 20.0
+
+
+def _tx_jitter_seconds(cfg, ram_budget_bytes: int,
+                       default: float | None = None) -> float:
+    """Jitter-buffer seconds for the TX producer/consumer queue.
+
+    ``cfg.tx_jitter_seconds`` (0 = auto) overrides *default*
+    (:data:`_TX_LOOP_BUFFER_SECONDS` when not given); the result is capped so the
+    buffer never consumes more than ~25 % of the RAM budget, leaving the
+    pre-generated segment (the bulk) safely inside it.
+    """
+    want = float(getattr(cfg, "tx_jitter_seconds", 0.0) or 0.0)
+    if want <= 0.0:
+        want = (_TX_LOOP_BUFFER_SECONDS if default is None
+                else float(default))
+    fs = float(getattr(cfg, "fs", 0.0) or 0.0)
+    if ram_budget_bytes > 0 and fs > 0:
+        cap = 0.25 * ram_budget_bytes / _TX_RAM_BYTES / fs
+        want = max(2.0, min(want, cap))
+    return max(2.0, want)
 
 
 class _DuplexSink(Sink):
@@ -584,6 +611,14 @@ class SimulationRunner:
                 # TX + loop is endless: ``duration`` below is deliberately not
                 # used as a stop condition for the generated RAM segment.
                 self._logf("Зацикливание: непрерывная передача до Стоп")
+                if req > 0 and abs(seg - req) < 1e-6:
+                    # The whole requested duration fits the RAM budget: ``_plan``
+                    # selects ONE segment, so the producer/consumer boundary is
+                    # never reached and there is no TOW reset to begin with.
+                    self._logf(
+                        f"TX: длительность {req:.0f} с помещается в RAM — "
+                        "передаётся одним сегментом, границы цикла (сброса "
+                        "TOW/HOW) нет.")
                 self._logf(
                     "Время непрерывно: на каждом следующем проходе эпоха "
                     "GPS/Galileo сдвигается вперёд на длину сегмента, "
@@ -920,6 +955,18 @@ class SimulationRunner:
         self._logf("Источник воспроизведения: "
                    + ("RAM (файл загружен в память)"
                       if self._source.in_ram else "диск (потоковое чтение)"))
+        # A recorded IQ file carries its original GPS/Galileo time (TOW/HOW) in
+        # the modulation; the runner only shifts a live synthesis clock, so the
+        # replay time CANNOT be moved to `start_text`.  Say so explicitly —
+        # otherwise a stale recording with an out-of-window TOW makes a receiver
+        # reject the ephemerides while the GUI log still shows the requested
+        # start time.
+        self._logf(
+            "ВНИМАНИЕ: готовый IQ-файл воспроизводится как записан — время "
+            "GPS/Galileo (TOW/HOW) в нём «зашито» в модуляцию и НЕ сдвигается "
+            f"на выбранное время старта ({getattr(cfg, 'start_text', '')}). "
+            "Убедитесь, что эфемериды приёмника соответствуют именно "
+            "записанному времени, иначе фикс не появится.")
         # Honour the file's real radio parameters for playback.
         if self._source.fs > 0 and abs(self._source.fs - cfg.fs) > 1.0:
             self._logf(f"fs берётся из файла: {self._source.fs / 1e6:.3f} "
@@ -1141,13 +1188,19 @@ class SimulationRunner:
         # producer synthesises larger chunks (CUDA throughput collapses for
         # tiny blocks); the consumer still writes ~block-sized pieces.
         gen_block = max(block, int(_TX_GEN_BLOCK_SECONDS * cfg.fs)) or block
+        jitter_s = _tx_jitter_seconds(cfg, self._ram_budget_bytes)
         q: "queue.Queue" = queue.Queue(
-            maxsize=max(2, int(_TX_LOOP_BUFFER_SECONDS * cfg.fs)
-                        // max(1, gen_block)))
+            maxsize=max(2, int(jitter_s * cfg.fs) // max(1, gen_block)))
+        self._logf(
+            f"TX-буфер джиттера: {jitter_s:.1f} с "
+            f"({max(2, int(jitter_s * cfg.fs) // max(1, gen_block))} блоков по "
+            f"{gen_block / cfg.fs:.2f} с); поток-синтезатор — повышенный "
+            "приоритет")
         stop = self._stop
         errors: list[BaseException] = []
 
         def producer() -> None:
+            boost_thread_priority()
             try:
                 while not stop.is_set():
                     b = self.engine.generate_block(gen_block)
@@ -1390,11 +1443,15 @@ class SimulationRunner:
 
         cfg = self.cfg
         assert self.engine is not None
-        q: "queue.Queue" = queue.Queue(maxsize=4)
+        jitter_s = _tx_jitter_seconds(cfg, self._ram_budget_bytes,
+                                      default=_TX_BOUNDED_BUFFER_SECONDS)
+        q: "queue.Queue" = queue.Queue(
+            maxsize=max(2, int(jitter_s * cfg.fs) // max(1, block)))
         stop = self._stop
         errors: list[BaseException] = []
 
         def producer() -> None:
+            boost_thread_priority()
             try:
                 got = 0
                 while not stop.is_set():

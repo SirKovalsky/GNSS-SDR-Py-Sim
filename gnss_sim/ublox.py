@@ -704,3 +704,71 @@ class NmeaReader:
     def last(self) -> dict:
         with self._lock:
             return dict(self._last)
+
+
+# ----------------------------------------------------------------------
+# Simulator-visible vs receiver-GSV comparison
+# ----------------------------------------------------------------------
+def _sv_key(sat: dict) -> tuple[str, int] | None:
+    """Normalise a satellite entry to ``(system, prn)`` or ``None``.
+
+    Accepts both the engine's ``channel_info`` dicts (``system``/``prn``) and
+    :meth:`NmeaReader.satellites` entries.  A missing system is taken from the
+    first character of ``name`` (e.g. ``"S120"`` -> ``("S", 120)``).
+    """
+    system = str(sat.get("system") or "").upper()
+    name = str(sat.get("name") or "")
+    if not system and name:
+        system = name[0].upper()
+    try:
+        prn = int(sat.get("prn"))
+    except (TypeError, ValueError):
+        return None
+    if not system:
+        return None
+    return (system, prn)
+
+
+def compare_visible(sim_sats, gsv_sats) -> dict:
+    """Compare the simulator's visible list against the receiver GSV list.
+
+    ``sim_sats`` is ``SignalEngine.channel_info`` (or any iterable of dicts with
+    ``system``/``prn``); ``gsv_sats`` is :meth:`NmeaReader.satellites` (built
+    from ``GSV`` sentences — **not** ``GSA``, which lists *used* satellites and
+    would hide tracked-but-unused ones).  Returns sets of ``(system, prn)``:
+
+    * ``matched``   — visible to the simulator and reported in GSV;
+    * ``not_in_gsv`` — transmitted but absent from the receiver's GSV
+      (not acquired/tracked — the interesting failure signal);
+    * ``not_in_sim`` — in GSV but not transmitted (real sky/other GNSS);
+    * ``sim_count`` / ``gsv_count``.
+    """
+    sim = {k for k in (_sv_key(s) for s in sim_sats) if k is not None}
+    gsv = {k for k in (_sv_key(s) for s in gsv_sats) if k is not None}
+    return {
+        "matched": sorted(sim & gsv),
+        "not_in_gsv": sorted(sim - gsv),
+        "not_in_sim": sorted(gsv - sim),
+        "sim_count": len(sim),
+        "gsv_count": len(gsv),
+    }
+
+
+def _fmt_sv(sv: tuple[str, int]) -> str:
+    system, prn = sv
+    return f"{system}{prn:02d}" if system != "S" else f"S{prn}"
+
+
+def describe_visible(cmp: dict, limit: int = 8) -> str:
+    """Human-readable one-line summary of :func:`compare_visible`."""
+    def fmt(items):
+        shown = ", ".join(_fmt_sv(s) for s in items[:limit])
+        if len(items) > limit:
+            shown += f" …(+{len(items) - limit})"
+        return shown or "—"
+
+    return (
+        f"Видимые (симулятор vs GSV): {cmp['sim_count']} передано, "
+        f"{cmp['gsv_count']} в GSV, совпало {len(cmp['matched'])}; "
+        f"нет в GSV: {fmt(cmp['not_in_gsv'])}; "
+        f"нет в симуляторе: {fmt(cmp['not_in_sim'])}")

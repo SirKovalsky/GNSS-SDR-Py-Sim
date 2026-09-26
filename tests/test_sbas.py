@@ -118,6 +118,38 @@ def test_mt9_field_roundtrip() -> None:
     assert sbas.parse_message(msg)["crc_ok"] is True
 
 
+def test_mt9_matches_simulated_off_meridian_geo_position() -> None:
+    """S120/S123/S126 MT9 must encode the exact simulated GEO ECEF position.
+
+    The engine places each synthetic GEO at ``user_lon + dlon`` on the equator;
+    an off-meridian GEO (S120/S126 at ±15°) is where a sign/scale/coordinate
+    error in MT9 would show up.  Decoding the broadcast MT9 must reproduce the
+    engine position to within the ICD quantisation (0.08 m for X/Y).
+    """
+    from gnss_sim.engine import _SBAS_GEO_RADIUS
+    for user_lon_deg in (139.77, 30.0, -75.0):
+        user_lon = np.radians(user_lon_deg)
+        for prn, dlon in ((120, -15.0), (123, 0.0), (126, 15.0)):
+            glon = user_lon + np.radians(dlon)
+            sv = np.array([_SBAS_GEO_RADIUS * np.cos(glon),
+                           _SBAS_GEO_RADIUS * np.sin(glon), 0.0])
+            bits = sbas.sbas_stream_bits(6, prn=prn, sv_ecef=sv, t0_sod=0.0)
+            mt9 = None
+            for k in range(6):
+                m = bits[k * sbas.SBAS_MSG_BITS:(k + 1) * sbas.SBAS_MSG_BITS]
+                p = sbas.parse_message(m)
+                assert p["crc_ok"]
+                if p["msg_type"] == 9:
+                    mt9 = sbas.mt9_decode(p["data"])
+            assert mt9 is not None
+            assert abs(mt9["xpos"] - sv[0]) <= 0.08
+            assert abs(mt9["ypos"] - sv[1]) <= 0.08
+            assert abs(mt9["zpos"] - sv[2]) <= 0.4
+            # Also self-consistent across the MT9 propagation (zero velocity).
+            assert mt9["xdot"] == 0.0 and mt9["ydot"] == 0.0
+
+
+
 # ----------------------------------------------------------------------
 # Поток сообщений 250 бит/с
 # ----------------------------------------------------------------------

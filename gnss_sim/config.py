@@ -380,6 +380,9 @@ class SimConfig:
 
     loop: bool = True
     loop_seconds: float = 0.0
+    #: TX jitter buffer (seconds) between the synthesis producer and the UHD
+    #: consumer; 0 = auto (see ``runner._TX_LOOP_BUFFER_SECONDS``).
+    tx_jitter_seconds: float = 0.0
     memory_budget_gb: float = 0.0
 
     # Мониторинг RX / регулятор мощности (B210, отдельный RX-канал)

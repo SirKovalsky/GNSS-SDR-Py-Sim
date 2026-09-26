@@ -2116,6 +2116,39 @@ class MainWindow(QtWidgets.QMainWindow):
             for j, v in enumerate(values):
                 self.tbl_ublox.setItem(
                     i, j, QtWidgets.QTableWidgetItem(str(v)))
+        self._log_visible_comparison(sats)
+
+    def _sim_visible(self) -> list[dict]:
+        """Snapshot the simulator's visible channels (empty if not running)."""
+        runner = self.runner
+        engine = getattr(runner, "engine", None) if runner is not None else None
+        if engine is None:
+            return []
+        try:
+            return [dict(c) for c in engine.channel_info]
+        except Exception:  # noqa: BLE001 - никогда не ломаем мониторинг
+            return []
+
+    def _log_visible_comparison(self, gsv_sats: list[dict]) -> None:
+        """Compare transmitted vs receiver-GSV satellites, throttled (~2 s).
+
+        Uses GSV (in view), never GSA (used), so tracked-but-unused satellites
+        are still visible.  ``нет в GSV`` is the diagnostic: the simulator is
+        transmitting them but the receiver does not see/track them.
+        """
+        import time as _time
+        now = _time.time()
+        if now - getattr(self, "_vis_last", 0.0) < 2.0:
+            return
+        sim = self._sim_visible()
+        if not sim:
+            return
+        self._vis_last = now
+        try:
+            cmp = ublox.compare_visible(sim, gsv_sats)
+            self._append_log(ublox.describe_visible(cmp))
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"Сравнение видимых: {exc}")
 
     def _take_position(self) -> None:
         if self._nmea is None:

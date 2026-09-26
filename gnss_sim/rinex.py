@@ -126,6 +126,9 @@ class Ephemeris:
     af1: float = 0.0        # s/s
     af2: float = 0.0        # s/s^2
     tgd: float = 0.0        # s
+    #: Galileo BGD E5b/E1 (seconds).  Distinct from ``tgd`` (E5a/E1); RINEX
+    #: stores it in the 4th field of the Galileo orbit-6 line.
+    bgd_e5b: float = 0.0
     svhlth: int = 0
     codeL2: int = 0
     ura: int = 0
@@ -389,6 +392,9 @@ def parse_nav_file(
         eph.svhlth = int(o6[1])
         eph.tgd = o6[2]
         eph.iodc = int(o6[3])
+        if sysch == "E":
+            # Galileo orbit-6 field 4 is the separate BGD E5b/E1 (seconds).
+            eph.bgd_e5b = o6[3]
         eph.finalize()
         by_sv.setdefault(eph.key, []).append(eph)
         i += 8

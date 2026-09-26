@@ -151,6 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="не зацикливать: писать полную длительность")
     p.add_argument("--loop-seconds", type=float, default=0.0,
                    help="длина зацикливаемого сегмента [с] (0=авто)")
+    p.add_argument("--tx-jitter", type=float, default=0.0,
+                   help="буфер джиттера синтез->UHD [с] (0=авто, обычно 20)")
     p.add_argument("--memory-budget", type=float, default=0.0,
                    help="бюджет RAM для сегмента [ГБ] (0=60%% доступной)")
     p.add_argument("--list-devices", action="store_true",
@@ -234,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         tx_bandwidth=args.tx_bandwidth, clock_source=args.clock_source,
         block_ms=args.block_ms, backend=args.backend,
         loop=not args.no_loop, loop_seconds=args.loop_seconds,
+        tx_jitter_seconds=args.tx_jitter,
         memory_budget_gb=args.memory_budget,
         monitor=args.monitor, tx_power_target_dbfs=args.tx_power_target,
         tx_power_auto=args.tx_power_auto, rx_channel=args.rx_channel,

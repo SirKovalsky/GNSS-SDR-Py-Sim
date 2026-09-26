@@ -190,6 +190,46 @@ def test_word5_and_word6_roundtrip() -> None:
     assert gal._read_raw(w6, 106, 20) == 432000
 
 
+def test_galileo_health_field_decoding() -> None:
+    """The RINEX 9-bit SV health maps to separate E1-B/E5b HS and DVS bits."""
+    eph = gal._synthetic_ephemeris()
+    # E1-B healthy, E5a unhealthy (bit 4): the old code wrongly flagged E1-B.
+    eph.svhlth = 0b000010000
+    h = gal.galileo_health(eph)
+    assert h["e1b_hs"] == 0 and h["e1b_dvs"] == 0
+    assert h["e5b_hs"] == 0          # bits 7-8 clear
+    assert h["e5b_dvs"] == 0
+    # E5b DVS (bit 6) + E5b HS (bits 7-8) -> E1-B must stay healthy.
+    eph.svhlth = 0b111000000
+    h = gal.galileo_health(eph)
+    assert h["e1b_hs"] == 0 and h["e1b_dvs"] == 0
+    assert h["e5b_dvs"] == 1 and h["e5b_hs"] == 3
+    # E1-B HS = 1 (bits 1-2 set) is the only case that must flag E1-B.
+    eph.svhlth = 0b000000010
+    assert gal.galileo_health(eph)["e1b_hs"] == 1
+
+
+def test_word5_broadcasts_separate_bgd_and_health() -> None:
+    """E5b/E1 BGD and per-signal health are broadcast, not duplicated from E5a."""
+    eph = gal._synthetic_ephemeris()
+    eph.tgd = -4.7e-9            # BGD E5a/E1
+    eph.bgd_e5b = 1.6e-9         # distinct BGD E5b/E1
+    eph.svhlth = 0b000010000     # only E5a HS flagged
+    word = gal.inav_subframe(eph, gst_week=2200, gst_tow=0.0)
+    page5 = word[4 * gal.PAGE_SYMBOLS:5 * gal.PAGE_SYMBOLS]
+    parsed = gal.parse_page(page5)
+    assert parsed["word_type"] == 5
+    bgd_a = gal._read_scaled(parsed["word"], 48, 10, gal.LSB["bgd"], True)
+    bgd_b = gal._read_scaled(parsed["word"], 58, 10, gal.LSB["bgd"], True)
+    assert abs(bgd_a - eph.tgd) <= 2 * gal.LSB["bgd"]
+    assert abs(bgd_b - eph.bgd_e5b) <= 2 * gal.LSB["bgd"]
+    assert abs(bgd_a - bgd_b) > gal.LSB["bgd"]
+    # E1-B HS = 0 despite the E5a flag, E5a/E5b not in the word.
+    assert gal._read_raw(parsed["word"], 70, 2) == 0
+    assert gal._read_raw(parsed["word"], 68, 2) == 0
+
+
+
 # ----------------------------------------------------------------------
 # sub-frame geometry / bit rate
 # ----------------------------------------------------------------------
