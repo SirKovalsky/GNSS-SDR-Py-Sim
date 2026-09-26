@@ -95,6 +95,55 @@ _PROGRESS_MILESTONES = (25, 50, 75, 100)
 _PROGRESS_LOG_INTERVAL_S = 30.0
 #: Time constant of the endless-TX streaming progress asymptote (``0.5 -> 1``).
 _TX_STREAM_TAU_S = 20.0
+#: Wall-time between two TX health journal lines.  Frequent enough to align a
+#: receiver dropout with a stream gap, rare enough not to spam a long run.
+_TX_HEALTH_INTERVAL_S = 8.0
+
+
+class _TxHealthJournal:
+    """Lightweight, throttled TX health lines for long over-air runs.
+
+    One line per ``interval`` seconds of wall time with the simulated stream
+    position, the underflow delta since the previous line, the number of
+    produced/queued blocks and the measured synth/air realtime rates.  That is
+    enough to tell a genuine TX starvation (underflow rising while the queue
+    empties) from a receiver-side dropout (stream advancing at ~1.00x, queue
+    healthy, underflow flat).
+    """
+
+    def __init__(self, log: StatusFn, interval: float = _TX_HEALTH_INTERVAL_S
+                 ) -> None:
+        self._log = log
+        self._interval = max(0.5, float(interval))
+        self._t_wall = time.time()
+        self._t_gen = self._t_wall
+        self._sim_last = 0.0
+        self._uf_last = 0
+        self._blocks_last = 0
+
+    def tick(self, sim_s: float, underflows: int, queued_blocks: int,
+             blocks_produced: int, synth_rate: float, air_rate: float,
+             force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self._t_wall) < self._interval:
+            return
+        duf = int(underflows) - self._uf_last
+        dblocks = int(blocks_produced) - self._blocks_last
+        sim_s = float(sim_s)
+        log = self._log
+        if log is not None:
+            try:
+                log(
+                    f"TX health: sim {sim_s:.1f} с | underflow +{duf} "
+                    f"(всего {int(underflows)}) | выдано {dblocks} бл., "
+                    f"в очереди {int(queued_blocks)} бл. | синтез "
+                    f"{synth_rate:.2f}x, эфир {air_rate:.3f}x")
+            except Exception:  # noqa: BLE001 - журнал не должен ронять TX
+                pass
+        self._t_wall = now
+        self._sim_last = sim_s
+        self._uf_last = int(underflows)
+        self._blocks_last = int(blocks_produced)
 
 
 def _tx_jitter_seconds(cfg, ram_budget_bytes: int,
@@ -485,6 +534,13 @@ class SimulationRunner:
             "30 Мвыб/с. Для объединённого потока используйте --band all "
             "(~25 Мвыб/с) или уменьшите fs.")
 
+    def _sink_underflows(self) -> int:
+        """Current TX underflow count of the active sink (0 when unknown)."""
+        try:
+            return int(getattr(self.sink, "underflows", 0) or 0)
+        except Exception:  # noqa: BLE001 - произвольный тестовый sink
+            return 0
+
     def _report_underflows(self) -> None:
         """Report the sink's TX underflow count (0 = silent)."""
         sink = self.sink
@@ -500,6 +556,16 @@ class SimulationRunner:
                 "короткие разрывы. Уменьшите fs (-s), block-ms (~100 мс) или "
                 "проверьте USB3/питание B210. Обрыва LIBUSB_TRANSFER_NO_DEVICE "
                 "не было.")
+            try:
+                events = list(getattr(sink, "underflow_events", []) or [])
+            except Exception:  # noqa: BLE001
+                events = []
+            if events:
+                shown = ", ".join(f"{float(s):.1f}" for s, _w, _c in events[:20])
+                more = " …" if len(events) > 20 else ""
+                self._logf(
+                    f"TX underflow по sim-времени (с от начала TX): "
+                    f"{shown}{more}")
         elif getattr(self.cfg, "use_usrp", False):
             # Always state the count so a clean TX run is unambiguous.
             self._logf("TX underflow за сеанс: 0")
@@ -1198,12 +1264,15 @@ class SimulationRunner:
             "приоритет")
         stop = self._stop
         errors: list[BaseException] = []
+        gen_blocks = 0
 
         def producer() -> None:
+            nonlocal gen_blocks
             boost_thread_priority()
             try:
                 while not stop.is_set():
                     b = self.engine.generate_block(gen_block)
+                    gen_blocks += 1
                     b = self._headroom_ctl().process_block(
                         np.asarray(b, dtype=np.complex64))
                     while not stop.is_set():
@@ -1225,14 +1294,24 @@ class SimulationRunner:
         thread.start()
         produced = 0
         stream_t0 = time.time()
+        gen_t0 = stream_t0
+        health = _TxHealthJournal(self._logf)
         segment_len = seg_total or 1
         within = 0
         loops = 0
         pending = deque(buf)
+        live = False
         while not self._stop.is_set():
             if pending:
                 b = pending.popleft()
             else:
+                if not live:
+                    live = True
+                    self._logf(
+                        f"TX: предгенерённый RAM-сегмент исчерпан — переход "
+                        f"на потоковый синтез (sim {produced / cfg.fs:.1f} с)")
+                    health.tick(produced / cfg.fs, self._sink_underflows(), 0,
+                                gen_blocks, 0.0, 0.0, force=True)
                 try:
                     item = q.get(timeout=0.2)
                 except queue.Empty:
@@ -1265,6 +1344,14 @@ class SimulationRunner:
                 frac = gen_span + (1.0 - gen_span) * (
                     1.0 - math.exp(-t / _TX_STREAM_TAU_S))
                 self._progress(frac, sim_s, wall, sim_s / wall)
+            # Periodic TX health: sim position, underflow delta, queue and
+            # rates.  Throttled to one line per _TX_HEALTH_INTERVAL_S.
+            now = time.time()
+            air_rate = (produced / cfg.fs) / max(1e-9, now - stream_t0)
+            synth_rate = ((gen_blocks * gen_block) / cfg.fs) / max(
+                1e-9, now - gen_t0)
+            health.tick(produced / cfg.fs, self._sink_underflows(),
+                        q.qsize(), gen_blocks, synth_rate, air_rate)
             if errors:
                 raise errors[0]
         thread.join(timeout=5.0)
@@ -1449,8 +1536,10 @@ class SimulationRunner:
             maxsize=max(2, int(jitter_s * cfg.fs) // max(1, block)))
         stop = self._stop
         errors: list[BaseException] = []
+        gen_blocks = 0
 
         def producer() -> None:
+            nonlocal gen_blocks
             boost_thread_priority()
             try:
                 got = 0
@@ -1459,6 +1548,7 @@ class SimulationRunner:
                         break
                     n = block if target is None else min(block, target - got)
                     b = self.engine.generate_block(n)
+                    gen_blocks += 1
                     while not stop.is_set():
                         try:
                             q.put((b, n), timeout=0.1)
@@ -1479,6 +1569,8 @@ class SimulationRunner:
         thread.start()
         produced = 0
         stream_t0 = time.time()
+        gen_t0 = stream_t0
+        health = _TxHealthJournal(self._logf)
         while True:
             try:
                 item = q.get(timeout=0.2)
@@ -1510,6 +1602,12 @@ class SimulationRunner:
                     t = max(0.0, time.time() - stream_t0)
                     self._phase("tx", 1.0 - math.exp(-t / _TX_STREAM_TAU_S),
                                 0, produced / cfg.fs, True)
+            now = time.time()
+            air_rate = (produced / cfg.fs) / max(1e-9, now - stream_t0)
+            synth_rate = ((gen_blocks * block) / cfg.fs) / max(
+                1e-9, now - gen_t0)
+            health.tick(produced / cfg.fs, self._sink_underflows(),
+                        q.qsize(), gen_blocks, synth_rate, air_rate)
             if stop.is_set():
                 break
         thread.join(timeout=10.0)

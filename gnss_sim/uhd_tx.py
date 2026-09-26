@@ -10,6 +10,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -244,6 +245,12 @@ class UhdTxSink:
         self._count = 0
         self._sent = 0
         self._underflows = 0
+        #: One ``(sim_s, wall_s, running_count)`` tuple per underflow, so a
+        #: receiver outage can be aligned with the exact TX stream position.
+        self._underflow_events: list[tuple[float, float, int]] = []
+        #: Wall time of the first queued sample (``start()``); used only to
+        #: formulate the per-event journal line.
+        self._tx_start_wall: float | None = None
         self._started = False
         self._queue: "queue.Queue[np.ndarray | None] | None" = None
         self._sender: threading.Thread | None = None
@@ -349,11 +356,38 @@ class UhdTxSink:
                 return
             name = str(getattr(md, "event_code", "")).lower()
             if "underflow" in name:
-                self._underflows += 1
+                self._note_underflow()
 
     @property
     def max_num_samps(self) -> int:
         return self._max_samps
+
+    def _note_underflow(self, offset_samples: int = 0) -> None:
+        """Count one TX underflow and journal it with sim/wall timestamps.
+
+        A short UHD send (or an async underflow event) means the B210 starved
+        for samples.  Logging *when* it happened — the simulated stream
+        position ``_sent / fs`` plus the wall clock — is what lets a receiver
+        fix dropout be correlated with a real gap (or, as in the 760 s run,
+        ruled out when the dropout sits inside the pre-generated RAM segment).
+        """
+        self._underflows += 1
+        fs = float(getattr(self, "sample_rate", 0.0) or 0.0)
+        sent = int(getattr(self, "_sent", 0) or 0)
+        sim_s = (sent + max(0, int(offset_samples))) / fs if fs > 0 else 0.0
+        wall = time.time()
+        events = getattr(self, "_underflow_events", None)
+        if events is not None:
+            events.append((sim_s, wall, self._underflows))
+        log = getattr(self, "_log", None)
+        if log is None:
+            return
+        stamp = time.strftime("%H:%M:%S", time.localtime(wall))
+        try:
+            log(f"TX underflow #{self._underflows}: sim {sim_s:.3f} с "
+                f"(от начала TX), wall {stamp} — короткий разрыв потока")
+        except Exception:  # noqa: BLE001 - журнал не должен ронять поток
+            pass
 
     def start(self) -> None:
         """Start the dedicated sender thread (idempotent).
@@ -368,6 +402,7 @@ class UhdTxSink:
             if self._started:
                 return
             self._started = True
+            self._tx_start_wall = time.time()
             self._sender_error = None
             self._queue = queue.Queue(maxsize=8)
             self._sender = threading.Thread(target=self._sender_loop,
@@ -441,7 +476,7 @@ class UhdTxSink:
             # timeout (an underflow).  Newer bindings do not expose
             # ``md.error_code``, so the short-send test is the reliable signal.
             if sent < chunk or tx_has_error(md, "underflow", ec):
-                self._underflows += 1
+                self._note_underflow(off)
             off += sent
             self._sent += sent
             if sent == 0:
@@ -481,6 +516,11 @@ class UhdTxSink:
     @property
     def underflows(self) -> int:
         return self._underflows
+
+    @property
+    def underflow_events(self) -> list[tuple[float, float, int]]:
+        """``(sim_s, wall_s, count)`` for each logged underflow."""
+        return list(getattr(self, "_underflow_events", []))
 
     def describe(self) -> str:
         lo, hi = self._gain_range
