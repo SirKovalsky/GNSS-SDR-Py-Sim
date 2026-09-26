@@ -6,6 +6,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from typing import Callable
 
 import numpy as np
@@ -68,6 +69,15 @@ _TX_RAM_BYTES = 8
 #: Cap on the TX write block (seconds): smaller writes feed the B210 more
 #: smoothly on Windows/USB3 and measurably reduce TX underflows.
 _TX_BLOCK_SECONDS = 0.1
+#: Jitter buffer (seconds) for the live continuation of a time-continuous TX
+#: loop.  The first segment is pre-generated; later passes are synthesised by a
+#: producer thread while the previous ones stream, and this bounds how far
+#: ahead the producer may run (one segment + this buffer stays in RAM).
+_TX_LOOP_BUFFER_SECONDS = 5.0
+#: Synthesis chunk (seconds) for the live TX continuation.  CUDA throughput
+#: collapses for tiny blocks (per-call overhead), so the producer synthesises
+#: 0.5 s at a time and the consumer still writes ~0.1 s sub-blocks to the B210.
+_TX_GEN_BLOCK_SECONDS = 0.5
 #: Default «контроль передачи» threshold (dB above the RX noise floor).
 _TX_CHECK_MARGIN_DB = 6.0
 #: Progress journal milestones (%).  Logging every block/write spammed the
@@ -528,18 +538,22 @@ class SimulationRunner:
         cfg = self.cfg
         bps = {"cs16": 4, "cf32": 8, "cs8": 2, "cs4": 2}.get(cfg.output_format, 4)
         bytes_per_s = cfg.fs * bps
+        # A TX RAM segment is stored as complex64 (8 B/sample), not as the IQ
+        # file format: size the segment budget against the real buffer so a
+        # wide-band live segment can never exceed the memory budget.
+        ram_bps = cfg.fs * (_TX_RAM_BYTES if cfg.use_usrp else bps)
         avail = sysinfo.available_ram()
         total = sysinfo.total_ram()
         budget = (int(cfg.memory_budget_gb * 1e9) if cfg.memory_budget_gb > 0
                   else sysinfo.default_budget(avail))
-        max_seg = budget / bytes_per_s if bytes_per_s else 0.0
+        max_seg = budget / ram_bps if ram_bps else 0.0
         # Budget kept for the pre-generation of a TX segment (engine blocks
         # are complex128 -> 16 bytes/sample in RAM).
         self._ram_budget_bytes = int(budget)
         self._max_seg_seconds = max_seg
         self._logf(f"RAM: доступно {sysinfo.human(avail)} из "
                    f"{sysinfo.human(total)}; бюджет {sysinfo.human(int(budget))} "
-                   f"(до {max_seg:.0f} с сигнала @ {bytes_per_s / 1e6:.1f} МБ/с)")
+                   f"(до {max_seg:.0f} с сигнала @ {ram_bps / 1e6:.1f} МБ/с)")
         if cfg.use_usrp and budget > 0 and cfg.fs:
             tx_cap = budget / _TX_RAM_BYTES / cfg.fs
             self._logf(f"TX-сегмент в RAM (complex64, 8 Б/отсчёт): до "
@@ -564,17 +578,20 @@ class SimulationRunner:
             self._segment_seconds = seg
             self._loop_kind = "RAM"
             self._logf(f"Зацикливание ВКЛ: сегмент {seg:.1f} с "
-                       f"(~{sysinfo.human(int(seg * bytes_per_s))} в RAM); "
+                       f"(~{sysinfo.human(int(seg * ram_bps))} в RAM); "
                        f"источник зацикливания: RAM (буфер в памяти)")
             if cfg.use_usrp:
                 # TX + loop is endless: ``duration`` below is deliberately not
                 # used as a stop condition for the generated RAM segment.
                 self._logf("Зацикливание: непрерывная передача до Стоп")
                 self._logf(
-                    "ВНИМАНИЕ: навигационные данные сегмента (TOW/эфемериды) "
-                    "повторяются каждый сегмент — приёмник может не удержать "
-                    "фикс между циклами. Для тестов приёмника используйте "
-                    "--no-loop или длинный сегмент.")
+                    "Время непрерывно: на каждом следующем проходе эпоха "
+                    "GPS/Galileo сдвигается вперёд на длину сегмента, "
+                    "подкадры NAV (30 с / 18 с / 6 с) пересчитываются для "
+                    "нового времени, а фазы кода/несущей не сбрасываются — "
+                    "TOW/HOW не прыгают назад. Первый сегмент предгенерён в "
+                    "RAM, остальные синтезируются в фоне (для запаса по "
+                    "времени рекомендуется GPU-бэкенд).")
         else:
             self._segment_seconds = None
             self._logf("Зацикливание ВЫКЛ: полная запись")
@@ -582,7 +599,7 @@ class SimulationRunner:
         if cfg.output:
             free = sysinfo.disk_free(os.path.dirname(cfg.output) or ".")
             self._logf(f"Диск для '{cfg.output}': свободно {sysinfo.human(free)}")
-            out_s = self._segment_seconds if self._segment_seconds else req
+            out_s = req if req > 0 else (self._segment_seconds or 0.0)
             if out_s and out_s > 0:
                 est = out_s * bytes_per_s
                 self._logf(f"Размер файла: ~{sysinfo.human(int(est))} "
@@ -1003,94 +1020,9 @@ class SimulationRunner:
 
         if self._segment_seconds:
             seg_total = int(self._segment_seconds * cfg.fs)
-            buf: list = []
-            got = 0
-            # «генерация» is a pure IQ-file run (no radio); a B210 run only
-            # pre-synthesises the segment first, so it says «предгенерация».
-            label = ("Идёт предгенерация" if cfg.use_usrp
-                     else "Идёт генерация")
-            log_progress = self._milestone_logger(label)
-            # A TX segment reserves the first half of the bar for synthesis and
-            # the second half for the (endless) streaming, so the bar keeps
-            # advancing for the whole run (issue 1b).
-            gen_span = 0.5 if cfg.use_usrp else 1.0
-            # Check the stop event for every generated block so «Стоп» reacts
-            # within roughly one block_ms, not after the whole segment.
-            while got < seg_total:
-                if self._stop.is_set():
-                    break
-                n = min(block, seg_total - got)
-                b = self.engine.generate_block(n)
-                got += n
-                stopped = self._stop.is_set()
-                if cfg.use_usrp:
-                    # TX needs the whole segment in RAM for the endless loop.
-                    # The anti-clip scale is applied to the whole segment once,
-                    # after synthesis (one exact factor, no TX level jump), so
-                    # the spectrum/level is emitted only once streaming starts.
-                    buf.append(b)
-                else:
-                    # Pure IQ-file run: write every produced block straight
-                    # away, so the progress bar tracks generation (and the bar
-                    # does not stay empty for a long segment, nor jump).
-                    b = self._headroom_ctl().process_block(b)
-                    self.sink.write(b)
-                    self._emit_spectrum("TX", b)
-                    produced += len(b)
-                if self._progress is not None and seg_total:
-                    wall = max(1e-9, time.time() - t0)
-                    sim_s = got / cfg.fs
-                    self._progress(gen_span * got / seg_total, sim_s, wall,
-                                   sim_s / wall if wall else 0.0)
-                if self._phase is not None and seg_total:
-                    # Pre-generation has its OWN 0…1 value (separate from the
-                    # transmission bar the user sees once TX starts).
-                    if cfg.use_usrp:
-                        self._phase("pregen", got / seg_total, 0,
-                                    got / cfg.fs, False)
-                if seg_total:
-                    log_progress(int(100 * got / seg_total),
-                                 f"{got / cfg.fs:.1f} из "
-                                 f"{seg_total / cfg.fs:.1f} с")
-                if stopped:
-                    break
-            where = "в память" if cfg.use_usrp else "в файл"
-            self._logf(f"Сегмент {got / cfg.fs:.1f} с сгенерирован {where}")
-
             if cfg.use_usrp:
-                # One exact anti-clip scale for the whole pre-generated segment.
-                self._headroom_ctl().process_segment(buf)
-                # TX + loop (the segment branch is only entered when looping):
-                # stream the RAM segment continuously until «Стоп».  ``duration``
-                # is deliberately ignored as a stop condition here; it still
-                # bounds file output and non-loop TX.
-                stream_t0 = time.time()
-                segment_len = seg_total or 1
-                within = 0
-                loops = 0
-                while not self._stop.is_set():
-                    for b in buf:
-                        if self._stop.is_set():
-                            break
-                        self.sink.write(b)
-                        self._emit_spectrum("TX", b)
-                        produced += len(b)
-                        within += len(b)
-                        if self._phase is not None:
-                            # Cyclic TX: the transmission bar wraps every loop
-                            # (0…1 per segment) so it keeps updating instead of
-                            # freezing at 100 %; the label shows elapsed/loops.
-                            self._phase("tx", (within % segment_len) / segment_len,
-                                        loops, produced / cfg.fs, True)
-                    if self._progress is not None:
-                        wall = max(1e-9, time.time() - t0)
-                        sim_s = produced / cfg.fs
-                        t = max(0.0, time.time() - stream_t0)
-                        frac = gen_span + (1.0 - gen_span) * (
-                            1.0 - math.exp(-t / _TX_STREAM_TAU_S))
-                        self._progress(frac, sim_s, wall, sim_s / wall)
-                    loops += 1
-                    within = 0
+                return self._run_tx_segment_loop(seg_total, block, t0)
+            return self._run_file_loop(seg_total, block, t0, duration)
         else:
             total = int(duration * cfg.fs) if duration else None
             if cfg.use_usrp:
@@ -1120,6 +1052,171 @@ class SimulationRunner:
                     log_progress(int(100 * produced / total),
                                  f"{produced / cfg.fs:.1f} из "
                                  f"{total / cfg.fs:.1f} с")
+        return produced
+
+    # ------------------------------------------------------------------
+    # Time-continuous cyclic generation (no TOW/HOW reset between passes)
+    # ------------------------------------------------------------------
+    def _run_file_loop(self, seg_total: int, block: int, t0: float,
+                       duration: float | None) -> int:
+        """Generate an IQ file segment after segment without resetting time.
+
+        Unlike the historic RAM-replay loop (which restarted the NAV time every
+        segment), this keeps calling :meth:`SignalEngine.generate_block`: the
+        GPS week/TOW, the 30 s legacy NAV sub-frames, the 18 s CNAV-2 frames,
+        the SBAS 6 s blocks and the Galileo I/NAV 30 s blocks are regenerated
+        for the advanced time, while the per-channel code/carrier phase state
+        keeps advancing across every boundary (no phase jump).  ``seg_total``
+        bounds the per-segment RAM accounting; the file itself runs the full
+        ``duration`` (``seg_total`` when the run is indefinite).
+        """
+        cfg = self.cfg
+        assert self.engine is not None and self.sink is not None
+        total = int(duration * cfg.fs) if duration else seg_total
+        log_progress = self._milestone_logger("Идёт генерация")
+        produced = 0
+        while not self._stop.is_set() and produced < total:
+            n = min(block, total - produced)
+            samples = self.engine.generate_block(n)
+            samples = self._headroom_ctl().process_block(samples)
+            self.sink.write(samples)
+            self._emit_spectrum("TX", samples)
+            produced += n
+            if self._progress is not None and total:
+                wall = max(1e-9, time.time() - t0)
+                sim_s = produced / cfg.fs
+                self._progress(produced / total, sim_s, wall, sim_s / wall)
+            if total:
+                log_progress(int(100 * produced / total),
+                             f"{produced / cfg.fs:.1f} из "
+                             f"{total / cfg.fs:.1f} с")
+        return produced
+
+    def _run_tx_segment_loop(self, seg_total: int, block: int,
+                             t0: float) -> int:
+        """Endless B210 TX from a time-continuous RAM segment.
+
+        The first segment is pre-synthesised into RAM (as before) so TX starts
+        without underflow.  Later passes are synthesised *continuously* by a
+        producer thread from the same engine: ``self.g`` and every channel's
+        code/carrier phase keep advancing, so TOW/HOW never jump backwards and
+        the NAV sub-frames are regenerated for the shifted time.  A small
+        bounded queue keeps RAM at roughly one segment plus a short jitter
+        buffer, independent of how long the transmission runs.
+        """
+        import queue
+
+        cfg = self.cfg
+        assert self.engine is not None and self.sink is not None
+        gen_span = 0.5
+        log_progress = self._milestone_logger("Идёт предгенерация")
+        buf: list = []
+        got = 0
+        while got < seg_total and not self._stop.is_set():
+            n = min(block, seg_total - got)
+            b = np.asarray(self.engine.generate_block(n), dtype=np.complex64)
+            buf.append(b)
+            got += n
+            if self._progress is not None and seg_total:
+                wall = max(1e-9, time.time() - t0)
+                sim_s = got / cfg.fs
+                self._progress(gen_span * got / seg_total, sim_s, wall,
+                               sim_s / wall if wall else 0.0)
+            if self._phase is not None and seg_total:
+                self._phase("pregen", got / seg_total, 0, got / cfg.fs, False)
+            if seg_total:
+                log_progress(int(100 * got / seg_total),
+                             f"{got / cfg.fs:.1f} из "
+                             f"{seg_total / cfg.fs:.1f} с")
+        self._logf(
+            f"Сегмент {got / cfg.fs:.1f} с сгенерирован в память; дальнейшие "
+            "проходы синтезируются непрерывно (TOW/HOW и фазы каналов "
+            "продолжаются без сброса)")
+        # One exact anti-clip scale for the whole pre-generated segment.
+        self._headroom_ctl().process_segment(buf)
+        if self._stop.is_set():
+            return 0
+
+        # Bounded jitter buffer for the live continuation of the loop.  The
+        # producer synthesises larger chunks (CUDA throughput collapses for
+        # tiny blocks); the consumer still writes ~block-sized pieces.
+        gen_block = max(block, int(_TX_GEN_BLOCK_SECONDS * cfg.fs)) or block
+        q: "queue.Queue" = queue.Queue(
+            maxsize=max(2, int(_TX_LOOP_BUFFER_SECONDS * cfg.fs)
+                        // max(1, gen_block)))
+        stop = self._stop
+        errors: list[BaseException] = []
+
+        def producer() -> None:
+            try:
+                while not stop.is_set():
+                    b = self.engine.generate_block(gen_block)
+                    b = self._headroom_ctl().process_block(
+                        np.asarray(b, dtype=np.complex64))
+                    while not stop.is_set():
+                        try:
+                            q.put(b, timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                try:
+                    q.put(None, timeout=1.0)
+                except queue.Full:
+                    pass
+
+        thread = threading.Thread(target=producer, name="gnss-sim-tx-loop",
+                                  daemon=True)
+        thread.start()
+        produced = 0
+        stream_t0 = time.time()
+        segment_len = seg_total or 1
+        within = 0
+        loops = 0
+        pending = deque(buf)
+        while not self._stop.is_set():
+            if pending:
+                b = pending.popleft()
+            else:
+                try:
+                    item = q.get(timeout=0.2)
+                except queue.Empty:
+                    if not thread.is_alive():
+                        break
+                    continue
+                if item is None:
+                    break
+                b = item
+            # Small UHD writes: split a (possibly large) synthesis chunk into
+            # ~block-sized pieces without changing the sample stream.
+            for off in range(0, len(b), block):
+                piece = b[off:off + block]
+                self.sink.write(piece)
+                self._emit_spectrum("TX", piece)
+                produced += len(piece)
+                within += len(piece)
+                if self._phase is not None:
+                    # Cyclic TX: the transmission bar wraps every segment (0…1
+                    # per loop) so it keeps updating; the label shows elapsed.
+                    self._phase("tx", (within % segment_len) / segment_len,
+                                loops, produced / cfg.fs, True)
+                if within >= segment_len:
+                    within = 0
+                    loops += 1
+            if self._progress is not None:
+                wall = max(1e-9, time.time() - t0)
+                sim_s = produced / cfg.fs
+                t = max(0.0, time.time() - stream_t0)
+                frac = gen_span + (1.0 - gen_span) * (
+                    1.0 - math.exp(-t / _TX_STREAM_TAU_S))
+                self._progress(frac, sim_s, wall, sim_s / wall)
+            if errors:
+                raise errors[0]
+        thread.join(timeout=5.0)
+        if errors:
+            raise errors[0]
         return produced
 
     # ------------------------------------------------------------------

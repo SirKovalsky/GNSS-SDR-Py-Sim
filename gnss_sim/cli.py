@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stream to USRP B210 instead of / in addition to file")
     p.add_argument("--uhd-args", default="type=b200", help="UHD device arguments")
     p.add_argument("--tx-channel", type=int, default=0, help="TX channel")
-    p.add_argument("--tx-gain", type=float, default=0.0, help="TX gain [dB]")
+    p.add_argument("--tx-gain", type=float, default=10.0, help="TX gain [dB]")
     p.add_argument("--tx-antenna", default="TX/RX", help="TX antenna")
     p.add_argument("--tx-bandwidth", type=float, default=0.0,
                    help="TX analog bandwidth [Hz] (0 = выбрать автоматически в UHD)")

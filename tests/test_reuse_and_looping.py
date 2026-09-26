@@ -202,6 +202,12 @@ def test_gui_start_widget_full_datetime_no_error(monkeypatch) -> None:
     try:
         assert win._start_text() == "now"
         win.chk_now.setChecked(False)
+        # The real coverage binding may have pinned the widget to whatever RINEX
+        # happens to be cached «today» (a date-dependent auto-resolution); widen
+        # it so this test checks the datetime formatting, not that binding.
+        win.ed_start.setDateTimeRange(
+            QtCore.QDateTime(2000, 1, 1, 0, 0, 0),
+            QtCore.QDateTime(2100, 1, 1, 0, 0, 0))
         win.ed_start.setDateTime(QtCore.QDateTime(2026, 9, 25, 0, 0, 0))
         text = win._start_text()
         assert text == "2026/09/25 00:00:00"

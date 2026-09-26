@@ -194,7 +194,7 @@ def test_tx_loop_streams_endlessly_past_duration() -> None:
     assert runner.error is None
 
 
-def test_plan_logs_endless_tx_loop_and_nav_warning() -> None:
+def test_plan_logs_endless_tx_loop_and_time_continuity() -> None:
     cfg = SimConfig(use_usrp=True, fs=1.0e6, duration=300.0, loop=True,
                     loop_seconds=300.0)
     logs: list[str] = []
@@ -203,7 +203,10 @@ def test_plan_logs_endless_tx_loop_and_nav_warning() -> None:
     assert runner._segment_seconds == 300.0
     text = "\n".join(logs)
     assert "непрерывная передача до Стоп" in text
-    assert "навигационные данные" in text and "--no-loop" in text
+    # Time-continuous loop: the old "NAV repeats / receiver may drop the fix"
+    # warning is gone; the new message documents the forward epoch shift.
+    assert "Время непрерывно" in text and "TOW/HOW" in text
+    assert "навигационные данные" not in text
 
 
 def test_report_underflows_logs_warning() -> None:

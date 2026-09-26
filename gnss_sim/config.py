@@ -368,7 +368,10 @@ class SimConfig:
     use_usrp: bool = False
     uhd_args: str = "type=b200"
     tx_channel: int = 0
-    tx_gain: float = 0.0
+    #: Default TX gain [dB].  ``+10`` is the value verified on the ZED-F9P with
+    #: the B210 in the foil box (valid over the B210 TX range 0..89.75 dB); an
+    #: explicit ``--tx-gain``/GUI value still wins.
+    tx_gain: float = 10.0
     tx_antenna: str = "TX/RX"
     tx_bandwidth: float = 0.0  # 0 = let UHD choose
     clock_source: str = "internal"
