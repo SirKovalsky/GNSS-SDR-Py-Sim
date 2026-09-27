@@ -9,7 +9,7 @@ Covers:
 
 Headless, no hardware, no network::
 
-    E:\\MySoftware\\SDR_Scan\\.venv\\Scripts\\python.exe -m pytest tests -q
+    .venv\\Scripts\\python.exe -m pytest tests -q
 """
 
 from __future__ import annotations

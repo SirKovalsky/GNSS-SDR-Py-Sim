@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gnss-sim"
+dynamic = ["version"]
+description = "Pure-Python GNSS baseband signal simulator (GPS L1 C/A + L1C, Galileo E1, SBAS, QZSS, BeiDou B1I)"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24,<2.0",
+    "PyQt5>=5.15.9",
+    "pyqtgraph>=0.13",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+cuda = ["cupy-cuda12x<14"]
+uhd = ["uhd==4.10.0.0"]
+
+[project.scripts]
+gnss-sim = "gnss_sim.cli:main"
+gnss-sim-gui = "gnss_sim.gui:main"
+
+[tool.setuptools]
+packages = ["gnss_sim"]
+
+[tool.setuptools.dynamic]
+version = { attr = "gnss_sim.__version__" }

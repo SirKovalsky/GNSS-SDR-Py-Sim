@@ -6,7 +6,7 @@ B1I: **GPS L1 C/A**, **GPS L1C**, **Galileo E1**, **SBAS L1 C/A**,
 2046-чиповый код, вторичный код **NH20** (1 кбит/с), сообщение **D1**
 (50 бит/с: BCH(15,11,1), 30-битное чередование, реальные эфемериды).
 Результат либо пишется в I/Q-файл, либо передаётся потоком на **USRP B210**
-через UHD. Интерфейс — PyQt5 (как в SDR_Scan), есть CLI и карта OpenStreetMap
+через UHD. Интерфейс — PyQt5, есть CLI и карта OpenStreetMap
 для построения маршрутов.
 
 Системы выбираются галочками **«Сигналы»** — это единственный источник истины.
@@ -58,20 +58,75 @@ bits1-2`, `e5b_dvs = bit6`, `e5b_hs = bits7-8`, см.
 
 ## Установка
 
-```powershell
-# Можно использовать готовое окружение SDR_Scan:
-cd E:\MySoftware\SDR_Scan
-.\.venv\Scripts\Activate.ps1
-pip install -r E:\MySoftware\GNSS_Sim\requirements.txt   # numpy, PyQt5
+Проект **самодостаточен**: нужны только Python 3.10–3.13 и (для передачи на
+B210) UHD. Виртуальное окружение создаётся **внутри проекта** — `.venv`.
 
-# UHD (только для B210): инсталлятор + uhd==4.10.0.0, см. README SDR_Scan
+### Windows (PowerShell)
+
+```powershell
+cd E:\MySoftware\GNSS_Sim
+.\scripts\setup_windows.ps1
 ```
+
+Скрипт создаёт `.venv` (`py -3.13 -m venv .venv`), обновляет pip, ставит
+`requirements.txt`, при наличии UHD-библиотек (`uhd.dll` или `UHD_PKG_PATH`)
+ставит `uhd==4.10.0.0`, а на NVIDIA-машине (флаг `-Cuda`) —
+`cupy-cuda12x<14`.
+
+Вручную:
+
+```powershell
+cd E:\MySoftware\GNSS_Sim
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# UHD (только для B210): скачать и запустить Windows-инсталлятор UHD
+# (https://files.ettus.com/binaries/uhd/latest_release/), затем в venv:
+.\.venv\Scripts\python.exe -m pip install uhd==4.10.0.0
+
+# CUDA (необязательно): cupy-cuda12x<14 для CUDA 12.x, cupy-cuda11x для 11.x
+.\.venv\Scripts\python.exe -m pip install "cupy-cuda12x<14"
+```
+
+### Linux / macOS
+
+```bash
+cd /path/to/GNSS_Sim
+./scripts/setup_linux.sh
+```
+
+Скрипт создаёт `.venv`, ставит `requirements.txt`; если в системе есть пакет
+UHD, ставит `libuhd-dev uhd-host python3-uhd` (apt), пересоздаёт venv с
+`--system-site-packages` (чтобы был виден системный `uhd`) и запускает
+`uhd_images_downloader`.
+
+Вручную:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+
+# UHD (Debian/Ubuntu): пакеты + образы FPGA
+sudo apt install libuhd-dev uhd-host python3-uhd
+sudo uhd_images_downloader
+# системный uhd виден только в venv с --system-site-packages:
+python3 -m venv --system-site-packages .venv
+
+# CUDA (необязательно)
+.venv/bin/python -m pip install "cupy-cuda12x<14"
+```
+
+Если пакетов UHD нет, соберите UHD из исходников с
+`-DENABLE_PYTHON_API=ON`, затем `.venv/bin/python -m pip install uhd==4.10.0.0`.
+Без UHD всё работает — генерируется IQ-файл (передача на B210 недоступна).
 
 ## Запуск GUI
 
 ```powershell
 cd E:\MySoftware\GNSS_Sim
-E:\MySoftware\SDR_Scan\.venv\Scripts\python.exe run.py
+.\.venv\Scripts\python.exe run.py
 ```
 
 Три вкладки:
@@ -136,7 +191,7 @@ E:\MySoftware\SDR_Scan\.venv\Scripts\python.exe run.py
 
 ```powershell
 # Автоскачивание RINEX за нужную дату и IQ в файл (все сигналы, 60 с)
-E:\MySoftware\SDR_Scan\.venv\Scripts\python.exe -m gnss_sim ^
+.venv\Scripts\python.exe -m gnss_sim ^
     -t "2022/01/01,00:00:00" -d 60 -o out.cs16 --format cs16
 
 # Свой RINEX-файл и статичная точка
@@ -367,7 +422,7 @@ GUI: группа «Сигналы» — галочка **«Авто»** ряд�
 прогрессом есть компактный индикатор уровня
 `TX: пик -3.1 dBFS, RMS -14.4 dBFS` (обновляется ~2 раза/с, не по отсчёту);
 при клиппинге добавляется `КЛИП N`, при передаче на B210 — `underflow N`.
-Шкала dBFS та же, что в SDR_Scan (комплексный тон амплитуды 1.0 = 0 dBFS).
+Шкала dBFS та же (комплексный тон амплитуды 1.0 = 0 dBFS).
 
 ## Форматы вывода
 
@@ -461,14 +516,14 @@ B210 = один AD9361 с **раздельными LO приёма и перед
 ограниченным пропорциональным шагом с EMA-сглаживанием и мёртвой зоной, чтобы
 не раскачиваться. Шумовой пол измеряется один раз перед стартом передачи (TX
 ещё выключен); SNR = уровень RX − шумовой пол. Шкала dBFS: комплексный тон
-амплитуды 1.0 = 0 dBFS (как в SDR_Scan).
+амплитуды 1.0 = 0 dBFS.
 
 ### Запуск (CLI)
 
 ```powershell
 # TX на канале 0 (TX/RX), RX на канале 1 (RX2), авторегулятор до -30 dBFS,
 # профиль задержек (топ-3 эхо) — ОБЯЗАТЕЛЬНО аттенюатор 50-60 дБ + DC block!
-E:\MySoftware\SDR_Scan\.venv\Scripts\python.exe -m gnss_sim ^
+.venv\Scripts\python.exe -m gnss_sim ^
     --tx --monitor --tx-channel 0 --tx-gain -20 ^
     --rx-channel 1 --rx-ant RX2 --rx-gain 30 ^
     --tx-power-target -30 --echo ^

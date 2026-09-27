@@ -2,7 +2,7 @@
 
 Run without hardware or network::
 
-    E:\\MySoftware\\SDR_Scan\\.venv\\Scripts\\python.exe -m pytest tests -q
+    .venv\\Scripts\\python.exe -m pytest tests -q
 
 Covered:
 * convolutional FEC (rate 1/2, K=7, G1=171o / G2=133o, G2 inverted) and the

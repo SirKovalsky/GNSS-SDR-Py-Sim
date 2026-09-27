@@ -1522,7 +1522,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # underflow), updated periodically by the runner (never per sample).
         self.lbl_tx_level = QtWidgets.QLabel("Уровень TX: —")
         self.lbl_tx_level.setToolTip(
-            "Уровень передаваемого сигнала (пик и RMS в dBFS, как в SDR_Scan: "
+            "Уровень передаваемого сигнала (пик и RMS в dBFS: "
             "комплексный тон 1.0 = 0 dBFS). Показывается число отсчётов с "
             "|x|>1 (клип) и underflow B210. Обновляется ~2 раза/с.")
         v.addWidget(self.lbl_tx_level)

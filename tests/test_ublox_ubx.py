@@ -3,7 +3,7 @@
 All frames are synthetic and carry correct Fletcher checksums, so no hardware
 or COM port is needed.  Run with::
 
-    E:\\MySoftware\\SDR_Scan\\.venv\\Scripts\\python.exe -m pytest tests -q
+    .venv\\Scripts\\python.exe -m pytest tests -q
 """
 
 from __future__ import annotations

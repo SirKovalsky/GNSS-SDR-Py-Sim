@@ -2,7 +2,7 @@
 
 Запуск (без железа и без сети)::
 
-    E:\\MySoftware\\SDR_Scan\\.venv\\Scripts\\python.exe -m pytest tests -q
+    .venv\\Scripts\\python.exe -m pytest tests -q
 
 Проверяются: CRC-24Q (на реальных захваченных сообщениях IGS geo_sbas.txt),
 обрамление 250-битного сообщения, round-trip полей MT9/MT17, скорость потока

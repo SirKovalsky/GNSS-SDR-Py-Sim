@@ -14,7 +14,7 @@ pyserial>=3.5
 #   CUDA 11.x:                  pip install "cupy-cuda11x"
 # Без CuPy приложение работает на CPU.
 
-# UHD (только для передачи на USRP B210) ставится ОТДЕЛЬНО, как и в SDR_Scan:
+# UHD (только для передачи на USRP B210) ставится ОТДЕЛЬНО:
 #   Windows: UHD-инсталлятор + pip install uhd==4.10.0.0
 #   Linux:   sudo apt install libuhd-dev uhd-host python3-uhd
 # Без UHD приложение всё равно работает — генерирует IQ в файл.

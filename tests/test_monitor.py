@@ -2,7 +2,7 @@
 
 Запуск (B200 не нужен, UHD импортируется лениво)::
 
-    E:\\MySoftware\\SDR_Scan\\.venv\\Scripts\\python.exe tests\\test_monitor.py
+    .venv\\Scripts\\python.exe tests\\test_monitor.py
 
 Проверяются: ``rms_dbfs``, сходимость/пределы ``PowerRegulator``,
 ``delay_profile`` на синтетическом двухлучевом канале, ``estimate_noise_floor``,

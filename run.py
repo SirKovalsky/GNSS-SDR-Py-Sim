@@ -1,8 +1,7 @@
 """Launch the GNSS Sim GUI.
 
 UHD is imported *before* PyQt5 on Windows: the native UHD libraries must load
-before Qt, otherwise creating a USRP object can crash with 0xC0000005 (the same
-precaution used by the SDR_Scan application).
+before Qt, otherwise creating a USRP object can crash with 0xC0000005.
 """
 
 import os

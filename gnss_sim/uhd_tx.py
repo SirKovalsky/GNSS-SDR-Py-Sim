@@ -1,8 +1,8 @@
 """UHD (USRP B210) TX streamer for GNSS baseband playback.
 
 The module imports :mod:`uhd` lazily so the rest of the simulator works (and
-shows a readable error) when UHD is not installed.  This mirrors the receive
-wrapper used by the SDR_Scan application but drives the TX chain.
+shows a readable error) when UHD is not installed.  The native bindings are
+imported lazily and only the TX chain is driven.
 """
 
 from __future__ import annotations

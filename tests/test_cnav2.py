@@ -2,7 +2,7 @@
 
 Run without hardware or network::
 
-    E:\\MySoftware\\SDR_Scan\\.venv\\Scripts\\python.exe -m pytest tests -q
+    .venv\\Scripts\\python.exe -m pytest tests -q
 
 Covered:
 * BCH(51,8) TOI encoding against known 52-symbol vectors and decode round-trip;
