@@ -212,34 +212,30 @@ def test_update_start_range_reenables_now_when_covered() -> None:
 # ======================================================================
 # 4) Basic/Advanced B1I sync
 # ======================================================================
-def test_gui_b1i_basic_advanced_sync() -> None:
+def test_gui_b1i_controls_disabled() -> None:
+    """BeiDou B1I selection is temporarily disabled in the GUI.
+
+    The Basic checkbox is unchecked/greyed and the Advanced B1I controls stay
+    disabled; even a programmatic toggle cannot select B1I or the opt-in.
+    """
     from gnss_sim.gui import MainWindow
     app = _app()
     win = MainWindow()
     try:
-        # Default: B1I UNCHECKED, so the Advanced B1I controls are disabled.
         assert not win.cb_bds.isChecked()
+        assert not win.cb_bds.isEnabled()
         assert not win.cb_combine.isEnabled()
         assert not win.cmb_b1i_data.isEnabled()
         assert not win.cb_auto_b1i.isEnabled()
-        # Selecting B1I in Basic enables the Advanced opt-in.
+        # A programmatic check must not enable B1I / the Advanced opt-in.
         win.cb_bds.setChecked(True)
-        assert win.cb_combine.isEnabled()
-        assert win.cmb_b1i_data.isEnabled()
-        assert win.cb_auto_b1i.isEnabled()
-        # Vice versa: ticking the Advanced opt-in selects B1I in Basic.
-        win.cb_bds.setChecked(False)
-        assert not win.cb_combine.isChecked()
+        assert not win.cb_combine.isEnabled()
+        assert not win.cmb_b1i_data.isEnabled()
+        assert not win.cb_auto_b1i.isEnabled()
         win.cb_combine.setChecked(True)
-        assert win.cb_bds.isChecked()
-        assert win.cb_combine.isChecked()
-        # B1I off again collapses the opt-in (never disagree).
-        win.cb_bds.setChecked(False)
         assert not win.cb_combine.isChecked()
-        # B1I back on re-enables the Advanced controls.
-        win.cb_bds.setChecked(True)
-        assert win.cmb_b1i_data.isEnabled()
-        assert win.cb_auto_b1i.isEnabled()
+        assert win._collect().enable_beidou is False
+        assert win._collect().combine is False
     finally:
         win.close()
     del app

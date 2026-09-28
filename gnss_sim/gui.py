@@ -58,7 +58,8 @@ _DEFAULT_OUTPUT_SCALE = 10000.0
 _B210_TX_GAIN_MAX = 89.75
 _B210_TX_GAIN_MIN = 0.0
 _TX_GAIN_STEPS_PER_DB = 4
-_DEFAULT_TX_GAIN = 10.0
+#: Default TX gain [dB] (B210 gain, not calibrated dBm): +18 for the B1I margin.
+_DEFAULT_TX_GAIN = 18.0
 
 #: Output extensions that track the format combo (B5).
 _IQ_EXTS = (".cs16", ".cf32", ".cs8", ".cs4", ".bin", ".iq")
@@ -67,6 +68,14 @@ _MERGED_RINEX_PREFIX = "BRDC00IGS_R_"
 #: Log colours (B1): errors red, warnings amber.
 _LOG_ERROR_COLOR = "#d32f2f"
 _LOG_WARN_COLOR = "#b26a00"
+#: BeiDou B1I selection is temporarily disabled in the GUI: the checkbox is
+#: unchecked and greyed out, and it never contributes to the derived band or the
+#: automatic B1I band widening.  A dedicated B1I session is still available from
+#: the CLI (``--beidou``).  Flipping this to ``True`` restores the old behaviour.
+_B1I_SELECTABLE = False
+#: Tooltip shown on the disabled «BeiDou B1I» checkbox (and the related group).
+_B1I_DISABLED_TIP = ("Временно отключено (требуется отдельная сессия B1I: "
+                     "CLI --beidou)")
 
 
 class _DateLockedDateTimeEdit(QtWidgets.QDateTimeEdit):
@@ -149,7 +158,8 @@ class _WheelGuard(QtCore.QObject):
 _HELP_HTML = """
 <h3>Что делает программа</h3>
 <p>Симулятор формирует цифровой IQ-сигнал GNSS (GPS L1 C/A + L1C, Galileo E1,
-QZSS, SBAS, BeiDou B1I) и по выбору записывает его в файл и/или передаёт через
+QZSS, SBAS; BeiDou B1I — только через CLI <code>--beidou</code>) и по выбору
+записывает его в файл и/или передаёт через
 USRP B210 в эфир.</p>
 <ul>
 <li><b>«Сгенерировать IQ»</b> — только записать IQ-файл (передача на B210
@@ -186,11 +196,11 @@ USRP B210 в эфир.</p>
 <li><b>Galileo E1</b> — сигнал Galileo (CBOC).</li>
 <li><b>QZSS L1 C/A</b>, <b>SBAS L1 C/A</b> — японский и SBAS
 (геостационарный) сигналы.</li>
-<li><b>BeiDou B1I</b> — китайский сигнал (1561.098 МГц). Вместе с L1/E1 он
-автоматически образует <b>единый поток</b> (<code>all</code>, центр/fs
-вычисляются); один он даёт узкую сессию <code>b1i</code>.</li>
+<li><b>BeiDou B1I</b> — <b>временно отключён</b> (галочка неактивна). B1I
+доступен только отдельной сессией из CLI (<code>--beidou</code>); в GUI сигнал
+не выбирается, диапазон остаётся <code>l1</code>.</li>
 </ul>
-<p>Источник RINEX тоже следует за системами: если отмечены Galileo/QZSS/BeiDou,
+<p>Источник RINEX тоже следует за системами: если отмечены Galileo/QZSS,
 нужен мультисистемный merged-файл, иначе достаточно GPS-файла.</p>
 
 <h3>Консоль, UHD и «U»/«O»</h3>
@@ -911,7 +921,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         multi = (getattr(self, "cb_gal", None) is not None
                  and (self.cb_gal.isChecked() or self.cb_qzss.isChecked()
-                      or self.cb_bds.isChecked()))
+                      or (_B1I_SELECTABLE and self.cb_bds.isChecked())))
         if multi:
             text = ("Источник RINEX: <b>мультисистемный merged (G/E/J/C)</b> — "
                     "выбраны Galileo/QZSS/BeiDou. Такой файл публикуется "
@@ -1025,13 +1035,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_qzss.setChecked(True)
         self.cb_sbas = QtWidgets.QCheckBox("SBAS L1 C/A")
         self.cb_sbas.setChecked(True)
-        self.cb_bds = QtWidgets.QCheckBox("BeiDou B1I (1561.098 МГц)")
-        self.cb_bds.setChecked(False)  # off by default (narrow L1 session)
+        self.cb_bds = QtWidgets.QCheckBox("BeiDou B1I (1561.098 МГц) — "
+                                          "временно отключено")
+        self.cb_bds.setChecked(False)  # off (B1I selection is disabled)
+        self.cb_bds.setEnabled(_B1I_SELECTABLE)
+        self.cb_bds.setToolTip(_B1I_DISABLED_TIP)
         _sig_tip = ("Системы определяют диапазон (l1/b1i/all), центр/fs и "
                     "источник RINEX автоматически. Подробнее — в «Справке».")
         for i, w in enumerate((self.cb_ca, self.cb_l1c, self.cb_gal,
                                self.cb_qzss, self.cb_sbas, self.cb_bds)):
-            w.setToolTip(_sig_tip)
+            if w is not self.cb_bds:
+                w.setToolTip(_sig_tip)
             f2.addWidget(w, i, 0, 1, 2)
         self.cmb_l1c_data = QtWidgets.QComboBox()
         self.cmb_l1c_data.addItems(["zeros", "cnav2"])
@@ -1193,7 +1207,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_backend.setCurrentText("auto")
 
     def _build_band_group(self) -> QtWidgets.QGroupBox:
-        g = QtWidgets.QGroupBox("BeiDou B1I")
+        g = QtWidgets.QGroupBox("BeiDou B1I — временно отключено")
+        self.grp_b1i = g
+        g.setToolTip(_B1I_DISABLED_TIP)
         f = QtWidgets.QGridLayout(g)
         self.cmb_b1i_data = QtWidgets.QComboBox()
         self.cmb_b1i_data.addItems(["d1", "placeholder"])
@@ -1232,63 +1248,61 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reset_band_group,
             "Сбросить данные B1I и объединение"),
             4, 0, 1, 2)
+        if not _B1I_SELECTABLE:
+            g.setEnabled(False)
         self.cb_combine.stateChanged.connect(self._on_combine_toggled)
         self._refresh_derived()
         return g
 
     # ------------------------------------------------------------------
     def _on_combine_toggled(self, on: bool) -> None:
-        """Sync the Advanced «Объединять L1+B1I» opt-in with Basic «B1I».
+        """Handle the Advanced «Объединять L1+B1I» opt-in.
 
-        The Advanced control only makes sense when BeiDou B1I is selected.  When
-        it is ticked, B1I is selected in the Basic tab too, so the two tabs can
-        never disagree (the other direction — B1I off collapses the opt-in — is
-        handled in :meth:`_refresh_derived`).
+        BeiDou B1I is temporarily disabled, so this control is greyed out and
+        the opt-in always collapses; the method only keeps the Basic and
+        Advanced tabs consistent if it is toggled programmatically.
         """
-        if on and not self.cb_bds.isChecked():
+        if not _B1I_SELECTABLE and getattr(self, "cb_combine", None):
+            self.cb_combine.blockSignals(True)
+            self.cb_combine.setChecked(False)
+            self.cb_combine.blockSignals(False)
+        elif on and not self.cb_bds.isChecked():
             self.cb_bds.setChecked(True)  # triggers _refresh_derived
         self._refresh_derived()
 
     def _refresh_derived(self, *_args) -> None:
         """Recompute the read-only band/centre/fs and RINEX note.
 
-        The «Сигналы» checkboxes are the single source of truth for the band;
-        the only Advanced state this changes is collapsing the «Объединять
-        L1+B1I» opt-in (and disabling the B1I-only controls) when B1I is off, so
-        the Basic and Advanced tabs stay consistent.
+        The «Сигналы» checkboxes are the single source of truth for the band.
+        BeiDou B1I is temporarily disabled: ``cb_bds`` is greyed out and never
+        contributes to the derived band/auto-B1I, and the related Advanced
+        controls are disabled, so only the historic L1 sessions are produced.
         """
         if not hasattr(self, "lbl_band") or not hasattr(self, "lbl_fs"):
             return
-        # Cross-tab B1I sync (bidirectional invariant):
-        #   «Объединять L1+B1I» checked  ->  B1I must be selected in Basic.
-        #   B1I unchecked in Basic        ->  collapse the Advanced opt-in.
-        if (hasattr(self, "cb_combine") and self.cb_combine.isChecked()
-                and not self.cb_bds.isChecked()):
+        # Collapse the B1I opt-in: it can never be active while B1I is off.
+        if hasattr(self, "cb_combine") and self.cb_combine.isChecked():
             self.cb_combine.blockSignals(True)
             self.cb_combine.setChecked(False)
             self.cb_combine.blockSignals(False)
-        combine = (self.cb_combine.isChecked()
-                   if hasattr(self, "cb_combine") else False)
+        combine = False
         enables = {
             "enable_ca": self.cb_ca.isChecked(),
             "enable_l1c": self.cb_l1c.isChecked(),
             "enable_galileo": self.cb_gal.isChecked(),
             "enable_qzss": self.cb_qzss.isChecked(),
             "enable_sbas": self.cb_sbas.isChecked(),
-            "enable_beidou": self.cb_bds.isChecked(),
+            # B1I is deliberately forced off: the checkbox never affects the
+            # derived band or the automatic B1I band widening.
+            "enable_beidou": False,
         }
-        # Enable the Advanced B1I controls only while B1I is selected; the
-        # combine opt-in additionally needs an L1/E1 carrier to merge with.
+        # Every B1I-only control stays disabled while B1I selection is off.
         if hasattr(self, "cb_combine"):
-            bds = enables["enable_beidou"]
-            l1_family = any(enables[k] for k in (
-                "enable_ca", "enable_l1c", "enable_galileo",
-                "enable_qzss", "enable_sbas"))
-            self.cb_combine.setEnabled(bool(bds and l1_family))
+            self.cb_combine.setEnabled(False)
             if hasattr(self, "cmb_b1i_data"):
-                self.cmb_b1i_data.setEnabled(bool(bds))
+                self.cmb_b1i_data.setEnabled(False)
             if hasattr(self, "cb_auto_b1i"):
-                self.cb_auto_b1i.setEnabled(bool(bds))
+                self.cb_auto_b1i.setEnabled(False)
         band = derive_band_key(combine=combine, **enables)
         plan = derive_band_plan(combine=combine, **enables)
         if not any(enables.values()):
@@ -1302,20 +1316,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_fs.setText(f"<b>{plan.fs / 1e6:g}</b> Мвыб/с")
             self.lbl_fc.setText(f"<b>{plan.center_freq / 1e6:.3f}</b> МГц")
         if hasattr(self, "lbl_auto_b1i"):
-            if enables["enable_beidou"] and band == "l1":
-                self.lbl_auto_b1i.setText(
-                    "BeiDou B1I отключён: он не входит в узкую полосу L1 "
-                    "(fs останется 2.6 Мвыб/с). Включите «Объединять L1+B1I», "
-                    "чтобы передать L1 и B1I одним широким потоком ~25 Мвыб/с.")
-            elif band == "all":
-                self.lbl_auto_b1i.setText(
-                    "Объединённый поток L1+B1I (~25 Мвыб/с): предгенерация "
-                    "TX-сегмента в RAM занимает минуты и несколько ГБ.")
-            else:
-                self.lbl_auto_b1i.setText(
-                    "B1I (1561.098 МГц) не помещается в узкую полосу L1: без "
-                    "галочки «Объединять L1+B1I» B1I отключается, fs остаётся "
-                    "2.6 Мвыб/с.")
+            self.lbl_auto_b1i.setText(
+                "BeiDou B1I временно отключён: выбор B1I недоступен, сеанс "
+                "остаётся L1. Для B1I нужна отдельная сессия "
+                "(CLI: --beidou --band b1i/all).")
         self._set_nav_mode_note()
 
     def _reset_band_group(self) -> None:
@@ -1459,9 +1463,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "пишутся в журнал.")
         self.lbl_tx_info.setWordWrap(True)
         f5.addWidget(self.lbl_tx_info, 6, 0, 1, 3)
+        self.cb_tx_native = QtWidgets.QCheckBox(
+            "Нативная передача (C++, без Python/GIL в петле UHD)")
+        self.cb_tx_native.setChecked(self._native_tx_available())
+        self.cb_tx_native.setToolTip(
+            "Сегмент предгенерируется во временный cs16-файл и играется "
+            "native/gnss_sim_tx.exe — убирает underflow Python-петли на "
+            "~25 Мвыб/с. Если exe не собран (native\\build.bat), "
+            "используется встроенный Python-путь с записью в журнал.")
+        f5.addWidget(self.cb_tx_native, 7, 0, 1, 3)
         f5.addWidget(self._group_reset_btn(self._reset_uhd_group,
                                            "Сбросить только параметры B210"),
-                     7, 0, 1, 3)
+                     8, 0, 1, 3)
         return g_tx
 
     def _reset_uhd_group(self) -> None:
@@ -1472,6 +1485,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_ant.setText("TX/RX")
         self.sp_bw.setValue(0.0)
         self.cmb_clk.setCurrentText("internal")
+        self.cb_tx_native.setChecked(self._native_tx_available())
         self._update_channel_validity()
 
     def _build_monitor_group(self) -> QtWidgets.QGroupBox:
@@ -2720,15 +2734,16 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     def _collect(self) -> SimConfig:
         # «Сигналы» are the single source of truth: derive band, centre/fs and
-        # the RINEX source mode from the checked systems.
+        # the RINEX source mode from the checked systems.  BeiDou B1I selection
+        # is temporarily disabled, so it is forced off regardless of the greyed
+        # checkbox (the band stays on the historic L1 sessions).
         enables = dict(
             enable_ca=self.cb_ca.isChecked(), enable_l1c=self.cb_l1c.isChecked(),
             enable_galileo=self.cb_gal.isChecked(),
             enable_qzss=self.cb_qzss.isChecked(),
             enable_sbas=self.cb_sbas.isChecked(),
-            enable_beidou=self.cb_bds.isChecked())
-        combine = (self.cb_combine.isChecked()
-                   if hasattr(self, "cb_combine") else False)
+            enable_beidou=False)
+        combine = False
         band = derive_band_key(combine=combine, **enables)
         plan = derive_band_plan(combine=combine, **enables)
         fs = plan.fs
@@ -2785,6 +2800,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tx_antenna=self.ed_ant.text().strip(),
             tx_bandwidth=self.sp_bw.value(),
             clock_source=self.cmb_clk.currentText(),
+            tx_native=bool(self.cb_tx_native.isChecked()),
             backend=self.cmb_backend.currentText(),
             monitor=self.cb_monitor.isChecked(),
             tx_power_target_dbfs=self.sp_target.value(),
@@ -2800,6 +2816,15 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # B210 auto-transmit detection / TX-power slider
     # ------------------------------------------------------------------
+    @staticmethod
+    def _native_tx_available() -> bool:
+        """True when native/gnss_sim_tx.exe exists (native TX is usable)."""
+        try:
+            from .native_tx import native_tx_available
+            return bool(native_tx_available())
+        except Exception:  # noqa: BLE001 - GUI must never fail on this
+            return False
+
     def _tx_gain_db(self) -> float:
         """TX gain [dB] from the slider, clamped to the B210 0..89.75 range."""
         raw = self.sl_tx_gain.value() / float(_TX_GAIN_STEPS_PER_DB)

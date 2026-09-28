@@ -80,8 +80,12 @@ def test_b1i_checkbox_unchecked_by_default() -> None:
     win = MainWindow()
     try:
         assert win.cb_bds.isChecked() is False
+        # B1I selection is disabled (greyed) as well as unchecked.
+        assert win.cb_bds.isEnabled() is False
         assert win._collect().enable_beidou is False
+        # A programmatic check must not leak into the collected config.
         win.cb_bds.setChecked(True)
+        assert win._collect().enable_beidou is False
         win._reset_signals_group()
         assert win.cb_bds.isChecked() is False  # reset restores the default
     finally:

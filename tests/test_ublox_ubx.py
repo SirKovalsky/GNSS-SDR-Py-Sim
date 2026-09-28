@@ -297,3 +297,43 @@ def test_nmea_reader_still_available() -> None:
         "$GNGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47"
     )["type"] == "GGA"
     assert hasattr(ublox, "NmeaReader")
+
+
+def test_parse_nmea_beidou_gbgsv_system_c() -> None:
+    """Regression: u-blox BeiDou GSV (Talker ID "GB") must map to "C".
+
+    The RX monitor used to accept only legacy "B"/"D" tags and silently
+    dropped every BeiDou satellite, so per-PRN C/N0 was unassessable.
+    """
+    line = ("$GBGSV,1,1,03,01,20,045,42,02,35,120,40,"
+            "03,50,200,38*00")
+    d = ublox.parse_nmea_line(line)
+    assert d["type"] == "GSV" and d["talker"] == "GB" and d["system"] == "C"
+    assert d["in_view"] == 3
+    assert [(s["system"], s["prn"], s["snr"]) for s in d["sats"]] == [
+        ("C", 1, 42.0), ("C", 2, 40.0), ("C", 3, 38.0)]
+    # Override Talker ID ("BD") must land on the same canonical letter.
+    bd = ublox.parse_nmea_line("$BDGSV,1,1,01,05,10,090,33*00")
+    assert bd["system"] == "C" and bd["sats"][0]["prn"] == 5
+
+
+def test_parse_nmea_gngsa_system_id_beidou() -> None:
+    """NMEA 4.11 ``systemId`` (field 18) must override the generic "GN"."""
+    line = ("$GNGSA,A,3,01,02,03,04,05,06,07,08,09,10,,,"
+            "1.8,0.9,1.5,4*00")
+    d = ublox.parse_nmea_line(line)
+    assert d["type"] == "GSA" and d["system_id"] == 4 and d["system"] == "C"
+    assert d["svids"][:3] == [1, 2, 3]
+    # GPS/legacy GSA without systemId keeps the talker's system.
+    gps = ublox.parse_nmea_line(
+        "$GPGSA,A,3,04,05,09,12,24,25,29,31,32,,,,1.8,0.9,1.5*00")
+    assert gps["system"] == "G"
+
+
+def test_compare_visible_normalises_beidou_aliases() -> None:
+    # The simulator transmits "C"; a monitor may still tag BeiDou "B"/"D".
+    sim = [{"system": "C", "prn": 5}, {"system": "C", "prn": 6}]
+    gsv = [{"system": "B", "prn": 5}, {"system": "D", "prn": 6}]
+    cmp = ublox.compare_visible(sim, gsv)
+    assert cmp["matched"] == [("C", 5), ("C", 6)]
+    assert cmp["not_in_gsv"] == [] and cmp["not_in_sim"] == []

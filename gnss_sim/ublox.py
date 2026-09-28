@@ -21,8 +21,8 @@ import threading
 _TALKER_SYSTEM = {
     "GP": "G",  # GPS
     "GA": "E",  # Galileo
-    "GB": "C",  # BeiDou
-    "BD": "C",
+    "GB": "C",  # BeiDou (u-blox default Talker ID)
+    "BD": "C",  # BeiDou (override Talker ID)
     "GC": "C",
     "GI": "C",
     "GQ": "J",  # QZSS
@@ -32,16 +32,28 @@ _TALKER_SYSTEM = {
     "GS": "S",
 }
 
+#: Legacy/short BeiDou tags seen from some monitors -> canonical RINEX letter.
+_SYSTEM_ALIASES = {"B": "C", "D": "C"}
+
+#: NMEA 4.11 ``GSA`` field 18 ``systemId`` -> RINEX-style system letter.
+_GSA_SYSTEM_ID = {1: "G", 2: "R", 3: "E", 4: "C", 5: "J"}
+
+
+def _normalise_system(system: str) -> str:
+    """Canonicalise a system letter (``B``/``D`` -> ``C`` for BeiDou)."""
+    s = (system or "").upper()
+    return _SYSTEM_ALIASES.get(s, s)
+
 
 def _system_from_talker(talker: str) -> str:
     t = (talker or "").upper()
     if len(t) < 2:
         return "?"
     if t in _TALKER_SYSTEM:
-        return _TALKER_SYSTEM[t]
+        return _normalise_system(_TALKER_SYSTEM[t])
     # Эвристика: последний символ talker'а часто кодирует систему.
-    return {"P": "G", "A": "E", "B": "C", "D": "C", "Q": "J",
-            "L": "R", "N": "G"}.get(t[-1], "?")
+    return _normalise_system({"P": "G", "A": "E", "B": "C", "D": "C",
+                              "Q": "J", "L": "R", "N": "G"}.get(t[-1], "?"))
 
 
 def _num(fields: list[str], idx: int, default=None):
@@ -149,8 +161,14 @@ def parse_nmea_line(line: str) -> dict:
 
     if stype == "GSA":
         svids = [int(x) for x in fields[3:15] if x and x.isdigit()]
+        # NMEA 4.11 added ``systemId`` (field 18).  Multi-GNSS receivers emit
+        # e.g. ``$GNGSA,…,4*..`` for BeiDou; without this the talker "GN"
+        # would label every GSA as GPS.
+        sysid = _int(fields, 18, 0)
+        system = _GSA_SYSTEM_ID.get(sysid, system)
         return {
             "type": "GSA", "talker": talker, "system": system,
+            "system_id": sysid,
             "mode": fields[1] if len(fields) > 1 else "",
             "fix": _int(fields, 2, 0),
             "svids": svids,
@@ -720,6 +738,7 @@ def _sv_key(sat: dict) -> tuple[str, int] | None:
     name = str(sat.get("name") or "")
     if not system and name:
         system = name[0].upper()
+    system = _normalise_system(system)
     try:
         prn = int(sat.get("prn"))
     except (TypeError, ValueError):

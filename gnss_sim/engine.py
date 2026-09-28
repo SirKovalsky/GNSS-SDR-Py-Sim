@@ -43,8 +43,8 @@ from .beidou import (
 from .beidou_nav import NH_CODE, d1_frame_block
 from .ca_code import code_bipolar
 from .constants import (
-    CARR_FREQ_L1, CODE_FREQ_CA, L1C_CODE_LEN, LAMBDA_L1, R2D,
-    SPEED_OF_LIGHT, WGS84_RADIUS,
+    BDT_GPST_OFFSET_S, BDT_WEEK_OFFSET, CARR_FREQ_L1, CODE_FREQ_CA,
+    L1C_CODE_LEN, LAMBDA_L1, R2D, SPEED_OF_LIGHT, WGS84_RADIUS,
 )
 from .galileo import CBOC_ALPHA, CBOC_BETA, e1_code, e1_secondary
 from .galileo_nav import inav_bit_block
@@ -90,6 +90,35 @@ B1I_SUGGEST_FS = 30.0e6
 B210_MAX_FS = 56.0e6
 B210_MIN_CENTER = 70.0e6
 B210_MAX_CENTER = 6.0e9
+
+
+def gps2bdt_sec(sec: float) -> float:
+    """Return a seconds-of-week value on the BeiDou time scale (BDT).
+
+    ``BDT = GPST - 14 s``; the wrap at the week boundary is handled so the
+    result stays in ``[0, 604800)``.
+    """
+    return (float(sec) - BDT_GPST_OFFSET_S) % 604800.0
+
+
+def b1i_frame_epoch(week: int, sec: float) -> GpsTime:
+    """Return the current B1I D1 frame epoch on the GPS time scale.
+
+    A D1 superframe is 30 s (5 subframes x 6 s) and must begin on a BDT 6-s
+    boundary so the subframe preamble lands on ``SOW = 0 (mod 6)``.  Since
+    ``BDT = GPST - 14 s``, that means the frame start is the latest instant
+    at or before ``(week, sec)`` with ``GPST = 14 (mod 30)``.  Anchoring to
+    GPS-30 s boundaries instead broadcast a BDT ``SOW = 4 (mod 6)``, which a
+    real receiver rejects.
+    """
+    bdt0 = (int(gps2bdt_sec(sec)) // 30) * 30
+    anchor = (bdt0 + BDT_GPST_OFFSET_S) % 604800.0
+    w = int(week)
+    if anchor > float(sec):
+        # ``sec`` is inside the first 14 s of a GPS week: the BDT boundary
+        # belongs to the previous GPS week.
+        w -= 1
+    return GpsTime(w, anchor)
 
 
 def b1i_band_fits(fs: float, center_freq: float,
@@ -435,8 +464,9 @@ class SignalEngine:
               + 6.0 - rng / SPEED_OF_LIGHT) * 1000.0
         if ch.kind == "beidou":
             ch.b1_phase = (ms % 1.0) * B1I_CODE_CHIPS
-            # D1 frame epoch aligned to 30 s (frame = 5 subframes x 6 s).
-            b0 = GpsTime(self.g.week, float(int(self.g.sec // 30) * 30))
+            # D1 frame = 5 subframes x 6 s, anchored to a BDT 6-s boundary
+            # (GPST == 14 (mod 30)) so the broadcast SOW == 0 (mod 6).
+            b0 = b1i_frame_epoch(self.g.week, self.g.sec)
             ch.b1i_frame_start = b0
             ch.b1i_bits = self._b1i_frame_bits(ch, b0)
         else:
@@ -533,10 +563,23 @@ class SignalEngine:
 
         Returns ``None`` in ``placeholder`` mode (the engine then transmits a
         constant +1 data bit, still NH20-framed).
+
+        The D1 time fields are defined in **BDT** (BDS-SIS-ICD-2.x): the week
+        number ``WN``, the subframe ``SOW`` and the clock/orbit epochs
+        ``toc``/``toe`` all count on the BDT scale (BDT = GPST - 14 s, BDT week
+        = GPS week - 1356).  The RINEX parser normalises BeiDou ``toe``/``toc``
+        to GPS time (see :func:`gnss_sim.rinex.ephemeris_toe_gps`), so they are
+        converted back here.  Broadcasting GPS week/seconds made the receiver's
+        BDT 1356 weeks and 14 s off, which stops it accepting the ephemeris in
+        a combined GPS+BDS solution.
         """
         if self.b1i_data != "d1" or ch.eph is None:
             return None
-        return d1_frame_block(ch.eph, frame_start.sec)
+        return d1_frame_block(
+            ch.eph, gps2bdt_sec(frame_start.sec),
+            week=int(frame_start.week) - BDT_WEEK_OFFSET,
+            toe_sec=gps2bdt_sec(ch.eph.toe.sec),
+            toc_sec=gps2bdt_sec(ch.eph.toc.sec))
 
     # ------------------------------------------------------------------
     def _roll_frames(self) -> None:
@@ -708,25 +751,42 @@ class SignalEngine:
             data = xp.ones_like(t)
         return code * data * carrier
 
-    def _b1i_term(self, ch, g, t, f_code, carrier, xp):
-        """BPSK(2) B1I: primary code x NH20 (1 kbps) x D1 data (50 bps)."""
+    def _b1i_term(self, ch, g, t, f_code, carrier, xp, rho=None):
+        """BPSK(2) B1I: primary code x NH20 (1 kbps) x D1 data (50 bps).
+
+        The 1 kbps NH20 chips and the 50 bps D1 bits must change exactly on the
+        1 ms ranging-code wraps *as seen by the receiver*, otherwise the
+        secondary code chops each code period and the receiver loses most of
+        the B1I correlation (observed as C/N0 ~10 dB and no nav decode).  The
+        old code timed them from the transmit second ``g.sec`` alone, which
+        put every NH transition ``frac(rng/c)`` ms away from the code epochs.
+
+        ``k`` counts 1 ms code periods from the D1 frame epoch: ``int(base_ms)``
+        is the integer count at the block start (including the propagation
+        delay ``rng/c``, like the GPS legacy and Galileo E1-B legs) and
+        ``floor(cp/2046)`` the code periods elapsed inside the block, so ``k``
+        steps on each code wrap.  ``k % 20`` is the NH20 chip and ``k // 20``
+        the D1 bit (one data bit = 20 code periods = 20 ms).
+        """
         ca = self._device(ch.ca, xp)
         nh = self._device(self._nh, xp)
         cp = ch.b1_phase + f_code * t
         chip = xp.floor(cp).astype(xp.int64) % B1I_CODE_CHIPS
         code = ca[chip].astype(xp.float64)
         if ch.b1i_frame_start is not None:
-            base = g.sec - ch.b1i_frame_start.sec
+            if rho is not None:
+                base_ms = (sub_gps_time(g, ch.b1i_frame_start)
+                           - rho.rng / SPEED_OF_LIGHT) * 1000.0
+            else:
+                base_ms = (g.sec - ch.b1i_frame_start.sec) * 1000.0
         else:
-            base = g.sec
-        sec = base + t
-        # NH20: one chip per 1 ms ranging-code period, 20 ms period.
-        nh_idx = xp.floor(sec * 1000.0).astype(xp.int64) % NH_CODE.shape[0]
+            base_ms = g.sec * 1000.0
+        k = int(base_ms) + xp.floor(cp / B1I_CODE_CHIPS).astype(xp.int64)
+        nh_idx = k % NH_CODE.shape[0]
         nh_bit = (1.0 - 2.0 * nh[nh_idx]).astype(xp.float64)
         if ch.b1i_bits is not None:
             bits = self._device(ch.b1i_bits, xp, cache=False)
-            # One D1 channel bit spans 20 ms (50 bps).
-            sym = xp.floor(sec * 50.0).astype(xp.int64) % bits.shape[0]
+            sym = (k // 20) % bits.shape[0]
             data = (1.0 - 2.0 * bits[sym]).astype(xp.float64)
         else:
             data = xp.ones_like(t)                    # placeholder +1 data
@@ -762,7 +822,8 @@ class SignalEngine:
             elif ch.kind == "sbas":
                 acc += ch.amp * self._sbas_term(ch, g, t, f_code, carrier, xp)
             elif ch.kind == "beidou":
-                acc += ch.amp * self._b1i_term(ch, g, t, f_code, carrier, xp)
+                acc += ch.amp * self._b1i_term(ch, g, t, f_code, carrier, xp,
+                                               rho)
 
             ch.carr = (ch.carr + TWO_PI * f_carr * nsamp * dt) % TWO_PI
             if ch.kind == "beidou":

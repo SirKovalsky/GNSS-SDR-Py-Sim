@@ -396,6 +396,8 @@ class SimulationRunner:
         #: (file generation may still proceed).
         self._tx_blocked = False
         self._tx_block_reason = ""
+        #: True when the active sink is the native C++ player (temp cs16 file).
+        self._native_tx = False
 
     # ------------------------------------------------------------------
     def _logf(self, msg: str) -> None:
@@ -627,6 +629,21 @@ class SimulationRunner:
                 sink = _DuplexSink(cfg, self._logf, self._emit_spectrum)
                 self._logf("UHD DUPLEX: " + sink.describe())
                 return sink
+            if getattr(cfg, "tx_native", False) and self._source is None:
+                from .native_tx import NativeTxSink, native_tx_path
+                if native_tx_path():
+                    sink = NativeTxSink(cfg, self._logf)
+                    self._native_tx = True
+                    self._logf("UHD TX (native): " + sink.describe())
+                    return sink
+                self._logf(
+                    "TX native: native/gnss_sim_tx.exe не найден — "
+                    "использую встроенный Python-путь UHD (fallback)")
+                cfg.tx_native = False
+            elif getattr(cfg, "tx_native", False):
+                self._logf("TX native: готовый IQ-файл пока играется встроенным "
+                           "Python-путём UHD (native поддерживает генерацию)")
+                cfg.tx_native = False
             from .uhd_tx import UhdTxSink
             sink = UhdTxSink(
                 args=cfg.uhd_args, channel=cfg.tx_channel, sample_rate=cfg.fs,
@@ -726,7 +743,16 @@ class SimulationRunner:
         # transmission has to fit the free-RAM budget; otherwise warn and refuse
         # TX (a file may still be generated).  Disk playback/streaming is never
         # used — the throughput is insufficient.
-        if cfg.use_usrp and budget > 0 and cfg.fs:
+        # The native player writes the segment to a temp file on disk, so the
+        # RAM-only policy does not apply to it.
+        native_plan = False
+        if cfg.use_usrp and getattr(cfg, "tx_native", False):
+            from .native_tx import native_tx_available
+            native_plan = native_tx_available()
+            if native_plan:
+                self._logf("TX native: сегмент пишется во временный cs16-файл "
+                           "(диск), а не в RAM — политика RAM-only не применяется")
+        if cfg.use_usrp and budget > 0 and cfg.fs and not native_plan:
             if self._loop:
                 need_s = float(self._segment_seconds or 0.0)
                 explicit_overflow = bool(cfg.loop_seconds > 0.0
@@ -735,20 +761,31 @@ class SimulationRunner:
                 need_s = req
                 explicit_overflow = False
             need_bytes = int(need_s * cfg.fs * _TX_RAM_BYTES)
+            force_pregen = bool(getattr(cfg, "tx_pregen", False))
             if need_bytes > budget or explicit_overflow:
-                self._tx_blocked = True
-                self._tx_block_reason = (
-                    f"буфер TX в RAM {need_s:.1f} с (~"
-                    f"{sysinfo.human(need_bytes)}) превышает бюджет "
-                    f"{sysinfo.human(int(budget))} (до {max_seg:.1f} с)")
-                self._logf(
-                    "ВНИМАНИЕ: " + self._tx_block_reason + " — передача на "
-                    "B210 ЗАБЛОКИРОВАНА (политика: только RAM). Файл IQ, если "
-                    "задан, будет сгенерирован без передачи.")
-                self._logf(
-                    "Решение: TX не запускается. Уменьшите fs/длительность "
-                    "или освободите память; «Зациклить сегмент (RAM)» с "
-                    "авто-сегментом или узкая полоса уменьшают буфер.")
+                if (force_pregen and not self._loop
+                        and not explicit_overflow):
+                    # ``--tx-pregen`` on a finite run: instead of blocking TX,
+                    # reduce the segment to the largest one that fits RAM and
+                    # stream it as a single pre-generated buffer.
+                    self._logf(
+                        f"TX: --tx-pregen: {need_s:.1f} с не помещаются в "
+                        f"бюджет RAM (до {max_seg:.1f} с) — TX-сегмент будет "
+                        f"сокращён до {max_seg:.1f} с")
+                else:
+                    self._tx_blocked = True
+                    self._tx_block_reason = (
+                        f"буфер TX в RAM {need_s:.1f} с (~"
+                        f"{sysinfo.human(need_bytes)}) превышает бюджет "
+                        f"{sysinfo.human(int(budget))} (до {max_seg:.1f} с)")
+                    self._logf(
+                        "ВНИМАНИЕ: " + self._tx_block_reason + " — передача на "
+                        "B210 ЗАБЛОКИРОВАНА (политика: только RAM). Файл IQ, если "
+                        "задан, будет сгенерирован без передачи.")
+                    self._logf(
+                        "Решение: TX не запускается. Уменьшите fs/длительность "
+                        "или освободите память; «Зациклить сегмент (RAM)» с "
+                        "авто-сегментом или узкая полоса уменьшают буфер.")
 
         if cfg.output:
             free = sysinfo.disk_free(os.path.dirname(cfg.output) or ".")
@@ -797,6 +834,22 @@ class SimulationRunner:
             # Explicit opt-in (cfg.combine) with BeiDou enabled: fall through to
             # the combined stream below.
             key = "all"
+
+        if key in ("b1i", "all", "wide") and not cfg.enable_beidou:
+            # BeiDou B1I is disabled by default (temporary measure): the B1I
+            # sessions only act with the explicit opt-in (CLI ``--beidou``).
+            # Fall back to the narrow L1 session, honouring any -s/-f override.
+            self._logf(
+                f"Сессия {key}: BeiDou B1I отключён (временно) — используется "
+                "сессия l1. Для B1I нужен явный --beidou (CLI) или отдельная "
+                "сессия B1I.")
+            if not (getattr(cfg, "fs_override", False)
+                    or getattr(cfg, "center_override", False)):
+                l1 = band_preset("l1")
+                cfg.fs = l1.fs
+                cfg.center_freq = l1.center_freq
+            cfg.band = "l1"
+            return
 
         if key == "b1i":
             changed: list[str] = []
@@ -1200,6 +1253,9 @@ class SimulationRunner:
         duration = cfg.duration if cfg.duration and cfg.duration > 0 else None
         produced = 0
 
+        if self._native_tx:
+            return self._run_tx_native(block, t0, duration)
+
         if self._segment_seconds:
             seg_total = int(self._segment_seconds * cfg.fs)
             if cfg.use_usrp:
@@ -1236,6 +1292,112 @@ class SimulationRunner:
                                  f"{produced / cfg.fs:.1f} из "
                                  f"{total / cfg.fs:.1f} с")
         return produced
+
+    # ------------------------------------------------------------------
+    # Native C++ TX path
+    # ------------------------------------------------------------------
+    def _run_tx_native(self, block: int, t0: float,
+                       duration: float | None) -> int:
+        """Pre-generate the whole segment to a temp cs16 file, then play it.
+
+        The native helper (``native/gnss_sim_tx.exe``) streams the file from a
+        tight C++ loop with no Python/GIL overhead between UHD sends.  Its
+        stderr is journalled and its underflow counter is reported through the
+        same sink interface as the Python path.  ``--loop`` maps the file to the
+        helper's ``--loop`` (endless until «Стоп»); without it the file is
+        played once.
+        """
+        import tempfile
+
+        cfg = self.cfg
+        assert self.engine is not None and self.sink is not None
+        fs = float(cfg.fs)
+        if self._segment_seconds:
+            total = int(self._segment_seconds * fs)
+        elif duration:
+            total = int(duration * fs)
+        else:
+            self._logf("TX native: длительность не задана — переключаюсь на "
+                       "встроенный Python-путь UHD")
+            self._native_tx = False
+            return self._run_tx_stream(None, block, t0)
+        if total <= 0:
+            return 0
+
+        from .iqfile import FileSink
+
+        fd, tmp = tempfile.mkstemp(prefix="gnss_sim_tx_", suffix=".cs16")
+        os.close(fd)
+        produced = 0
+        try:
+            fsink = FileSink(tmp, fmt="cs16", fs=fs,
+                             center_freq=cfg.center_freq,
+                             scale=cfg.output_scale)
+            fsink.start()
+            self._logf(
+                f"TX native: предгенерация {total / fs:.1f} с в {tmp} "
+                f"(cs16, ~{total * 4 / 1e6:.0f} МБ); затем отправка нативным "
+                "плеером без Python в петле UHD")
+            log_progress = self._milestone_logger("Предгенерация (native)")
+            gen_block = max(block, int(0.5 * fs))
+            while produced < total and not self._stop.is_set():
+                self._wait_if_paused()
+                n = min(gen_block, total - produced)
+                b = self.engine.generate_block(n)
+                b = self._headroom_ctl().process_block(b)
+                fsink.write(b)
+                produced += n
+                if self._progress is not None:
+                    wall = max(1e-9, time.time() - t0)
+                    sim_s = produced / fs
+                    self._progress(0.5 * produced / total, sim_s, wall,
+                                   sim_s / wall if wall else 0.0)
+                if self._phase is not None:
+                    self._phase("pregen", produced / total, 0, produced / fs,
+                                False)
+                log_progress(int(100 * produced / total),
+                             f"{produced / fs:.1f} с из {total / fs:.1f} с")
+            fsink.close()
+            if self._stop.is_set():
+                return 0
+
+            loop = bool(cfg.loop)
+            play_seconds = 0.0 if loop else produced / fs
+            stream_t0 = time.time()
+            seg_len = max(1, produced)
+
+            def on_status(sim_s: float) -> None:
+                if self._progress is None:
+                    return
+                wall = max(1e-9, time.time() - t0)
+                sim_s = float(sim_s)
+                if loop:
+                    frac = 0.5 + 0.5 * (1.0 - math.exp(
+                        -max(0.0, time.time() - stream_t0) / _TX_STREAM_TAU_S))
+                else:
+                    frac = 0.5 + 0.5 * min(1.0, sim_s * fs / seg_len)
+                self._progress(frac, sim_s, wall,
+                               sim_s / wall if wall else 0.0)
+                if self._phase is not None:
+                    self._phase("tx", ((sim_s * fs) % seg_len) / seg_len,
+                                0, sim_s, loop)
+
+            self._logf(f"TX native: сегмент {produced / fs:.1f} с готов — "
+                       f"запуск {getattr(self.sink, 'exe', 'native')} "
+                       f"(loop={'ВКЛ' if loop else 'ВЫКЛ'})")
+            result = self.sink.play(tmp, loop=loop, seconds=play_seconds,
+                                    stop_event=self._stop, on_status=on_status)
+            self._logf(
+                f"TX native: готово, отправлено ~{result.sent_sim_s:.1f} с, "
+                f"underflow {result.underflows} (short-send "
+                f"{result.short_sends}, seq-err {result.seq_errors})")
+            return produced
+        finally:
+            for path in (tmp, tmp + ".json"):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # Time-continuous cyclic generation (no TOW/HOW reset between passes)
@@ -1292,6 +1454,9 @@ class SimulationRunner:
 
         cfg = self.cfg
         assert self.engine is not None and self.sink is not None
+        self._logf(
+            "TX: путь — живой цикл (live-loop): предгенерация первого "
+            "RAM-сегмента, затем непрерывный потоковый синтез")
         gen_span = 0.5
         log_progress = self._milestone_logger("Идёт предгенерация")
         buf: list = []
@@ -1558,22 +1723,44 @@ class SimulationRunner:
             f"ВНИМАНИЕ: TX-сегмент {target / fs:.0f} с @ "
             f"{fs / 1e6:.2f} Мвыб/с (~{gb:.1f} ГБ RAM) — предгенерация "
             f"займёт ориентировочно ≥ {gen_s:.0f} с. Чтобы ускорить: "
-            f"уменьшите fs, отключите B1I (--no-beidou) или используйте "
+            f"уменьшите fs или используйте "
             f"cs8/узкополосный режим.")
 
     def _run_tx_stream(self, target: int | None, block: int, t0: float) -> int:
-        """Non-looping TX: pre-generate to RAM or bounded producer/consumer."""
+        """Non-looping TX: pre-generate to RAM or bounded producer/consumer.
+
+        Path selection:
+        * **single pre-generated RAM segment** whenever a finite ``target`` fits
+          the RAM budget (or ``cfg.tx_pregen`` forces it, in which case a too
+          long target is reduced to the largest segment that fits): the whole
+          segment is synthesised first and then streamed, so there is no live
+          synthesis between UHD sends (this is the underflow-free path for a
+          short combined run);
+        * **bounded producer/consumer** (live synthesis) for long or unbounded
+          runs that do not fit RAM.
+        """
         cfg = self.cfg
         assert self.engine is not None
         budget = int(getattr(self, "_ram_budget_bytes", 0) or 0)
         # RAM segment is stored as complex64 (_TX_RAM_BYTES bytes/sample).
         max_samples = budget // _TX_RAM_BYTES if budget > 0 else 0
+        force = bool(getattr(cfg, "tx_pregen", False))
+        if (force and target is not None and max_samples > 0
+                and target > max_samples):
+            self._logf(
+                f"TX: --tx-pregen: запрошенные {target / cfg.fs:.1f} с не "
+                f"помещаются в бюджет RAM — длительность сокращена до "
+                f"{max_samples / cfg.fs:.1f} с")
+            target = max_samples
         if target is not None and max_samples > 0 and target <= max_samples:
             est_s = target / _EST_SYNTH_RATE_SPS
             self._logf(
-                f"TX: предгенерация {target / cfg.fs:.2f} с в RAM "
-                f"(~{sysinfo.human(target * _TX_RAM_BYTES)}), затем передача "
-                f"из памяти; оценка предгенерации ~{est_s:.0f} с")
+                f"TX: путь — единый предгенерённый RAM-сегмент: "
+                f"предгенерация {target / cfg.fs:.2f} с в RAM "
+                f"(~{sysinfo.human(target * _TX_RAM_BYTES)})"
+                f"{' [--tx-pregen]' if force else ''}, затем передача из "
+                f"памяти; синтеза между блоками нет. Оценка предгенерации "
+                f"~{est_s:.0f} с")
             self._warn_large_tx_segment(target)
             # Pre-generation fills the first half of the bar; transmission the
             # second half (issue 1b), so the bar advances during both phases.
@@ -1590,13 +1777,13 @@ class SimulationRunner:
         if target is not None:
             fit_s = (budget / _TX_RAM_BYTES / cfg.fs) if budget > 0 else 0.0
             self._logf(
-                f"TX: {target / cfg.fs:.1f} с не помещается в бюджет RAM "
-                f"(до {fit_s:.1f} с) — синтез и передача параллельно "
-                f"(ограниченная очередь)")
+                f"TX: путь — потоковый синтез с ограниченной очередью "
+                f"(live): {target / cfg.fs:.1f} с не помещается в бюджет RAM "
+                f"(до {fit_s:.1f} с)")
             self._warn_large_tx_segment(target)
         else:
-            self._logf("TX: длительность не задана — синтез и передача "
-                       "параллельно (ограниченная очередь)")
+            self._logf("TX: путь — потоковый синтез с ограниченной очередью "
+                       "(live): длительность не задана")
         return self._run_tx_bounded(target, block, t0)
 
     def _run_tx_bounded(self, target: int | None, block: int,

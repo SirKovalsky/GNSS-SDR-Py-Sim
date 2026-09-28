@@ -207,10 +207,14 @@ def derive_band_key(
     enable_galileo: bool = True,
     enable_qzss: bool = True,
     enable_sbas: bool = True,
-    enable_beidou: bool = True,
+    enable_beidou: bool = False,
     combine: bool = False,
 ) -> str:
     """Derive the ``l1``/``b1i``/``all`` session from the enabled systems.
+
+    BeiDou B1I is off by default, so unless ``enable_beidou=True`` the result is
+    always the historic narrow ``l1`` session (``b1i``/``all`` are never
+    selected while B1I is disabled).
 
     Single source of truth for the GUI: BeiDou B1I (1561.098 MHz) only -> ``b1i``;
     no B1I -> the historic narrow ``l1`` session.  B1I together with any L1/E1
@@ -235,7 +239,7 @@ def derive_band_plan(
     enable_galileo: bool = True,
     enable_qzss: bool = True,
     enable_sbas: bool = True,
-    enable_beidou: bool = True,
+    enable_beidou: bool = False,
     combine: bool = False,
 ) -> BandPlan:
     """Return the :class:`BandPlan` matching :func:`derive_band_key`.
@@ -269,7 +273,7 @@ def derive_nav_mode(
     *,
     enable_galileo: bool = True,
     enable_qzss: bool = True,
-    enable_beidou: bool = True,
+    enable_beidou: bool = False,
 ) -> str:
     """Derive the RINEX source mode: ``merged`` (multi-GNSS) or ``auto`` (GPS).
 
@@ -335,7 +339,9 @@ class SimConfig:
     enable_galileo: bool = True
     enable_qzss: bool = True
     enable_sbas: bool = True
-    enable_beidou: bool = True
+    #: BeiDou B1I is temporarily disabled: the GUI checkbox is greyed out and
+    #: unchecked, and only an explicit opt-in (CLI ``--beidou``) turns it on.
+    enable_beidou: bool = False
     el_mask: float = 5.0
     #: Overall amplitude scale.  ``None`` (default) derives one scene-wide
     #: scale from the allocated channels / their summed amplitudes so a
@@ -370,10 +376,11 @@ class SimConfig:
     use_usrp: bool = False
     uhd_args: str = "type=b200"
     tx_channel: int = 0
-    #: Default TX gain [dB].  ``+10`` is the value verified on the ZED-F9P with
-    #: the B210 in the foil box (valid over the B210 TX range 0..89.75 dB); an
-    #: explicit ``--tx-gain``/GUI value still wins.
-    tx_gain: float = 10.0
+    #: Default TX gain [dB] (B210 gain, not calibrated dBm; device range is
+    #: 0..89.75 dB).  ``+18`` gives the margin needed for the F9P to track the
+    #: weaker B1I code while staying inside the foil box; an explicit
+    #: ``--tx-gain``/GUI value still wins and is clamped to the device range.
+    tx_gain: float = 18.0
     tx_antenna: str = "TX/RX"
     tx_bandwidth: float = 0.0  # 0 = let UHD choose
     clock_source: str = "internal"
@@ -386,6 +393,20 @@ class SimConfig:
     #: consumer; 0 = auto (see ``runner._TX_LOOP_BUFFER_SECONDS``).
     tx_jitter_seconds: float = 0.0
     memory_budget_gb: float = 0.0
+    #: Force the TX path to pre-generate the WHOLE (finite) segment into RAM and
+    #: then stream it (no live synthesis between sends).  The runner
+    #: auto-selects this path whenever the duration fits the RAM budget; the
+    #: flag removes the ambiguity and, when the duration does not fit, reduces
+    #: it to the largest segment that does (instead of falling back to the
+    #: parallel synthesis/transmit path).  Long / looping runs keep the
+    #: time-continuous live path.
+    tx_pregen: bool = False
+    #: Stream through the native C++ helper (``native/gnss_sim_tx.exe``) instead
+    #: of the Python UHD sink: the whole segment is pre-generated to a temp
+    #: ``cs16`` file and played by the helper, removing the per-block Python/GIL
+    #: overhead that underflowed at ~25 Msps.  Falls back to the Python path
+    #: with a clear journal note when the executable is missing.
+    tx_native: bool = False
 
     # Мониторинг RX / регулятор мощности (B210, отдельный RX-канал)
     monitor: bool = False

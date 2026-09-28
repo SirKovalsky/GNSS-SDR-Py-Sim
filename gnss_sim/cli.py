@@ -31,12 +31,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "2.6 Мвыб/с (по умолч.); b1i — только BeiDou B1I, "
                         "центр 1561.098 МГц, 4.092 Мвыб/с; all — единый поток "
                         "всех систем (L1/E1 + B1I), центр/fs вычисляются "
-                        "(≈1571.33 МГц / 25 Мвыб/с); wide — синоним all")
+                        "(≈1571.33 МГц / 25 Мвыб/с); wide — синоним all. "
+                        "Сессии b1i/all/wide действуют только вместе с "
+                        "явным --beidou (иначе используется l1)")
     p.add_argument("--combine", action="store_true",
                    help="явно объединить L1+B1I в один широкий поток "
                         "(≈1571.33 МГц / ~25 Мвыб/с, боковые лепестки BOC(6,1) "
-                        "сохраняются). По умолчанию при L1+B1I выбирается узкая "
-                        "полоса L1 (2.6 Мвыб/с), а B1I отключается")
+                        "сохраняются). Действует только с --beidou. По "
+                        "умолчанию при L1+B1I выбирается узкая полоса L1 "
+                        "(2.6 Мвыб/с), а B1I отключается")
     p.add_argument("-s", "--sample-rate", type=float, default=None,
                    help="sampling frequency [Hz] (по умолчанию — из --band)")
     p.add_argument("-f", "--center-freq", type=float, default=None,
@@ -62,8 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="disable Galileo E1")
     p.add_argument("--no-qzss", action="store_true", help="disable QZSS L1")
     p.add_argument("--no-sbas", action="store_true", help="disable SBAS L1")
-    p.add_argument("--no-beidou", action="store_true",
-                   help="отключить BeiDou B1I")
+    p.add_argument("--beidou", action="store_true", default=False,
+                   help="ЯВНО включить BeiDou B1I (по умолчанию выключен: "
+                        "система временно недоступна, требуется отдельная "
+                        "сессия B1I). Только с этим флагом действуют --band "
+                        "b1i/all/wide, --combine и --b1i-data")
     p.add_argument("--auto-b1i", dest="auto_b1i", action="store_true",
                    default=True,
                    help="авто-подбор fs/центра под B1I вместе с L1 (по умолч. вкл)")
@@ -88,8 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="L1Cd data source")
     p.add_argument("--b1i-data", dest="b1i_data", default="d1",
                    choices=["d1", "placeholder"],
-                   help="данные BeiDou B1I: d1 — реальное сообщение D1 "
-                        "(NH20+BCH), placeholder — постоянный +1 (по умолч. d1)")
+                   help="данные BeiDou B1I (только с --beidou): d1 — реальное "
+                        "сообщение D1 (NH20+BCH), placeholder — постоянный +1 "
+                        "(по умолч. d1)")
     p.add_argument("--el-mask", type=float, default=5.0,
                    help="elevation mask [deg]")
     p.add_argument("--amp", type=float, default=None,
@@ -112,7 +119,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stream to USRP B210 instead of / in addition to file")
     p.add_argument("--uhd-args", default="type=b200", help="UHD device arguments")
     p.add_argument("--tx-channel", type=int, default=0, help="TX channel")
-    p.add_argument("--tx-gain", type=float, default=10.0, help="TX gain [dB]")
+    p.add_argument("--tx-gain", type=float, default=18.0,
+                   help="TX gain (B210 dB, not dBm; device range 0..89.75, "
+                        "по умолчанию 18)")
     p.add_argument("--tx-antenna", default="TX/RX", help="TX antenna")
     p.add_argument("--tx-bandwidth", type=float, default=0.0,
                    help="TX analog bandwidth [Hz] (0 = выбрать автоматически в UHD)")
@@ -154,8 +163,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="длина зацикливаемого сегмента [с] (0=авто)")
     p.add_argument("--tx-jitter", type=float, default=0.0,
                    help="буфер джиттера синтез->UHD [с] (0=авто, обычно 20)")
+    p.add_argument("--tx-pregen", dest="tx_pregen", action="store_true",
+                   default=False,
+                   help="передать короткий сегмент одним куском: сначала "
+                        "полностью предгенерировать его в RAM, затем "
+                        "стримить (без синтеза между блоками). Если "
+                        "длительность не влезает в бюджет RAM, она "
+                        "сокращается до максимально возможной; долгие/"
+                        "цикличные прогоны идут живым путём, как раньше")
     p.add_argument("--memory-budget", type=float, default=0.0,
                    help="бюджет RAM для сегмента [ГБ] (0=60%% доступной)")
+    p.add_argument("--tx-native", dest="tx_native", action="store_true",
+                   default=False,
+                   help="передавать через нативный C++ помощник "
+                        "native/gnss_sim_tx.exe (сегмент пишется в временный "
+                        "cs16-файл и играется без Python/GIL в петле отправки; "
+                        "при отсутствии exe — откат на Python-путь UHD)")
     p.add_argument("--list-devices", action="store_true",
                    help="list USRP devices and exit")
     p.add_argument("--uhd-log-level", default=None,
@@ -220,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         combine=args.combine,
         enable_ca=not args.no_ca, enable_l1c=not args.no_l1c,
         enable_galileo=not args.no_galileo, enable_qzss=not args.no_qzss,
-        enable_sbas=not args.no_sbas, enable_beidou=not args.no_beidou,
+        enable_sbas=not args.no_sbas, enable_beidou=args.beidou,
         auto_download=not args.no_auto_download,
         download_source=args.source, cddis_user=args.cddis_user,
         cddis_password=args.cddis_password, cddis_token=args.cddis_token,
@@ -239,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
         loop=not args.no_loop, loop_seconds=args.loop_seconds,
         tx_jitter_seconds=args.tx_jitter,
         memory_budget_gb=args.memory_budget,
+        tx_pregen=args.tx_pregen,
+        tx_native=args.tx_native,
         monitor=args.monitor, tx_power_target_dbfs=args.tx_power_target,
         tx_power_auto=args.tx_power_auto, rx_channel=args.rx_channel,
         rx_antenna=args.rx_antenna, rx_gain=args.rx_gain,

@@ -414,7 +414,11 @@ def select_ephemeris(by_sv: dict[str, list[Ephemeris]], key: str,
     best = None
     best_dt = None
     for eph in sets:
-        toe = eph.toe.week * SECONDS_IN_WEEK + eph.toe.sec
+        # BeiDou ``toe`` is stored in BDT (week = GPS week - 1356); without
+        # normalising it the ~1356-week offset dominates the distance and the
+        # selection always returns the *last* BDS record of the day instead of
+        # the one nearest ``t`` (stale ephemeris -> receiver rejects it).
+        toe = _abs_gps(ephemeris_toe_gps(eph))
         dt = abs(target - toe)
         if best_dt is None or dt < best_dt:
             best, best_dt = eph, dt

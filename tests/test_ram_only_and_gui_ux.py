@@ -241,7 +241,7 @@ def test_gui_playback_controls_grouped() -> None:
 
 
 def test_gui_tx_power_slider_on_basic_tab_b210_range() -> None:
-    """(C) TX power is a slider on «Базовые», 0..89.75 dB, default +10."""
+    """(C) TX power is a slider on «Базовые», 0..89.75 dB, default +18."""
     from gnss_sim.gui import MainWindow, _B210_TX_GAIN_MAX
     app = _app()
     win = MainWindow()
@@ -249,8 +249,8 @@ def test_gui_tx_power_slider_on_basic_tab_b210_range() -> None:
         basic = win.left_tabs.widget(0)
         assert basic.isAncestorOf(win.sl_tx_gain)
         assert not hasattr(win, "sp_txg")
-        assert win._collect().tx_gain == 10.0
-        assert "10" in win.lbl_tx_gain.text()
+        assert win._collect().tx_gain == 18.0
+        assert "18" in win.lbl_tx_gain.text()
         win.sl_tx_gain.setValue(win.sl_tx_gain.maximum())
         assert win._tx_gain_db() == pytest.approx(_B210_TX_GAIN_MAX)
         assert win._collect().tx_gain <= _B210_TX_GAIN_MAX

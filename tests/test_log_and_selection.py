@@ -113,7 +113,9 @@ def test_derive_band_key_from_systems() -> None:
     # Default GUI state (every system, no opt-in) -> conservative narrow L1;
     # B1I is dropped by the runner instead of silently widening the stream.
     assert derive_band_key() == "l1"
-    assert derive_band_key(combine=True) == "all"
+    # combine only opts into the wide stream when B1I is explicitly enabled.
+    assert derive_band_key(combine=True) == "l1"
+    assert derive_band_key(combine=True, enable_beidou=True) == "all"
     # BeiDou only -> narrowband b1i.
     assert derive_band_key(
         enable_ca=False, enable_l1c=False, enable_galileo=False,
