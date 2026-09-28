@@ -362,7 +362,9 @@ class SimConfig:
     output_scale: float = 10000.0
     #: Reuse an existing IQ file instead of generating one (skip RINEX/engine).
     iq_input: str = ""
-    #: Load the whole ready IQ file into RAM and loop from memory.
+    #: Deprecated compatibility flag (CLI ``--iq-ram``): ready IQ files are
+    #: always decoded into RAM now (RAM-only playback), so the runner ignores
+    #: this value and the GUI no longer exposes it.
     iq_in_ram: bool = False
 
     use_usrp: bool = False

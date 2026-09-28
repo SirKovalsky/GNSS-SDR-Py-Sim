@@ -212,6 +212,24 @@ def list_devices(args: str = "") -> list[dict]:
         raise TxError(f"Поиск устройств не удался: {exc}") from exc
 
 
+def b210_present(args: str = "type=b200") -> bool:
+    """Return True when a USRP matching ``args`` is plugged in.
+
+    Never raises: a missing UHD install, a library problem or a discovery
+    timeout all return ``False`` so the GUI can fall back to file-only output
+    with a clear note instead of crashing.  This performs the same
+    ``uhd.find`` discovery as :func:`list_devices`.
+    """
+    try:
+        import uhd
+    except Exception:  # noqa: BLE001 - UHD отсутствует/не загрузился
+        return False
+    try:
+        return len(list(uhd.find(args))) > 0
+    except Exception:  # noqa: BLE001 - нет устройства/ошибка поиска
+        return False
+
+
 class UhdTxSink:
     """Streams ``complex64`` blocks to a USRP TX channel."""
 
@@ -324,6 +342,29 @@ class UhdTxSink:
     def gain_range(self) -> tuple[float, float]:
         """Device TX gain range ``(min, max)`` in dB."""
         return self._gain_range
+
+    def set_tx_gain(self, gain: float) -> float:
+        """Change TX gain on the running device and return the actual value.
+
+        The B210 supports ``set_tx_gain`` while streaming, so the GUI slider can
+        adjust the output power without stopping the run.  The value is clamped
+        to the range read at start-up; the device read-back is authoritative.
+        Safe to call after :meth:`close` (it then only records the request).
+        """
+        with self._lock:
+            if self.usrp is None:  # closed / never opened
+                self.gain = float(gain)
+                return self.gain
+            if self._gain_range[1] > self._gain_range[0]:
+                value, warn = clamp_gain(gain, self._gain_range)
+            else:
+                value, warn = float(gain), None
+            if warn and self.gain_warning is None:
+                self.gain_warning = warn
+                self._warn(warn)
+            self.usrp.set_tx_gain(float(value), self.channel)
+            self.gain = float(self.usrp.get_tx_gain(self.channel))
+            return self.gain
 
     def _make_streamer(self) -> None:
         uhd = self._uhd

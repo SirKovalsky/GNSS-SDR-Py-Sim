@@ -48,13 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "(генерация пропускается; .json рядом задаёт "
                         "sample_rate/format/center)")
     p.add_argument("--iq-ram", action="store_true",
-                   help="загрузить готовый IQ-файл целиком в RAM и "
-                        "зацикливать из памяти (по умолчанию — с диска)")
+                   help="устарело, оставлено для совместимости: готовый IQ-файл "
+                        "всегда загружается в RAM и зацикливается из памяти")
     p.add_argument("--format", default="cs16",
                    choices=["cf32", "cs16", "cs8", "cs4"],
                    help="IQ file format (default cs16)")
     p.add_argument("--scale", type=float, default=10000.0,
-                   help="float->integer sample scale")
+                   help="float->integer sample scale (в GUI не настраивается, "
+                        "внутреннее значение 10000)")
     p.add_argument("--no-ca", action="store_true", help="disable GPS L1 C/A")
     p.add_argument("--no-l1c", action="store_true", help="disable GPS L1C")
     p.add_argument("--no-galileo", action="store_true",

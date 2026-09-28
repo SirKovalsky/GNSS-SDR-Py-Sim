@@ -323,6 +323,10 @@ class _DuplexSink(Sink):
                  for i in idx]
         self._logf("Эхо, топ-3: " + ", ".join(parts))
 
+    def set_tx_gain(self, gain: float) -> float:
+        """Forward a live TX-gain change to the duplex radio (slider)."""
+        return float(self._duplex.set_tx_gain(gain))
+
     def close(self) -> None:
         self._duplex.close()
 
@@ -369,7 +373,12 @@ class SimulationRunner:
         self._level = level
         self._spec_last: dict[str, float] = {}
         self._level_last: dict[str, float] = {}
+        #: Serialises live TX-gain changes (slider) against the generator thread.
+        self._gain_lock = threading.Lock()
         self._stop = threading.Event()
+        #: Live pause: while set the generation/transmission loops wait between
+        #: blocks (the in-memory stream is preserved; see :meth:`_wait_if_paused`).
+        self._pause = threading.Event()
         self._thread: threading.Thread | None = None
         self.engine: SignalEngine | None = None
         self.sink: Sink | None = None
@@ -382,6 +391,11 @@ class SimulationRunner:
         self._max_seg_seconds = 0.0
         self._source: IqFileSource | None = None
         self._headroom: HeadroomController | None = None
+        #: RAM-only policy: set when the buffer that must live in RAM for a B210
+        #: transmission does not fit the free-RAM budget.  TX is then refused
+        #: (file generation may still proceed).
+        self._tx_blocked = False
+        self._tx_block_reason = ""
 
     # ------------------------------------------------------------------
     def _logf(self, msg: str) -> None:
@@ -590,6 +604,17 @@ class SimulationRunner:
         if getattr(cfg, "tx_check", False) and not cfg.use_usrp:
             self._logf("Контроль передачи: TX на B210 выключен — "
                        "проверка пропущена")
+        if cfg.use_usrp and getattr(self, "_tx_blocked", False):
+            # RAM-only policy: do not open the radio when the buffer does not
+            # fit.  Generation to a file is still allowed; with no output file
+            # there is nothing left to do, so abort with a clear error.
+            self._logf("TX на B210 не выполняется: " + self._tx_block_reason
+                       + " (продолжается только генерация файла).")
+            cfg.use_usrp = False
+            if ignore_file or not cfg.output:
+                raise ValueError(
+                    "Передача на B210 заблокирована: " + self._tx_block_reason
+                    + ". Задайте файл выхода, чтобы только сгенерировать IQ.")
         if cfg.use_usrp:
             self._warn_high_fs_tx()
             needs_rx = bool(cfg.monitor or getattr(cfg, "tx_check", False))
@@ -696,6 +721,34 @@ class SimulationRunner:
         else:
             self._segment_seconds = None
             self._logf("Зацикливание ВЫКЛ: полная запись")
+
+        # --- RAM-only TX policy: the buffer that must live in RAM for a B210
+        # transmission has to fit the free-RAM budget; otherwise warn and refuse
+        # TX (a file may still be generated).  Disk playback/streaming is never
+        # used — the throughput is insufficient.
+        if cfg.use_usrp and budget > 0 and cfg.fs:
+            if self._loop:
+                need_s = float(self._segment_seconds or 0.0)
+                explicit_overflow = bool(cfg.loop_seconds > 0.0
+                                         and cfg.loop_seconds > max_seg)
+            else:
+                need_s = req
+                explicit_overflow = False
+            need_bytes = int(need_s * cfg.fs * _TX_RAM_BYTES)
+            if need_bytes > budget or explicit_overflow:
+                self._tx_blocked = True
+                self._tx_block_reason = (
+                    f"буфер TX в RAM {need_s:.1f} с (~"
+                    f"{sysinfo.human(need_bytes)}) превышает бюджет "
+                    f"{sysinfo.human(int(budget))} (до {max_seg:.1f} с)")
+                self._logf(
+                    "ВНИМАНИЕ: " + self._tx_block_reason + " — передача на "
+                    "B210 ЗАБЛОКИРОВАНА (политика: только RAM). Файл IQ, если "
+                    "задан, будет сгенерирован без передачи.")
+                self._logf(
+                    "Решение: TX не запускается. Уменьшите fs/длительность "
+                    "или освободите память; «Зациклить сегмент (RAM)» с "
+                    "авто-сегментом или узкая полоса уменьшают буфер.")
 
         if cfg.output:
             free = sysinfo.disk_free(os.path.dirname(cfg.output) or ".")
@@ -1006,7 +1059,12 @@ class SimulationRunner:
 
     # ------------------------------------------------------------------
     def _prepare_source(self) -> None:
-        """Route to an existing IQ file (feature «готовый IQ-файл»)."""
+        """Route to an existing IQ file (feature «готовый IQ-файл»).
+
+        RAM-only policy: playback always decodes the whole file into RAM; a file
+        that does not fit the free-RAM budget is rejected with a clear error
+        (disk streaming is never used — the throughput is insufficient).
+        """
         cfg = self.cfg
         path = cfg.iq_input
         if not os.path.exists(path):
@@ -1014,13 +1072,12 @@ class SimulationRunner:
         self._source = IqFileSource(
             path, fmt=cfg.output_format, fs=cfg.fs,
             center_freq=cfg.center_freq, scale=cfg.output_scale,
-            load_to_ram=bool(getattr(cfg, "iq_in_ram", False)),
+            load_to_ram=True,
             log=self._logf)
         self._source.start()
         self._logf("Повторное использование IQ: " + self._source.describe())
-        self._logf("Источник воспроизведения: "
-                   + ("RAM (файл загружен в память)"
-                      if self._source.in_ram else "диск (потоковое чтение)"))
+        self._logf("Источник воспроизведения: RAM (политика — только RAM; "
+                   "файл целиком загружен в память)")
         # A recorded IQ file carries its original GPS/Galileo time (TOW/HOW) in
         # the modulation; the runner only shifts a live synthesis clock, so the
         # replay time CANNOT be moved to `start_text`.  Say so explicitly —
@@ -1050,21 +1107,23 @@ class SimulationRunner:
 
     def _plan_source(self) -> None:
         cfg = self.cfg
-        src = self._source
-        assert src is not None
+        # Honour the loop checkbox for playback: checked = repeat (until «Стоп»
+        # with no duration, or up to the duration), unchecked = play the file
+        # once.  (Do NOT force looping when the duration is 0 — that ignored the
+        # user's choice.)
         self._loop = bool(cfg.loop)
-        if cfg.duration and cfg.duration > 0:
-            self._loop = bool(cfg.loop)
-        else:
-            self._loop = True  # indefinite playback
         kind = "B210" if cfg.use_usrp else "нет (только проверка)"
-        source_kind = ("RAM (файл загружен в память)" if src.in_ram
-                       else f"диск ({src.path})")
+        if self._loop:
+            tail = (f"; длительность {cfg.duration:.1f} с"
+                    if cfg.duration and cfg.duration > 0 else "; до «Стоп»")
+        else:
+            tail = ("; однократно"
+                    if not (cfg.duration and cfg.duration > 0)
+                    else f"; до {cfg.duration:.1f} с")
         self._logf(
-            f"Источник зацикливания: {source_kind}; "
+            f"Источник зацикливания: RAM (файл целиком в памяти); "
             f"передача: {kind}; повтор: {'ВКЛ' if self._loop else 'ВЫКЛ'}"
-            + (f"; длительность {cfg.duration:.1f} с"
-               if cfg.duration and cfg.duration > 0 else "; до «Стоп»"))
+            + tail)
 
     def _run_source(self) -> int:
         """Play/validate an existing IQ file; returns produced samples."""
@@ -1076,8 +1135,9 @@ class SimulationRunner:
         t0 = time.time()
 
         if not cfg.use_usrp:
-            self._logf("Передача на B210 выключена: файл только проверяется "
-                       "и описывается (плей в никуда)")
+            self._logf("Передача на B210 недоступна (устройство не обнаружено "
+                       "или TX запрещён): файл только проверяется и "
+                       "описывается — в эфир ничего не идёт.")
             first = src.read(block)
             if first.size == 0:
                 raise ValueError(f"IQ-файл пуст или нечитаем: {src.path}")
@@ -1089,16 +1149,16 @@ class SimulationRunner:
 
         duration = cfg.duration if cfg.duration and cfg.duration > 0 else None
         target = int(duration * cfg.fs) if duration else None
+        total = int(src.total_samples) or 1
         assert self.sink is not None
         src.seek_start()
         while not self._stop.is_set():
+            self._wait_if_paused()
             b = src.read(block)
             if b.size == 0:
                 if self._loop:
                     src.seek_start()
-                    self._logf("Лууп (RAM): возврат в начало"
-                               if src.in_ram else
-                               "Лууп (диск): возврат в начало файла")
+                    self._logf("Лууп (RAM): возврат в начало")
                     continue
                 break
             if target is not None:
@@ -1113,8 +1173,17 @@ class SimulationRunner:
             if self._progress is not None:
                 wall = max(1e-9, time.time() - t0)
                 sim_s = produced / cfg.fs
-                frac = (produced / target) if target else 0.0
+                # Reflect the actual playback position: within the requested
+                # duration when finite, otherwise the position inside the file
+                # (so a looping replay visibly advances every pass).
+                frac = (min(1.0, produced / target) if target
+                        else (produced % total) / total)
                 self._progress(frac, sim_s, wall, sim_s / wall)
+            if self._phase is not None:
+                pfrac = (min(1.0, produced / target) if target
+                         else ((produced % total) / total))
+                self._phase("tx", pfrac, produced // total,
+                            produced / cfg.fs, bool(self._loop))
             if target is not None and produced >= target:
                 break
         return produced
@@ -1146,6 +1215,7 @@ class SimulationRunner:
                 return self._run_tx_stream(total, block, t0)
             log_progress = self._milestone_logger("Идёт генерация")
             while not self._stop.is_set():
+                self._wait_if_paused()
                 n = block
                 if total is not None:
                     n = min(block, total - produced)
@@ -1189,6 +1259,7 @@ class SimulationRunner:
         log_progress = self._milestone_logger("Идёт генерация")
         produced = 0
         while not self._stop.is_set() and produced < total:
+            self._wait_if_paused()
             n = min(block, total - produced)
             samples = self.engine.generate_block(n)
             samples = self._headroom_ctl().process_block(samples)
@@ -1226,6 +1297,7 @@ class SimulationRunner:
         buf: list = []
         got = 0
         while got < seg_total and not self._stop.is_set():
+            self._wait_if_paused()
             n = min(block, seg_total - got)
             b = np.asarray(self.engine.generate_block(n), dtype=np.complex64)
             buf.append(b)
@@ -1271,6 +1343,7 @@ class SimulationRunner:
             boost_thread_priority()
             try:
                 while not stop.is_set():
+                    self._wait_if_paused()
                     b = self.engine.generate_block(gen_block)
                     gen_blocks += 1
                     b = self._headroom_ctl().process_block(
@@ -1302,6 +1375,7 @@ class SimulationRunner:
         pending = deque(buf)
         live = False
         while not self._stop.is_set():
+            self._wait_if_paused()
             if pending:
                 b = pending.popleft()
             else:
@@ -1384,6 +1458,7 @@ class SimulationRunner:
             "TX: передача начнётся только после предгенерации сегмента в RAM; "
             "светодиод TX загорится по её завершении")
         while got < target and not self._stop.is_set():
+            self._wait_if_paused()
             n = min(block, target - got)
             # Store the RAM segment as complex64 (half of complex128) so a
             # 25 Msps combined segment stays comfortably in memory.
@@ -1431,6 +1506,7 @@ class SimulationRunner:
         within = 0
         loops = 0
         while not self._stop.is_set():
+            self._wait_if_paused()
             for b in blocks:
                 # Honour «Стоп» within one block, not after the whole segment.
                 if self._stop.is_set():
@@ -1544,6 +1620,7 @@ class SimulationRunner:
             try:
                 got = 0
                 while not stop.is_set():
+                    self._wait_if_paused()
                     if target is not None and got >= target:
                         break
                     n = block if target is None else min(block, target - got)
@@ -1572,6 +1649,7 @@ class SimulationRunner:
         gen_t0 = stream_t0
         health = _TxHealthJournal(self._logf)
         while True:
+            self._wait_if_paused()
             try:
                 item = q.get(timeout=0.2)
             except queue.Empty:
@@ -1661,6 +1739,69 @@ class SimulationRunner:
 
     def stop(self) -> None:
         self._stop.set()
+        self._pause.clear()  # a paused wait must observe the stop at once
+
+    def pause(self) -> None:
+        """Pause generation/transmission between blocks (stream kept in RAM)."""
+        self._pause.set()
+
+    def resume(self) -> None:
+        self._pause.clear()
+
+    def is_paused(self) -> bool:
+        return self._pause.is_set()
+
+    def toggle_pause(self) -> bool:
+        """Flip the pause state; return the new ``is_paused`` value."""
+        if self._pause.is_set():
+            self._pause.clear()
+        else:
+            self._pause.set()
+        return self._pause.is_set()
+
+    def _wait_if_paused(self) -> None:
+        """Block while paused, but stay responsive to :meth:`stop`.
+
+        Pausing happens *between* blocks: the samples already produced stay in
+        RAM and the stream resumes from exactly the same position.  For a live
+        B210 transmission this suspends the sample feed for the duration of the
+        pause (the radio may underflow/log a gap), which is documented in the
+        GUI: the file path pauses losslessly, the air path pauses the feed.
+        """
+        while self._pause.is_set() and not self._stop.is_set():
+            time.sleep(0.05)
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    # ------------------------------------------------------------------
+    def set_tx_gain(self, db: float) -> float | None:
+        """Change TX gain on the *live* sink, safe while transmitting.
+
+        The B210 supports ``set_tx_gain`` at runtime, so the GUI slider can
+        retune the output power without stopping the run.  The request is
+        forwarded to the active ``UhdTxSink``/``_DuplexSink``, which clamps it to
+        the device range and returns the value actually applied.
+
+        Returns the applied value, or ``None`` when nothing is transmitting (the
+        new value is then only remembered in ``cfg.tx_gain`` for the next run).
+        Never raises for a closed/foreign sink: the GUI must stay responsive.
+        """
+        db = float(db)
+        with self._gain_lock:
+            sink = self.sink
+            setter = getattr(sink, "set_tx_gain", None)
+            if sink is None or setter is None:
+                self.cfg.tx_gain = db  # remembered for the next run
+                return None
+            try:
+                applied = float(setter(db))
+            except Exception as exc:  # noqa: BLE001 - device may be gone
+                self._logf(f"Не удалось изменить мощность TX на лету: {exc}")
+                self.cfg.tx_gain = db
+                return None
+            # Keep the clamped, device-confirmed value for a later run.
+            self.cfg.tx_gain = applied
+        self._logf(f"Мощность TX изменена на лету: запрошено {db:g} дБ, "
+                   f"применено {applied:g} дБ")
+        return applied

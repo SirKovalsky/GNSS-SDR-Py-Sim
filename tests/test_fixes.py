@@ -372,7 +372,9 @@ def test_gui_generate_iq_disables_usrp(monkeypatch) -> None:
 
     monkeypatch.setattr(gui, "SimulationRunner", FakeRunner)
     try:
-        win.cb_tx.setChecked(True)
+        # Even with a B210 available, «Сгенерировать IQ» is file-only.
+        win._b210_override = True
+        win._detect_b210()
         win.ed_out.setText("out.cs16")
         win._generate_iq()
         assert captured["cfg"].use_usrp is False

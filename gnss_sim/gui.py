@@ -24,6 +24,7 @@ import math
 import os
 import sys
 import threading
+import time
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -46,6 +47,18 @@ _IQ_INPUT_FILTER = "IQ (*.cs16 *.cf32 *.cs8 *.cs4 *.bin *.iq);;Все файлы
 _DEFAULT_FS = 2600000
 _DEFAULT_FC = 1575420000
 _DEFAULT_OUT = "gnss_sim_output.cs16"
+#: Internal float→int scale for integer IQ files (cs16: full scale
+#: 32767/scale).  The control was removed from the GUI (the user finds it
+#: unnecessary); the historic, receiver-verified value is kept here.  The CLI
+#: ``--scale`` flag is still accepted for compatibility.
+_DEFAULT_OUTPUT_SCALE = 10000.0
+
+#: B210 TX gain range [dB] and the slider resolution (0.25 dB steps): the
+#: slider value is ``round(dB * _TX_GAIN_STEPS_PER_DB)``.
+_B210_TX_GAIN_MAX = 89.75
+_B210_TX_GAIN_MIN = 0.0
+_TX_GAIN_STEPS_PER_DB = 4
+_DEFAULT_TX_GAIN = 10.0
 
 #: Output extensions that track the format combo (B5).
 _IQ_EXTS = (".cs16", ".cf32", ".cs8", ".cs4", ".bin", ".iq")
@@ -89,25 +102,46 @@ class _DateLockedDateTimeEdit(QtWidgets.QDateTimeEdit):
 
 
 class _WheelGuard(QtCore.QObject):
-    """Ignore mouse-wheel changes for a combo box unless its popup is open.
+    """Ignore mouse-wheel value changes unless the widget is active.
 
-    Qt's default behaviour lets a stray wheel scroll silently change a combo
-    value.  This filter swallows the wheel event while the dropdown is closed
-    (so scrolling the settings page never edits values), while still allowing
-    scrolling inside the open popup.
+    Qt's default behaviour lets a stray wheel scroll silently change a value
+    while the user only wanted to scroll the settings page.  This filter covers
+    both kinds of input:
+
+    * a ``QComboBox`` may change only while its popup is open;
+    * a numeric input (``QSpinBox`` / ``QDoubleSpinBox`` / ``QDateTimeEdit``)
+      may change only while it has keyboard focus.
+
+    Everything else swallows the wheel event (and marks it handled), so the
+    page can scroll but no value is edited.
     """
 
-    def __init__(self, combo: QtWidgets.QComboBox) -> None:
-        super().__init__(combo)
-        self._combo = combo
+    def __init__(self, widget: QtWidgets.QWidget) -> None:
+        super().__init__(widget)
+        self._widget = widget
+
+    def _popup_open(self) -> bool:
+        view = getattr(self._widget, "view", None)
+        if view is None:
+            return False
+        try:
+            return bool(view.isVisible())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _focused(self) -> bool:
+        try:
+            return bool(self._widget.hasFocus())
+        except Exception:  # noqa: BLE001
+            return False
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.Wheel:
-            try:
-                popup_open = self._combo.view().isVisible()
-            except Exception:  # noqa: BLE001
-                popup_open = False
-            if not popup_open:
+            # Combos keep the historical rule (popup only); numeric inputs are
+            # editable by wheel only once focused.
+            allowed = (self._popup_open() if hasattr(self._widget, "view")
+                       else self._focused())
+            if not allowed:
                 event.ignore()
                 return True
         return False
@@ -120,10 +154,22 @@ USRP B210 в эфир.</p>
 <ul>
 <li><b>«Сгенерировать IQ»</b> — только записать IQ-файл (передача на B210
 выключена).</li>
-<li><b>«Старт»</b> — записать IQ-файл, если задан файл выхода; передать в эфир,
-если отмечено «Передавать на B210»; если отмечено и то и другое — сделать
-оба действия.</li>
-<li><b>«Стоп»</b> — остановить генерацию/передачу.</li>
+<li><b>«Старт»</b> — запустить сеанс. Если B210 <b>обнаружен</b>, сигнал
+<b>автоматически идёт в эфир</b> — отдельной галочки/кнопки передачи нет;
+состояние показано на вкладке «Базовые» (группа «Передача на B210 (авто)»).
+Если B210 не найден, выполняется только запись/генерация файла.</li>
+<li><b>«Пауза»/«Продолжить»</b> — приостанавливает и возобновляет генерацию и
+подачу отсчётов <i>между блоками</i>, не теряя уже сформированный поток.
+Для файла — без потерь; при живой передаче на B210 поток на время паузы
+прекращает подаваться (радио может показать underflow/разрыв) и продолжается
+с того же места. «Стоп» работает и во время паузы.</li>
+<li><b>«Воспроизвести»</b> — проиграть последний сгенерированный IQ-файл или
+файл, выбранный в поле «Готовый IQ» (то же поле с кнопкой «…»), из RAM; при
+наличии B210 — с передачей в эфир.</li>
+<li><b>«Стоп»</b> — остановить генерацию/передачу (в т.ч. из паузы).</li>
+<li>Кнопки, галочка <b>«Зациклить сегмент (RAM)»</b> и выбор готового IQ-файла
+находятся в одной группе <b>«Управление воспроизведением»</b> на вкладке
+«Генерация».</li>
 </ul>
 
 <h3>Сигналы — единственный выбор систем</h3>
@@ -159,35 +205,45 @@ USRP B210 в эфир.</p>
 <ul>
 <li>Отметьте <b>«Использовать готовый IQ-файл»</b> и укажите файл — генерация
 полностью пропускается (RINEX и синтез не нужны).</li>
+<li>Воспроизведение идёт <b>только из RAM</b>, но буфер хранится в
+<b>нативном формате</b> (например, <code>cs16</code> = 4 Б/отсчёт), поэтому
+ему нужно ≈ размеру файла, а не вчетверо больше; блоки конвертируются
+на лету. Если файл не влезает в свободную память — понятная ошибка, передача
+не запускается.</li>
 <li>Если рядом есть side-car <code>&lt;файл&gt;.json</code>, из него берутся
 <code>sample_rate</code>, <code>format</code>, <code>center_freq</code>;
 если нет — используются значения из настроек (в журнал пишется
 предупреждение).</li>
-<li>При включённой передаче на B210 файл проигрывается (с зацикливанием —
-возврат к началу файла на диске); при выключенной он только проверяется и
-описывается.</li>
+<li>При наличии B210 файл проигрывается из памяти (с зацикливанием) и идёт в
+эфир; без B210 он только проверяется и описывается.</li>
+</ul>
+
+<h3>Мощность TX</h3>
+<ul>
+<li><b>«Мощность TX»</b> — строка <b>подпись | ползунок | значение</b> на
+вкладке <b>«Базовые»</b> (группа «Передача на B210 (авто)»): значение в дБ
+всегда видно справа от ползунка и обновляется при перетаскивании. Диапазон
+B210 <b>0..89.75 дБ</b>, значение зажимается; по умолчанию <b>+10 дБ</b>.</li>
+<li>Фактический диапазон усиления устройства читается после старта и
+пишется в журнал; при выходе за него значение зажимается с предупреждением.</li>
+<li>Мощность можно менять <b>во время передачи</b>: ползунок применяется к
+живому B210 на лету (<code>set_tx_gain</code>), а применённое/фактическое
+значение пишется в журнал.</li>
 </ul>
 
 <h3>Поля режима и памяти</h3>
 <ul>
 <li><b>Длительность</b> — сколько секунд сигнала сгенерировать/записать (0 —
 бесконечно, до «Стоп»). При передаче на B210 вместе с зацикливанием
-длительность не ограничивает эфир: сегмент передаётся непрерывно до «Стоп»
-(для приёмника длительность по-прежнему задаёт длину файла и не-loop передачу).</li>
+длительность не ограничивает эфир: сегмент передаётся непрерывно до «Стоп».</li>
 <li><b>Зацикливать сегмент (RAM)</b> — сгенерировать сегмент в оперативную
 память и повторять его. Для файла сегмент пишется один раз; для передачи на
-B210 (TX) это <b>непрерывная передача до кнопки «Стоп»</b> (длительность
-игнорируется, пока включено зацикливание).</li>
-<li><b>Длина сегмента</b> — длина зацикливаемого сегмента (0 — автоматически:
-<code>min(длительность, что влезает в бюджет RAM)</code>). Если заданная
-длительность помещается в RAM, генерируется ровно она (один сегмент) даже
-при включённом зацикливании. Урезается (с предупреждением и округлением до
-кратного 30/18 с, т.е. 90 с) только когда не влезает. В журнале указывается,
-источник зацикливания — RAM или диск.</li>
-<li><b>Бюджет RAM</b> — сколько оперативной памяти разрешено занять сегменту
-(0 — 60 % доступной).</li>
-<li><b>по умолчанию</b> у каждой группы сбрасывает только её настройки;
-логин/пароль/токен CDDIS при этом не затрагиваются.</li>
+B210 (TX) это <b>непрерывная передача до кнопки «Стоп»</b>.</li>
+<li>Сегмент и бюджет RAM <b>вычисляются автоматически</b> (по умолчанию 60 %
+свободной памяти): отдельных полей «Длина сегмента»/«Бюджет RAM» больше нет.
+Если буфер сегмента или готовый IQ-файл не помещается в свободную память,
+<b>передача на B210 блокируется</b> с предупреждением (файл, если задан, всё
+равно генерируется).</li>
 </ul>
 
 <h3>RINEX-эфемериды</h3>
@@ -353,6 +409,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_cfg: SimConfig | None = None
         self._truck_result: dict | None = None
         self._anim_idx = 0.0
+        #: Throttle for the «Мощность TX» live-change journal lines.
+        self._tx_gain_log_ts = 0.0
+        #: Ready-IQ file last generated/replayed by this window (used by
+        #: «Воспроизвести» when the chooser is empty).
+        self._last_iq_file: str = ""
+        #: B210 auto-transmit: availability is probed from the GUI (never in
+        #: headless tests).  ``_b210_override`` lets tests force the state.
+        self._b210_available = False
+        self._b210_override: bool | None = None
+        self._b210_checked = False
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._anim_tick)
         self._nmea: ublox.NmeaReader | None = None
@@ -361,6 +427,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._nmea_timer.setInterval(500)
         self._nmea_timer.timeout.connect(self._update_ublox)
         self._build_ui()
+        # Every numeric input ignores the mouse wheel unless focused, so
+        # scrolling the settings page cannot change values by accident.
+        self._guard_spinboxes()
         # Native UHD text (minus the U/O markers) goes to the GUI log, never to
         # the console.  run.py installs the fd-2 capture before importing UHD;
         # this just points it at the log widget.
@@ -417,12 +486,32 @@ class MainWindow(QtWidgets.QMainWindow):
         btn.clicked.connect(slot)
         return btn
 
-    def _guard_combo(self, combo: QtWidgets.QComboBox):
+    def _guard_widget(self, widget: QtWidgets.QWidget):
         """Install the wheel guard and keep a reference for direct testing."""
-        guard = _WheelGuard(combo)
-        combo.installEventFilter(guard)
-        combo._wheel_guard = guard  # type: ignore[attr-defined]
+        guard = _WheelGuard(widget)
+        widget.installEventFilter(guard)
+        widget._wheel_guard = guard  # type: ignore[attr-defined]
         return guard
+
+    def _guard_combo(self, combo: QtWidgets.QComboBox):
+        """Install the wheel guard on a combo box."""
+        return self._guard_widget(combo)
+
+    def _guard_spinboxes(self) -> int:
+        """Install the wheel guard on every numeric input in the window.
+
+        Covers ``QSpinBox``/``QDoubleSpinBox`` and ``QDateTimeEdit`` (all are
+        ``QAbstractSpinBox``): the wheel changes a value only while that input
+        is focused, so scrolling the settings page never edits anything by
+        accident.  Called once after the UI is built.
+        """
+        installed = 0
+        for spin in self.findChildren(QtWidgets.QAbstractSpinBox):
+            if hasattr(spin, "_wheel_guard"):
+                continue
+            self._guard_widget(spin)
+            installed += 1
+        return installed
 
     # ------------------------------------------------------------------
     def _build_basic_tab(self) -> QtWidgets.QWidget:
@@ -1031,80 +1120,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._guard_combo(self.cmb_fmt)
         self.cmb_fmt.currentTextChanged.connect(self._on_format_changed)
         _row(f3, 1, "Формат", self.cmb_fmt)
-        self.sp_scale = QtWidgets.QDoubleSpinBox(); self.sp_scale.setRange(1, 1e7)
-        self.sp_scale.setValue(10000.0)
-        _row(f3, 2, "Масштаб в int", self.sp_scale)
+        # «Масштаб в int» был убран (пользователь считает его ненужным): для
+        # целочисленных форматов используется внутренний проверенный масштаб
+        # _DEFAULT_OUTPUT_SCALE.  Флаг CLI --scale оставлен для совместимости.
         self.lbl_format_hint = QtWidgets.QLabel(
-            "cs8/cs4 вдвое уменьшают поток (2 Б/отсчёт вместо 4); при "
-            "30 Мвыб/с сегмент в RAM может упираться в бюджет — уменьшите "
-            "длительность/сегмент или включите потоковую передачу.")
+            "cs8/cs4 вдвое уменьшают поток (2 Б/отсчёт вместо 4). Масштаб "
+            "float→int для целочисленных форматов задан внутренним значением "
+            f"({_DEFAULT_OUTPUT_SCALE:g}) и в GUI не настраивается. При "
+            "30 Мвыб/с сегмент в RAM большой — сегмент урезается "
+            "автоматически, а TX блокируется, если не влезает в память.")
         self.lbl_format_hint.setWordWrap(True)
-        f3.addWidget(self.lbl_format_hint, 3, 0, 1, 2)
+        f3.addWidget(self.lbl_format_hint, 2, 0, 1, 2)
 
-        # --- reuse an existing IQ file (generation is skipped) ------------
-        self.cb_iq_in = QtWidgets.QCheckBox("Использовать готовый IQ-файл")
-        self.cb_iq_in.setToolTip(
-            "Генерация пропускается: файл читается и, если включён B210, "
-            "передаётся в эфир; иначе только проверяется и описывается.\n"
-            "Если рядом есть <файл>.json — sample_rate/format/center_freq "
-            "берутся из него; иначе используются значения из настроек.")
-        f3.addWidget(self.cb_iq_in, 4, 0, 1, 2)
-        self.ed_iq_in = QtWidgets.QLineEdit("")
-        self.ed_iq_in.setPlaceholderText("путь к готовому IQ-файлу")
-        self.ed_iq_in.setEnabled(False)
-        btn_iq = QtWidgets.QPushButton("…")
-        btn_iq.setFixedWidth(32)
-        btn_iq.clicked.connect(
-            lambda: self._browse(self.ed_iq_in, "Готовый IQ-файл",
-                                 _IQ_INPUT_FILTER, "Все файлы (*)"))
-        btn_iq.setEnabled(False)
-        r_iq = QtWidgets.QHBoxLayout()
-        r_iq.addWidget(self.ed_iq_in)
-        r_iq.addWidget(btn_iq)
-        self._btn_iq_in = btn_iq
-        self.cb_iq_in.toggled.connect(self.ed_iq_in.setEnabled)
-        self.cb_iq_in.toggled.connect(btn_iq.setEnabled)
-        _row(f3, 5, "Готовый IQ", self._wrap(r_iq))
-        # The verbose side-car note moved into the tooltip of the checkbox.
-        self.cb_iq_ram = QtWidgets.QCheckBox(
-            "Загрузить IQ в RAM (зацикливать из памяти)")
-        self.cb_iq_ram.setToolTip(
-            "Прочитать готовый IQ-файл целиком в оперативную память и "
-            "зацикливать из неё (быстрее, но нужен объём RAM под весь файл). "
-            "По умолчанию — потоковое чтение с диска.")
-        self.cb_iq_ram.setChecked(False)
-        self.cb_iq_ram.setEnabled(False)
-        self.cb_iq_in.toggled.connect(self.cb_iq_ram.setEnabled)
-        f3.addWidget(self.cb_iq_ram, 6, 0, 1, 2)
-
-        self.cb_loop = QtWidgets.QCheckBox("Зацикливать сегмент (RAM)")
-        self.cb_loop.setChecked(True)
-        self.cb_loop.setToolTip(
-            "Для файла: сегмент генерируется один раз и пишется один раз.\n"
-            "Для передачи на B210 (TX): непрерывная передача сегмента до "
-            "кнопки «Стоп» — «Длительность» в эфире не ограничивает.")
-        f3.addWidget(self.cb_loop, 7, 0, 1, 2)
-        self.sp_loop = QtWidgets.QDoubleSpinBox(); self.sp_loop.setRange(0, 86400)
-        self.sp_loop.setValue(0.0); self.sp_loop.setSuffix(" с (0=авто)")
-        self.sp_loop.setToolTip(
-            "Длина зацикливаемого сегмента в RAM (0 — авто). При TX с "
-            "зацикливанием передача идёт до «Стоп».")
-        _row(f3, 8, "Длина сегмента", self.sp_loop)
-        self.sp_mem = QtWidgets.QDoubleSpinBox(); self.sp_mem.setRange(0, 1024)
-        self.sp_mem.setValue(0.0); self.sp_mem.setSuffix(" ГБ (0=60%)")
-        _row(f3, 9, "Бюджет RAM", self.sp_mem)
+        # The «Использовать готовый IQ-файл» chooser and the
+        # «Зацикливать сегмент (RAM)» checkbox live on the «Генерация» tab
+        # next to the playback buttons (one obvious place for every playback
+        # control), so the output group only holds the file/format here.
         self.lbl_ram = QtWidgets.QLabel()
-        f3.addWidget(self.lbl_ram, 10, 0, 1, 2)
+        self.lbl_ram.setWordWrap(True)
+        f3.addWidget(self.lbl_ram, 3, 0, 1, 2)
         try:
             from .sysinfo import available_ram, human, total_ram
+            avail = available_ram()
             self.lbl_ram.setText(
-                f"RAM: {human(available_ram())} свободно из {human(total_ram())}")
+                f"RAM: {human(avail)} свободно из {human(total_ram())}. "
+                "Передача идёт только из RAM: если буфер сегмента/файла не "
+                "влезает в свободную память, TX блокируется, а файл может "
+                "быть сгенерирован.")
         except Exception:
             pass
         f3.addWidget(self._group_reset_btn(
             self._reset_output_group,
-            "Сбросить только выход IQ (готовый файл, формат, лууп)"),
-            11, 0, 1, 2)
+            "Сбросить только выход IQ (формат, готовый файл, лууп)"),
+            4, 0, 1, 2)
         return g_out
 
     def _on_format_changed(self, fmt: str) -> None:
@@ -1119,13 +1167,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_output_group(self) -> None:
         self.ed_out.setText(_DEFAULT_OUT)
         self.cmb_fmt.setCurrentText("cs16")
-        self.sp_scale.setValue(10000.0)
         self.cb_iq_in.setChecked(False)
         self.ed_iq_in.setText("")
-        self.cb_iq_ram.setChecked(False)
         self.cb_loop.setChecked(True)
-        self.sp_loop.setValue(0.0)
-        self.sp_mem.setValue(0.0)
 
     def _build_rf_group(self) -> QtWidgets.QGroupBox:
         g_rf = QtWidgets.QGroupBox("Радиотракт (вычисляется)")
@@ -1335,17 +1379,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_date.setText(self._default_date_text())
 
     def _build_tx_group(self) -> QtWidgets.QGroupBox:
-        """B210 TX checkbox on the main tab (B6); wiring is unchanged."""
-        g = QtWidgets.QGroupBox("Передача на B210")
+        """B210 auto-transmit status + TX power slider (basic tab).
+
+        The old «Передавать на B210» checkbox is gone: «Старт» and
+        «Воспроизвести» transmit automatically when a B210 is detected; with no
+        device the run is file-only and the indicator says so.
+        """
+        g = QtWidgets.QGroupBox("Передача на B210 (авто)")
         f = QtWidgets.QGridLayout(g)
-        self.cb_tx = QtWidgets.QCheckBox(
-            "Передавать на B210 (в эфир, в дополнение к IQ-файлу)")
-        self.cb_tx.setChecked(False)
-        self.cb_tx.setToolTip(
-            "Снято: только IQ-файл. Отмечено: передавать в эфир через B210; "
-            "если файл выхода тоже задан — и файл, и эфир. Параметры B210 — "
-            "на вкладке «Дополнительные».")
-        f.addWidget(self.cb_tx, 0, 0, 1, 2)
+        self.lbl_b210 = QtWidgets.QLabel("B210 не проверен")
+        self.lbl_b210.setWordWrap(True)
+        self.lbl_b210.setTextFormat(QtCore.Qt.RichText)
+        f.addWidget(self.lbl_b210, 0, 0, 1, 3)
+
+        self.sl_tx_gain = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sl_tx_gain.setRange(
+            int(round(_B210_TX_GAIN_MIN * _TX_GAIN_STEPS_PER_DB)),
+            int(round(_B210_TX_GAIN_MAX * _TX_GAIN_STEPS_PER_DB)))
+        self.sl_tx_gain.setSingleStep(1)
+        self.sl_tx_gain.setPageStep(_TX_GAIN_STEPS_PER_DB)
+        self.sl_tx_gain.setValue(
+            int(round(_DEFAULT_TX_GAIN * _TX_GAIN_STEPS_PER_DB)))
+        self.sl_tx_gain.setToolTip(
+            "Мощность (усиление) TX B210. Диапазон устройства 0..89.75 дБ "
+            "показан в журнале после старта, значение зажимается в этот "
+            "диапазон.")
+        # Layout matches the other settings rows: label | slider | value.  All
+        # spare width goes to the value column (stretch=1) and the value label is
+        # left-aligned, so the dB reading stays immediately to the right of the
+        # slider instead of being pushed off-screen; it updates while dragging.
+        self.lbl_tx_gain = QtWidgets.QLabel(f"{self._tx_gain_db():.2f} дБ")
+        self.lbl_tx_gain.setMinimumWidth(78)
+        self.lbl_tx_gain.setAlignment(QtCore.Qt.AlignLeft
+                                      | QtCore.Qt.AlignVCenter)
+        self.sl_tx_gain.setMinimumWidth(140)
+        f.addWidget(QtWidgets.QLabel("Мощность TX"), 1, 0)
+        f.addWidget(self.sl_tx_gain, 1, 1)
+        f.addWidget(self.lbl_tx_gain, 1, 2)
+        f.setColumnStretch(0, 0)
+        f.setColumnStretch(1, 0)
+        f.setColumnStretch(2, 1)
+        self.sl_tx_gain.valueChanged.connect(self._on_tx_gain_changed)
+        self.sl_tx_gain.sliderReleased.connect(self._on_tx_gain_released)
+
+        note = QtWidgets.QLabel(
+            "«Старт» и «Воспроизвести» передают в эфир автоматически, если "
+            "B210 обнаружен; иначе — только файл (в эфир ничего не идёт).")
+        note.setWordWrap(True)
+        f.addWidget(note, 2, 0, 1, 3)
+        self.btn_b210 = QtWidgets.QPushButton("Проверить B210")
+        self.btn_b210.clicked.connect(lambda: self._detect_b210(force=True))
+        f.addWidget(self.btn_b210, 3, 0, 1, 3)
         return g
 
     def _build_uhd_group(self) -> QtWidgets.QGroupBox:
@@ -1355,38 +1439,36 @@ class MainWindow(QtWidgets.QMainWindow):
         _row(f5, 0, "UHD args", self.ed_args)
         self.sp_ch = QtWidgets.QSpinBox(); self.sp_ch.setRange(0, 1)
         _row(f5, 1, "TX канал", self.sp_ch)
-        self.sp_txg = QtWidgets.QDoubleSpinBox(); self.sp_txg.setRange(-90, 90)
-        self.sp_txg.setValue(10.0); self.sp_txg.setSuffix(" дБ")
-        _row(f5, 2, "TX усиление", self.sp_txg)
         self.ed_ant = QtWidgets.QLineEdit("TX/RX")
-        _row(f5, 3, "Антенна", self.ed_ant)
+        _row(f5, 2, "Антенна", self.ed_ant)
         self.sp_bw = QtWidgets.QDoubleSpinBox(); self.sp_bw.setRange(0, 56e6)
         self.sp_bw.setDecimals(0); self.sp_bw.setValue(0.0)
         self.sp_bw.setSuffix(" Гц (0=авто)")
-        _row(f5, 4, "Полоса TX", self.sp_bw)
+        _row(f5, 3, "Полоса TX", self.sp_bw)
         self.cmb_clk = QtWidgets.QComboBox()
         self.cmb_clk.addItems(["internal", "external", "gpsdo"])
         self._guard_combo(self.cmb_clk)
-        _row(f5, 5, "Опорная частота", self.cmb_clk)
+        _row(f5, 4, "Опорная частота", self.cmb_clk)
         btn_find = QtWidgets.QPushButton("Найти устройства")
         btn_find.clicked.connect(self._find_devices)
-        f5.addWidget(btn_find, 6, 0, 1, 3)
+        f5.addWidget(btn_find, 5, 0, 1, 3)
         self.lbl_tx_info = QtWidgets.QLabel(
-            "Фактические частота дискретизации и полоса читаются с B210 "
-            "после запуска и пишутся в журнал (TX gain зажимается в диапазон "
-            "устройства с предупреждением).")
+            "Мощность TX задаётся ползунком «Мощность TX» на вкладке "
+            "«Базовые» (диапазон B210 0..89.75 дБ, зажимается). Фактические "
+            "частота дискретизации и полоса читаются с B210 после запуска и "
+            "пишутся в журнал.")
         self.lbl_tx_info.setWordWrap(True)
-        f5.addWidget(self.lbl_tx_info, 7, 0, 1, 3)
+        f5.addWidget(self.lbl_tx_info, 6, 0, 1, 3)
         f5.addWidget(self._group_reset_btn(self._reset_uhd_group,
                                            "Сбросить только параметры B210"),
-                     8, 0, 1, 3)
+                     7, 0, 1, 3)
         return g_tx
 
     def _reset_uhd_group(self) -> None:
-        self.cb_tx.setChecked(False)
         self.ed_args.setText("type=b200")
         self.sp_ch.setValue(0)
-        self.sp_txg.setValue(10.0)
+        self.sl_tx_gain.setValue(
+            int(round(_DEFAULT_TX_GAIN * _TX_GAIN_STEPS_PER_DB)))
         self.ed_ant.setText("TX/RX")
         self.sp_bw.setValue(0.0)
         self.cmb_clk.setCurrentText("internal")
@@ -1477,22 +1559,80 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_gen_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(page)
+
+        # One obvious playback area: buttons, loop checkbox and the ready-IQ
+        # chooser together (issue A).
+        play = QtWidgets.QGroupBox("Управление воспроизведением")
+        pv = QtWidgets.QVBoxLayout(play)
         ctrl = QtWidgets.QHBoxLayout()
         self.btn_gen = QtWidgets.QPushButton("Сгенерировать IQ")
         self.btn_gen.setToolTip("Записать IQ-файл без передачи на B210")
         self.btn_gen.clicked.connect(self._generate_iq)
         self.btn_start = QtWidgets.QPushButton("▶ Старт")
         self.btn_start.setToolTip(
-            "Записать IQ-файл и/или передать в эфир (см. галочку B210)")
+            "Запустить сеанс: записать IQ-файл (если задан) и автоматически "
+            "передать в эфир, если B210 обнаружен")
         self.btn_start.clicked.connect(self._start)
+        self.btn_pause = QtWidgets.QPushButton("⏸ Пауза")
+        self.btn_pause.setToolTip(
+            "Приостановить/возобновить генерацию и передачу между блоками. "
+            "Файл — без потерь; при живой передаче на B210 поток на паузе не "
+            "подаётся (возможен underflow) и продолжается с того же места.")
+        self.btn_pause.clicked.connect(self._pause)
+        self.btn_pause.setEnabled(False)
+        self.btn_replay = QtWidgets.QPushButton("▷ Воспроизвести")
+        self.btn_replay.setToolTip(
+            "Проиграть последний сгенерированный IQ-файл или файл, выбранный "
+            "в поле «Готовый IQ» (из RAM); при наличии B210 — с передачей "
+            "в эфир.")
+        self.btn_replay.clicked.connect(self._play_iq)
         self.btn_stop = QtWidgets.QPushButton("■ Стоп")
         self.btn_stop.clicked.connect(self._stop)
         self.btn_stop.setEnabled(False)
         ctrl.addWidget(self.btn_gen)
         ctrl.addWidget(self.btn_start)
+        ctrl.addWidget(self.btn_pause)
         ctrl.addWidget(self.btn_stop)
+        ctrl.addWidget(self.btn_replay)
         ctrl.addStretch(1)
-        v.addLayout(ctrl)
+        pv.addLayout(ctrl)
+
+        # Loop checkbox + ready-IQ chooser in the SAME group as the buttons.
+        opts = QtWidgets.QHBoxLayout()
+        self.cb_loop = QtWidgets.QCheckBox("Зациклить сегмент (RAM)")
+        self.cb_loop.setChecked(True)
+        self.cb_loop.setToolTip(
+            "Для файла: сегмент генерируется один раз и пишется один раз.\n"
+            "Для передачи на B210 (TX): непрерывная передача сегмента до "
+            "кнопки «Стоп» — «Длительность» в эфире не ограничивает.\n"
+            "Для готового IQ-файла: повтор с начала файла.\n"
+            "Сегмент автоматически урезается под свободный бюджет RAM.")
+        opts.addWidget(self.cb_loop)
+
+        self.cb_iq_in = QtWidgets.QCheckBox("Использовать готовый IQ-файл")
+        self.cb_iq_in.setToolTip(
+            "Генерация пропускается: файл целиком загружается в RAM (нативный "
+            "формат — RAM ≈ размер файла) и, если B210 обнаружен, передаётся в "
+            "эфир; иначе только проверяется.\n"
+            "Если рядом есть <файл>.json — sample_rate/format/center_freq "
+            "берутся из него; иначе используются значения из настроек.")
+        opts.addWidget(self.cb_iq_in)
+        self.ed_iq_in = QtWidgets.QLineEdit("")
+        self.ed_iq_in.setPlaceholderText("путь к готовому IQ-файлу")
+        self.ed_iq_in.setEnabled(False)
+        btn_iq = QtWidgets.QPushButton("…")
+        btn_iq.setFixedWidth(32)
+        btn_iq.clicked.connect(
+            lambda: self._browse(self.ed_iq_in, "Готовый IQ-файл",
+                                 _IQ_INPUT_FILTER, "Все файлы (*)"))
+        btn_iq.setEnabled(False)
+        self._btn_iq_in = btn_iq
+        self.cb_iq_in.toggled.connect(self.ed_iq_in.setEnabled)
+        self.cb_iq_in.toggled.connect(btn_iq.setEnabled)
+        opts.addWidget(self.ed_iq_in, 1)
+        opts.addWidget(btn_iq)
+        pv.addLayout(opts)
+        v.addWidget(play)
 
         # One visible bar area (issue 1), implemented as a stack of two bars so
         # the widget can be REPLACED when the phase changes:
@@ -1534,6 +1674,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         v.addWidget(self.table, 2)
+
+        # Dedicated, in-place satellite-list field (issue 6): the visible-vs-GSV
+        # comparison is shown here instead of being appended to the journal every
+        # couple of seconds.  The journal keeps only milestone/status lines.
+        self.lbl_visible = QtWidgets.QLabel("Видимые: —")
+        self.lbl_visible.setWordWrap(True)
+        self.lbl_visible.setToolTip(
+            "Сравнение передаваемых спутников (таблица выше) с приёмником "
+            "(GSV). Обновляется на месте, в журнал не пишется.")
+        v.addWidget(self.lbl_visible)
 
         v.addWidget(self._build_ublox_group())
 
@@ -1903,6 +2053,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_progress.setText("Подготовка…")
         if hasattr(self, "lbl_tx_level"):
             self.lbl_tx_level.setText("Уровень TX: —")
+        # Definitive TX status line (after log.clear()): auto-transmit when a
+        # B210 is present, otherwise file-only with an explicit note.
+        if cfg.use_usrp:
+            self._append_log("TX: B210 обнаружен — передача в эфир включена "
+                             "автоматически.")
+        else:
+            self._append_log("B210 не обнаружен (или TX недоступен) — только "
+                             "файл: в эфир ничего не идёт.")
         # A reused IQ file has no synthesis step: when it is streamed to the
         # radio show the transmission bar straight away (the runner emits only
         # an overall fraction there, which ``_on_progress`` feeds to it).
@@ -1911,6 +2069,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start.setEnabled(False)
         self.btn_gen.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        if hasattr(self, "btn_pause"):
+            self.btn_pause.setEnabled(True)
+            self.btn_pause.setText("⏸ Пауза")
         try:
             self.spectrum_widget.clear()
         except Exception:  # noqa: BLE001
@@ -1930,6 +2091,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.runner.start()
 
     def _start(self) -> None:
+        # Auto-transmit: probe the B210 once (cached) before collecting, so
+        # `use_usrp` reflects whether a radio is actually present.  The
+        # user-visible status line is written by ``_launch`` after it clears
+        # the journal.
+        self._detect_b210()
         cfg = self._collect()
         if cfg.iq_input:
             if not os.path.exists(cfg.iq_input):
@@ -1955,6 +2121,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Для мониторинга/контроля RX TX и RX каналы должны "
                 "различаться.")
             return
+        if cfg.output:
+            self._last_iq_file = cfg.output
         self._launch(cfg)
 
     def _generate_iq(self) -> None:
@@ -1987,11 +2155,69 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.monitor = False
         cfg.tx_check = False
         self._append_log("Генерация IQ в файл (без передачи на B210).")
+        if cfg.output:
+            self._last_iq_file = cfg.output
         self._launch(cfg)
 
     def _stop(self) -> None:
-        if self.runner is not None:
-            self.runner.stop()
+        """Stop the run from any state, including a paused one.
+
+        Always clears the pause flag and aborts promptly (``runner.stop()``
+        also clears it defensively): the historic bug was that «Стоп» while
+        paused did nothing because the paused wait never observed the stop.
+        """
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            try:
+                if hasattr(runner, "resume"):
+                    runner.resume()
+            except Exception:  # noqa: BLE001 - чужой runner в тестах
+                pass
+            runner.stop()
+        if hasattr(self, "btn_pause"):
+            self.btn_pause.setText("⏸ Пауза")
+        if hasattr(self, "lbl_progress"):
+            self.lbl_progress.setText("Остановка…")
+        self._append_log("Стоп: останавливаю генерацию/передачу.")
+
+    def _pause(self) -> None:
+        """Pause/resume the live run (see :meth:`SimulationRunner._wait_if_paused`)."""
+        if self.runner is None:
+            return
+        paused = self.runner.toggle_pause()
+        if paused:
+            if hasattr(self, "btn_pause"):
+                self.btn_pause.setText("▶ Продолжить")
+            if hasattr(self, "lbl_progress"):
+                self.lbl_progress.setText("Пауза (поток сохранён в RAM)")
+            self._append_log(
+                "Пауза: генерация и подача отсчётов приостановлены между "
+                "блоками (файл — без потерь; при TX поток на паузе не "
+                "подаётся и продолжится с того же места).")
+        else:
+            if hasattr(self, "btn_pause"):
+                self.btn_pause.setText("⏸ Пауза")
+            self._append_log("Продолжение после паузы.")
+
+    def _play_iq(self) -> None:
+        """Play the last generated IQ file (or the one in the chooser) from RAM."""
+        path = (self.ed_iq_in.text().strip()
+                or getattr(self, "_last_iq_file", "") or "")
+        if not path or not os.path.exists(path):
+            QtWidgets.QMessageBox.warning(
+                self, "Воспроизвести IQ",
+                "Нет готового IQ-файла: сгенерируйте файл или выберите его "
+                "в поле «Готовый IQ».")
+            return
+        if getattr(self, "runner", None) is not None and self.runner.is_running():
+            self._append_log("Воспроизвести: дождитесь окончания текущего запуска.")
+            return
+        self._detect_b210()
+        self.cb_iq_in.setChecked(True)
+        self.ed_iq_in.setText(path)
+        cfg = self._collect()
+        cfg.duration = 0.0  # until «Стоп» (or the file ends without loop)
+        self._launch(cfg)
 
     # ==================================================================
     # Spectrum
@@ -2130,11 +2356,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return []
 
     def _log_visible_comparison(self, gsv_sats: list[dict]) -> None:
-        """Compare transmitted vs receiver-GSV satellites, throttled (~2 s).
+        """Show transmitted vs receiver-GSV satellites in the dedicated field.
 
         Uses GSV (in view), never GSA (used), so tracked-but-unused satellites
         are still visible.  ``нет в GSV`` is the diagnostic: the simulator is
-        transmitting them but the receiver does not see/track them.
+        transmitting them but the receiver does not see/track them.  The result
+        is shown *in place* in ``lbl_visible``; the journal is not touched (no
+        periodic per-satellite spam).
         """
         import time as _time
         now = _time.time()
@@ -2146,9 +2374,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._vis_last = now
         try:
             cmp = ublox.compare_visible(sim, gsv_sats)
-            self._append_log(ublox.describe_visible(cmp))
+            text = ublox.describe_visible(cmp)
         except Exception as exc:  # noqa: BLE001
-            self._append_log(f"Сравнение видимых: {exc}")
+            text = f"Сравнение видимых: {exc}"
+        if hasattr(self, "lbl_visible"):
+            self.lbl_visible.setText("Видимые: " + text)
 
     def _take_position(self) -> None:
         if self._nmea is None:
@@ -2472,6 +2702,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_gen.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        if hasattr(self, "btn_pause"):
+            self.btn_pause.setEnabled(False)
+            self.btn_pause.setText("⏸ Пауза")
         if err:
             QtWidgets.QMessageBox.critical(self, "Ошибка", str(err))
             if hasattr(self, "lbl_progress"):
@@ -2534,15 +2767,21 @@ class MainWindow(QtWidgets.QMainWindow):
             cddis_token=self.ed_cddis_token.text().strip(),
             output=self.ed_out.text().strip(),
             output_format=self.cmb_fmt.currentText(),
-            output_scale=self.sp_scale.value(),
+            # «Масштаб в int» removed from the GUI: use the internal verified
+            # default (CLI --scale is still honoured for compatibility).
+            output_scale=_DEFAULT_OUTPUT_SCALE,
             iq_input=(self.ed_iq_in.text().strip()
                       if self.cb_iq_in.isChecked() else ""),
-            iq_in_ram=self.cb_iq_ram.isChecked(),
+            # RAM-only playback: a ready IQ file is always decoded into RAM.
+            iq_in_ram=True,
             loop=self.cb_loop.isChecked(),
-            loop_seconds=self.sp_loop.value(),
-            memory_budget_gb=self.sp_mem.value(),
-            use_usrp=self.cb_tx.isChecked(), uhd_args=self.ed_args.text().strip(),
-            tx_channel=self.sp_ch.value(), tx_gain=self.sp_txg.value(),
+            # Segment length and RAM budget are derived automatically (60 % of
+            # free RAM): the redundant disk-loop sizing fields were removed.
+            loop_seconds=0.0,
+            memory_budget_gb=0.0,
+            use_usrp=bool(self._b210_available),
+            uhd_args=self.ed_args.text().strip(),
+            tx_channel=self.sp_ch.value(), tx_gain=self._tx_gain_db(),
             tx_antenna=self.ed_ant.text().strip(),
             tx_bandwidth=self.sp_bw.value(),
             clock_source=self.cmb_clk.currentText(),
@@ -2558,14 +2797,111 @@ class MainWindow(QtWidgets.QMainWindow):
             tx_check=self.cb_tx_check.isChecked(),
         )
 
+    # ------------------------------------------------------------------
+    # B210 auto-transmit detection / TX-power slider
+    # ------------------------------------------------------------------
+    def _tx_gain_db(self) -> float:
+        """TX gain [dB] from the slider, clamped to the B210 0..89.75 range."""
+        raw = self.sl_tx_gain.value() / float(_TX_GAIN_STEPS_PER_DB)
+        return max(_B210_TX_GAIN_MIN, min(_B210_TX_GAIN_MAX, raw))
+
+    def _apply_tx_gain_live(self) -> float | None:
+        """Push the slider's gain to the live TX sink (no-op when idle).
+
+        Returns the value the device actually applied, or ``None`` when no run
+        is active / no sink supports runtime changes.  The journal line is
+        throttled so dragging the handle does not flood it, and the final value
+        is logged on release (``sliderReleased``).
+        """
+        runner = getattr(self, "runner", None)
+        if runner is None or not runner.is_running():
+            return None
+        db = self._tx_gain_db()
+        try:
+            applied = runner.set_tx_gain(db)
+        except Exception as exc:  # noqa: BLE001 - slider must never crash the UI
+            self._append_log(f"Мощность TX: не удалось применить на лету: {exc}")
+            return None
+        if applied is None:
+            return None
+        now = time.time()
+        if now - self._tx_gain_log_ts < 0.5:
+            return applied
+        self._tx_gain_log_ts = now
+        if abs(applied - db) < 0.005:
+            self._append_log(f"Мощность TX: применено {applied:.2f} дБ")
+        else:
+            self._append_log(
+                f"Мощность TX: запрошено {db:.2f} дБ, применено "
+                f"{applied:.2f} дБ (диапазон устройства)")
+        return applied
+
+    def _on_tx_gain_changed(self, _value: int) -> None:
+        self.lbl_tx_gain.setText(f"{self._tx_gain_db():.2f} дБ")
+        self._apply_tx_gain_live()
+
+    def _on_tx_gain_released(self) -> None:
+        """Force a final journal line with the value applied at drag end."""
+        self._tx_gain_log_ts = 0.0
+        self._apply_tx_gain_live()
+
+    def _refresh_b210_status(self) -> None:
+        """Update the basic-tab B210 indicator from the cached availability."""
+        if not hasattr(self, "lbl_b210"):
+            return
+        if self._b210_available:
+            self.lbl_b210.setText(
+                "<b>B210 обнаружен</b> — «Старт» и «Воспроизвести» передают "
+                "в эфир (плюс файл, если задан).")
+        else:
+            self.lbl_b210.setText(
+                "<b>B210 не обнаружен</b> — только файл, в эфир ничего не "
+                "идёт. Подключите B210 и нажмите «Проверить B210».")
+
+    def _detect_b210(self, force: bool = False) -> bool:
+        """Probe once whether a B210 is present and cache the result.
+
+        Headless (``QT_QPA_PLATFORM=offscreen``) runs never touch UHD, and
+        tests can force the outcome via ``self._b210_override``.  Returns the
+        cached availability; ``force=True`` (the «Проверить B210» button)
+        re-probes.
+        """
+        if self._b210_override is not None:
+            self._b210_available = bool(self._b210_override)
+            self._b210_checked = True
+        elif self._b210_checked and not force:
+            pass
+        elif os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            # Headless tests: never import/scan UHD; default to file-only.
+            self._b210_available = False
+            self._b210_checked = True
+        else:
+            args = (self.ed_args.text().strip()
+                    if hasattr(self, "ed_args") else "") or "type=b200"
+            try:
+                from .uhd_tx import b210_present
+                self._b210_available = bool(b210_present(args))
+            except Exception as exc:  # noqa: BLE001 - поиск не должен ронять GUI
+                self._b210_available = False
+                self._append_log(f"Поиск B210 не удался: {exc}")
+            self._b210_checked = True
+        self._refresh_b210_status()
+        return self._b210_available
+
     def _find_devices(self) -> None:
         from .uhd_tx import list_devices, uhd_version
         self._append_log(f"UHD: {uhd_version()}")
+        found = 0
         try:
             for dev in list_devices(self.ed_args.text().strip()):
+                found += 1
                 self._append_log("  " + str(dict(dev)))
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"  ошибка: {exc}")
+        self._b210_override = None
+        self._b210_available = found > 0
+        self._b210_checked = True
+        self._refresh_b210_status()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self._timer.stop()

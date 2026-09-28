@@ -12,4 +12,16 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
-from . import constants  # noqa: F401
+
+def __getattr__(name: str):
+    """Lazily expose ``gnss_sim.constants`` without importing NumPy eagerly.
+
+    Importing the package must stay dependency-free so ``python -m gnss_sim``
+    can re-exec into the project virtualenv before any third-party import (the
+    system interpreter has no NumPy).  ``gnss_sim.constants`` (and any future
+    submodule) is still reachable as an attribute on first use.
+    """
+    if name == "constants":
+        from . import constants
+        return constants
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

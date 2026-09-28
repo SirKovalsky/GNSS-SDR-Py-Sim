@@ -149,8 +149,28 @@ class NullSink(Sink):
 # ----------------------------------------------------------------------
 #: Bytes per complex sample for every supported file format.
 FORMAT_BYTES = {"cf32": 8, "cs16": 4, "cs8": 2, "cs4": 2}
+#: Native NumPy dtype of the *interleaved* I/Q stream of each file format.
+#: A RAM buffer keeps these samples in their native width (int16 = 4 B,
+#: int8 = 2 B, float32 = 8 B per complex sample) instead of decoding the whole
+#: file to ``complex128`` (16 B/sample), which used to need ~4x the file size.
+FORMAT_DTYPE = {"cf32": "<f4", "cs16": "<i2", "cs8": "<i1", "cs4": "<i1"}
 #: Fallback divisor applied to integer formats when the side-car is missing.
 _FORMAT_SCALE_DIV = {"cs8": 256.0, "cs4": 4096.0}
+
+
+def _format_div(fmt: str, scale: float) -> float:
+    """Normalisation divisor that turns native samples into baseband units.
+
+    ``cf32`` is already normalised; ``cs16`` is divided by ``scale``; ``cs8``
+    and ``cs4`` by ``scale / (256 or 4096)`` (same rule as
+    :func:`_decode_samples`).
+    """
+    fmt = fmt.lower()
+    if fmt == "cf32":
+        return 1.0
+    if fmt == "cs16":
+        return float(scale or 1.0)
+    return float(scale or 1.0) / _FORMAT_SCALE_DIV.get(fmt, 1.0)
 
 
 def load_iq_metadata(path: str) -> dict:
@@ -205,11 +225,13 @@ class IqFileSource:
     recorded ``output_scale`` (config fallback) so the returned samples are
     normalised complex values suitable for :class:`~gnss_sim.uhd_tx.UhdTxSink`.
 
-    With ``load_to_ram=True`` the whole file is decoded into memory once and
-    looped from RAM (faster playback, at the cost of RAM).  Available RAM is
-    checked via :mod:`gnss_sim.sysinfo` and a clear Russian error is raised
-    when the decoded file would not fit, unless ``force=True`` or the available
-    RAM is unknown (``0``).  Streaming from disk remains the default.
+    With ``load_to_ram=True`` the whole file is loaded into memory once and
+    looped from RAM.  The buffer keeps the file's *native* interleaved dtype, so
+    a 6 GB ``cs16`` file needs ~6 GB (not the ~24 GB a full ``complex128``
+    decode used to require); :meth:`read` converts one block at a time to
+    ``complex64``.  Available RAM is checked via :mod:`gnss_sim.sysinfo` and a
+    clear Russian error is raised when the file would not fit, unless
+    ``force=True`` or the available RAM is unknown (``0``).
     """
 
     def __init__(
@@ -229,6 +251,8 @@ class IqFileSource:
         self._load_to_ram = bool(load_to_ram)
         self._force = bool(force)
         self._ram: np.ndarray | None = None
+        self._ram_nsamples = 0
+        self._ram_div = 1.0
         self._ram_pos = 0
         have_meta = metadata is not None
         meta = dict(metadata) if have_meta else load_iq_metadata(path)
@@ -284,24 +308,36 @@ class IqFileSource:
             self._fh = open(self.path, "rb")
 
     def _load_ram(self) -> None:
-        """Decode the whole file into a ``complex128`` array (with RAM check)."""
+        """Load the whole file into RAM in its *native* dtype (with RAM check).
+
+        The buffer is exactly one file-sized allocation (no per-sample
+        ``complex128`` blow-up).  A previously loaded buffer is released before
+        the new one is allocated so a re-load does not double the footprint.
+        """
         from . import sysinfo
 
-        need = int(self.total_samples) * 16  # complex128 in memory
+        # Release any previous buffer before allocating the new one.
+        self._ram = None
+        self._ram_nsamples = 0
+        n_samp = int(self.total_samples)
+        bps = FORMAT_BYTES.get(self.fmt, 4)
+        need = max(0, n_samp) * bps  # native size == file size
         avail = sysinfo.available_ram()
         if not self._force and avail > 0 and need > avail:
             raise RuntimeError(
                 "Недостаточно оперативной памяти для загрузки IQ-файла "
                 f"целиком: нужно ~{sysinfo.human(need)}, доступно "
-                f"{sysinfo.human(avail)}. Снимите «Загрузить IQ в RAM» "
-                "(поток с диска) или уменьшите файл.")
-        with open(self.path, "rb") as fh:
-            raw = fh.read(int(self.total_samples) * FORMAT_BYTES[self.fmt])
-        self._ram = _decode_samples(raw, self.fmt, self.scale)
+                f"{sysinfo.human(avail)}. Воспроизведение выполняется только "
+                "из RAM — уменьшите файл или освободите память.")
+        self._ram = np.fromfile(
+            self.path, dtype=FORMAT_DTYPE[self.fmt], count=max(0, n_samp) * 2)
+        self._ram_nsamples = int(self._ram.size) // 2
+        self._ram_div = _format_div(self.fmt, self.scale)
         self._ram_pos = 0
         self._warn(
-            f"IQ-файл загружен в RAM: {self._ram.size} отсч. "
-            f"(~{sysinfo.human(int(self._ram.size) * 16)})")
+            f"IQ-файл загружен в RAM: {self._ram_nsamples} отсч. "
+            f"({self.fmt}, ~{sysinfo.human(int(self._ram.nbytes))}; "
+            "нативный формат, без complex128)")
 
     def seek_start(self) -> None:
         if self._ram is not None:
@@ -316,12 +352,7 @@ class IqFileSource:
         """Return up to ``n`` normalised complex samples (empty at EOF)."""
         n = max(0, int(n))
         if self._ram is not None:
-            if self._ram_pos >= self._ram.size:
-                return np.zeros(0, dtype=np.complex128)
-            end = min(self._ram.size, self._ram_pos + n)
-            out = self._ram[self._ram_pos:end]
-            self._ram_pos = end
-            return out
+            return self._read_ram(n)
         if self._fh is None:
             self.start()
         assert self._fh is not None
@@ -330,6 +361,26 @@ class IqFileSource:
         if not raw:
             return np.zeros(0, dtype=np.complex128)
         return _decode_samples(raw, self.fmt, self.scale)
+
+    def _read_ram(self, n: int) -> np.ndarray:
+        """Convert the next ``n`` samples of the native RAM buffer to complex64.
+
+        Only one block-sized ``complex64`` array is allocated per call; the
+        file-sized native buffer is never decoded wholesale.
+        """
+        total = self._ram_nsamples
+        pos = self._ram_pos
+        if n <= 0 or pos >= total:
+            return np.zeros(0, dtype=np.complex64)
+        end = min(total, pos + n)
+        inter = self._ram[2 * pos:2 * end]
+        out = np.empty(end - pos, dtype=np.complex64)
+        out.real = inter[0::2]
+        out.imag = inter[1::2]
+        if self._ram_div != 1.0:
+            out /= self._ram_div
+        self._ram_pos = end
+        return out
 
     def read_all(self) -> np.ndarray:  # pragma: no cover - convenience
         self.seek_start()

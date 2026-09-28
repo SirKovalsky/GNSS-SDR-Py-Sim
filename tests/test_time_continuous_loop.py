@@ -71,15 +71,22 @@ def test_default_tx_gain_is_plus10() -> None:
 
 
 def test_gui_default_tx_gain_is_plus10_and_resets() -> None:
-    from gnss_sim.gui import MainWindow
+    from gnss_sim.gui import (MainWindow, _B210_TX_GAIN_MAX,
+                              _TX_GAIN_STEPS_PER_DB)
     app = _app()
     win = MainWindow()
     try:
-        assert win.sp_txg.value() == 10.0
-        win.sp_txg.setValue(33.0)
+        # TX power is a slider on the «Базовые» tab; +10 dB is the default.
+        assert win.sl_tx_gain.value() == int(round(10.0 * _TX_GAIN_STEPS_PER_DB))
+        assert win._tx_gain_db() == 10.0
+        win.sl_tx_gain.setValue(int(round(33.0 * _TX_GAIN_STEPS_PER_DB)))
         assert win._collect().tx_gain == 33.0
+        # The slider cannot exceed the B210 range (clamped by the widget).
+        assert win._tx_gain_db() <= _B210_TX_GAIN_MAX
         win._reset_uhd_group()
-        assert win.sp_txg.value() == 10.0
+        assert win._tx_gain_db() == 10.0
+        # The old spinbox is gone.
+        assert not hasattr(win, "sp_txg")
     finally:
         win.close()
     del app

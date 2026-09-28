@@ -526,13 +526,17 @@ def test_gui_log_colours() -> None:
 # ======================================================================
 # B6/B7) B210 checkbox on the basic tab; RAM/format hint
 # ======================================================================
-def test_gui_b210_checkbox_on_basic_tab_and_hint() -> None:
+def test_gui_b210_slider_on_basic_tab_and_hint() -> None:
     from gnss_sim.gui import MainWindow
     app = _app()
     win = MainWindow()
     try:
         basic = win.left_tabs.widget(0)
-        assert basic.isAncestorOf(win.cb_tx)
+        # The «Передавать на B210» checkbox is gone; TX power is a slider on
+        # the basic tab and the B210 indicator lives there too.
+        assert not hasattr(win, "cb_tx")
+        assert basic.isAncestorOf(win.sl_tx_gain)
+        assert basic.isAncestorOf(win.lbl_b210)
         hint = win.lbl_format_hint.text()
         assert "cs8" in hint and "30" in hint
     finally:

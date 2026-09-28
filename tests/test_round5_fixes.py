@@ -189,7 +189,7 @@ def test_compare_visible_uses_name_when_system_missing() -> None:
         "matched"] == []
 
 
-def test_gui_monitor_logs_visible_comparison() -> None:
+def test_gui_monitor_shows_visible_comparison_in_field() -> None:
     from PyQt5 import QtWidgets
     from gnss_sim.gui import MainWindow
 
@@ -206,8 +206,10 @@ def test_gui_monitor_logs_visible_comparison() -> None:
         win.runner = _Runner()  # type: ignore[assignment]
         win._vis_last = 0.0
         win._log_visible_comparison([{"system": "G", "prn": 5}])
-        text = win.log.toPlainText()
+        text = win.lbl_visible.text()
         assert "нет в GSV" in text and "E08" in text
+        # Issue 6: the satellite comparison must NOT spam the journal.
+        assert "нет в GSV" not in win.log.toPlainText()
     finally:
         win.close()
     del app

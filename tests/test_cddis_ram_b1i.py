@@ -350,18 +350,20 @@ def test_gui_iq_ram_and_auto_b1i_controls() -> None:
     app = _app()
     win = MainWindow()
     try:
-        # Авто-подбор включён по умолчанию, галочка «в RAM» выключена.
+        # Авто-подбор включён по умолчанию; отдельной галочки «в RAM» больше
+        # нет — готовый IQ-файл всегда воспроизводится из RAM.
         assert win.cb_auto_b1i.isChecked() is True
         assert win._collect().auto_b1i is True
-        assert win.cb_iq_ram.isChecked() is False
-        assert win.cb_iq_ram.isEnabled() is False
+        assert not hasattr(win, "cb_iq_ram")
+        assert not hasattr(win, "sp_scale")   # «Масштаб в int» убран
+        assert not hasattr(win, "sp_loop") and not hasattr(win, "sp_mem")
         win.cb_iq_in.setChecked(True)
         win.ed_iq_in.setText("reuse.cs16")
-        win.cb_iq_ram.setChecked(True)
         cfg = win._collect()
         assert cfg.iq_in_ram is True and cfg.iq_input == "reuse.cs16"
         win._reset_output_group()
-        assert win.cb_iq_ram.isChecked() is False
+        assert win.cb_iq_in.isChecked() is False
+        assert win._collect().iq_input == ""
         win._reset_band_group()
         assert win.cb_auto_b1i.isChecked() is True
         # Понятная заметка про merged только за прошлые сутки.
