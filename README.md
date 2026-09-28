@@ -248,7 +248,13 @@ python run.py --print-interpreter
 ... -m gnss_sim --band b1i --b1i-data placeholder -o b1i_ph.cs16
 
 # Передача на B210 (ОБЯЗАТЕЛЬНО через аттенюатор + DC block!)
-... -m gnss_sim --tx --tx-gain -20 --uhd-args type=b200
+# У B210 усиление TX 0..89.75 дБ; отрицательное недопустимо (зажмётся в 0).
+# Вниз мощность — только внешним аттенюатором. По умолчанию +10 дБ.
+... -m gnss_sim -e rinex_cache\BRDC00IGS_R_20262670000_01D_MN.rnx ^
+    -t "2026/09/24,12:00:00" --tx --uhd-args type=b200
+
+# Передать уже готовый IQ-файл: прикрепляется ключом --iq-input (из RAM, зацикливается)
+... -m gnss_sim --iq-input out.cs16 --tx --uhd-args type=b200
 
 # Список устройств
 ... -m gnss_sim --list-devices
@@ -275,7 +281,7 @@ python run.py --print-interpreter
 
 ```powershell
 # CLI: генерация пропускается, файл читается и (при --tx) идёт в эфир
-... -m gnss_sim --iq-input out.cs16 --tx --tx-gain -20
+... -m gnss_sim --iq-input out.cs16 --tx --tx-gain 10
 # Без --tx файл только проверяется и описывается в журнале
 ... -m gnss_sim --iq-input out.cs16
 ```
@@ -550,7 +556,7 @@ B210 = один AD9361 с **раздельными LO приёма и перед
 # TX на канале 0 (TX/RX), RX на канале 1 (RX2), авторегулятор до -30 dBFS,
 # профиль задержек (топ-3 эхо) — ОБЯЗАТЕЛЬНО аттенюатор 50-60 дБ + DC block!
 .venv\Scripts\python.exe -m gnss_sim ^
-    --tx --monitor --tx-channel 0 --tx-gain -20 ^
+    --tx --monitor --tx-channel 0 --tx-gain 10 ^
     --rx-channel 1 --rx-ant RX2 --rx-gain 30 ^
     --tx-power-target -30 --echo ^
     -t "2022/01/01,00:00:00" -d 600
@@ -559,7 +565,7 @@ B210 = один AD9361 с **раздельными LO приёма и перед
 ... -m gnss_sim --tx --monitor --no-tx-power-auto --rx-freq 1570e6
 
 # Обычная передача без мониторинга (поведение не изменилось)
-... -m gnss_sim --tx --tx-gain -20
+... -m gnss_sim --tx --tx-gain 10
 ```
 
 В журнал раз в ~0.5 с пишется строка вида
