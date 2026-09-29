@@ -70,8 +70,10 @@ bits1-2`, `e5b_dvs = bit6`, `e5b_hs = bits7-8`, см.
 
 ## Установка
 
-Проект **самодостаточен**: нужны только Python 3.10–3.13 и (для передачи на
-B210) UHD. Виртуальное окружение создаётся **внутри проекта** — `.venv`.
+Проект **самодостаточен**: нужен только Python 3.10–3.13 и (для передачи на
+B210) UHD. Для UHD/B210 используйте Python **3.12**: пакет `uhd` собран против
+NumPy 1.x, а у NumPy 1.x нет wheel'ов под 3.13. На 3.13 работает генерация IQ в
+файл (NumPy 2.x). Виртуальное окружение создаётся **внутри проекта** — `.venv`.
 
 ### Windows (PowerShell)
 
@@ -80,16 +82,17 @@ cd E:\MySoftware\GNSS_Sim
 .\scripts\setup_windows.ps1
 ```
 
-Скрипт создаёт `.venv` (`py -3.13 -m venv .venv`), обновляет pip, ставит
+Скрипт создаёт `.venv` (`py -3.12 -m venv .venv`), обновляет pip, ставит
 `requirements.txt`, при наличии UHD-библиотек (`uhd.dll` или `UHD_PKG_PATH`)
 ставит `uhd==4.10.0.0`, а на NVIDIA-машине (флаг `-Cuda`) —
-`cupy-cuda12x<14`.
+`cupy-cuda12x<14` вместе с runtime-пакетами `nvidia-*-cu12` (cudart/NVRTC),
+так что отдельный CUDA Toolkit не нужен.
 
 Вручную:
 
 ```powershell
 cd E:\MySoftware\GNSS_Sim
-py -3.13 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
@@ -97,8 +100,9 @@ py -3.13 -m venv .venv
 # (https://files.ettus.com/binaries/uhd/latest_release/), затем в venv:
 .\.venv\Scripts\python.exe -m pip install uhd==4.10.0.0
 
-# CUDA (необязательно): cupy-cuda12x<14 для CUDA 12.x, cupy-cuda11x для 11.x
-.\.venv\Scripts\python.exe -m pip install "cupy-cuda12x<14"
+# CUDA (необязательно): cupy-cuda12x<14 для CUDA 12.x, cupy-cuda11x для 11.x.
+# Пакеты nvidia-*-cu12 дают cudart/NVRTC без установки всего CUDA Toolkit.
+.\.venv\Scripts\python.exe -m pip install "cupy-cuda12x<14" nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12
 ```
 
 ### Linux / macOS
@@ -126,7 +130,8 @@ sudo uhd_images_downloader
 # системный uhd виден только в venv с --system-site-packages:
 python3 -m venv --system-site-packages .venv
 
-# CUDA (необязательно)
+# CUDA (необязательно); без системного CUDA Toolkit добавьте runtime-пакеты:
+# nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12
 .venv/bin/python -m pip install "cupy-cuda12x<14"
 ```
 

@@ -12,19 +12,28 @@
     No external project is referenced; everything lives inside this repository.
 
 .PARAMETER Python
-    Command used to create the venv.  Default: "py -3.13".
+    Command used to create the venv.  Default: "py -3.12".
+
+    Use Python 3.12 for UHD/B210 support: the uhd package is built against
+    NumPy 1.x, and NumPy 1.x has no wheels for Python 3.13+.  Python 3.13
+    still works for file-only IQ generation (NumPy 2.x).
+
+.PARAMETER Uhd
+    Force-install the uhd==4.10.0.0 Python bindings (needed for USRP B210 TX).
 
 .PARAMETER Cuda
-    Force-install "cupy-cuda12x<14" for CUDA 12.x GPU synthesis.
+    Force-install "cupy-cuda12x<14" plus the NVIDIA CUDA 12 runtime wheels
+    (nvidia-cuda-*-cu12) for GPU synthesis without a system CUDA Toolkit.
 
 .EXAMPLE
     .\scripts\setup_windows.ps1
 .EXAMPLE
-    .\scripts\setup_windows.ps1 -Cuda
+    .\scripts\setup_windows.ps1 -Uhd -Cuda
 #>
 [CmdletBinding()]
 param(
-    [string]$Python = "py -3.13",
+    [string]$Python = "py -3.12",
+    [switch]$Uhd,
     [switch]$Cuda
 )
 
@@ -47,7 +56,7 @@ if (Test-Path $VenvPy) {
     if ($parts.Length -gt 1) { $rest = $parts[1..($parts.Length - 1)] }
     & $exe @rest -m venv .venv
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $VenvPy)) {
-        throw "Failed to create .venv. Install Python 3.10-3.13 or pass -Python <exe>."
+        throw "Failed to create .venv. Install Python 3.10-3.12 (3.12 for UHD) or pass -Python <exe>."
     }
 }
 
@@ -79,16 +88,29 @@ function Find-UhdDll {
 }
 
 $uhdDll = Find-UhdDll
-if ($uhdDll) {
-    Write-Host "UHD found ($uhdDll) - installing uhd==4.10.0.0"
-    & $VenvPy -m pip install "uhd==4.10.0.0"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Could not install the UHD Python bindings; file-only mode still works."
+$uhdInstalled = $false
+& $VenvPy -c "import uhd" 2>$null
+if ($LASTEXITCODE -eq 0) { $uhdInstalled = $true }
+
+if ($uhdInstalled) {
+    Write-Host "UHD Python bindings already installed"
+} elseif ($uhdDll -or $Uhd) {
+    $pyVer = & $VenvPy -c "import sys; print('{0}.{1}'.format(*sys.version_info[:2]))"
+    if ([version]$pyVer -ge [version]"3.13") {
+        Write-Warning "UHD needs NumPy < 2.0, which has no wheels for Python $pyVer."
+        Write-Warning "For USRP B210 TX use Python 3.12:  py -3.12 -m venv .venv  then re-run this script."
+    } else {
+        if ($uhdDll) { Write-Host "UHD found ($uhdDll) - installing uhd==4.10.0.0" }
+        else { Write-Host "Installing uhd==4.10.0.0 (-Uhd)" }
+        & $VenvPy -m pip install "uhd==4.10.0.0"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not install the UHD Python bindings; file-only mode still works."
+        }
     }
 } else {
-    Write-Host "UHD not found - skipping. For USRP B210 TX:"
-    Write-Host "  1) install UHD for Windows (https://files.ettus.com/binaries/uhd/latest_release/)"
-    Write-Host "  2) re-run this script, or: .venv\Scripts\python.exe -m pip install uhd==4.10.0.0"
+    Write-Host "UHD not installed - skipping. For USRP B210 TX:"
+    Write-Host "  .venv\Scripts\python.exe -m pip install uhd==4.10.0.0"
+    Write-Host "  (or re-run: .\scripts\setup_windows.ps1 -Uhd); requires Python 3.12."
 }
 
 # --- 4. CUDA / CuPy (optional) --------------------------------------------
@@ -96,9 +118,18 @@ $nvidia = [bool](Get-Command nvidia-smi -ErrorAction SilentlyContinue)
 if ($Cuda) {
     Write-Host "Installing CuPy for CUDA 12.x (cupy-cuda12x<14)"
     & $VenvPy -m pip install "cupy-cuda12x<14"
+    if ($LASTEXITCODE -ne 0) { throw "pip install cupy-cuda12x failed" }
+    # CuPy does not bundle the CUDA runtime; install the pip wheels that
+    # provide cudart/NVRTC instead of a full CUDA Toolkit.  gnss_sim adds
+    # their DLL directories to the Windows search path at import time.
+    Write-Host "Installing NVIDIA CUDA 12 runtime libraries (cudart/NVRTC)"
+    & $VenvPy -m pip install nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not install the NVIDIA CUDA runtime wheels; CUDA synthesis may fail. Install CUDA Toolkit 12.x as a fallback."
+    }
 } elseif ($nvidia) {
     Write-Host "NVIDIA GPU detected - for GPU synthesis re-run with -Cuda, or:"
-    Write-Host "  .venv\Scripts\python.exe -m pip install 'cupy-cuda12x<14'"
+    Write-Host "  .venv\Scripts\python.exe -m pip install 'cupy-cuda12x<14' nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12"
 }
 
 # --- 5. Done --------------------------------------------------------------

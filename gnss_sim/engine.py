@@ -21,6 +21,12 @@ from typing import Callable
 
 import numpy as np
 
+from .cuda_env import configure_cuda_dlls
+
+# Register pip-installed CUDA DLLs (nvidia-*-cu12 wheels) before importing
+# CuPy, so it works without a system-wide CUDA Toolkit install on Windows.
+configure_cuda_dlls()
+
 try:  # CUDA acceleration is optional
     import cupy as _cp
 except Exception:  # pragma: no cover - CUDA optional

@@ -10,15 +10,22 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = { text = "MIT" }
 dependencies = [
-    "numpy>=1.24,<2.0",
+    "numpy>=1.24,<2.0; python_version < '3.13'",
+    "numpy>=2.0,<3.0; python_version >= '3.13'",
     "PyQt5>=5.15.9",
     "pyqtgraph>=0.13",
     "pyserial>=3.5",
 ]
 
 [project.optional-dependencies]
-cuda = ["cupy-cuda12x<14"]
+cuda = [
+    "cupy-cuda12x<14",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+    "nvidia-nvjitlink-cu12",
+]
 uhd = ["uhd==4.10.0.0"]
+dev = ["pytest>=7.0"]
 
 [project.scripts]
 gnss-sim = "gnss_sim.cli:main"
