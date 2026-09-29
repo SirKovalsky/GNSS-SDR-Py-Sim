@@ -14,8 +14,9 @@ from __future__ import annotations
 import numpy as np
 
 from gnss_sim import sbas
+from gnss_sim.constants import CODE_FREQ_CA, SPEED_OF_LIGHT
 from gnss_sim.engine import SignalEngine
-from gnss_sim.gpstime import GpsTime, date2gps
+from gnss_sim.gpstime import GpsTime, date2gps, sub_gps_time
 from gnss_sim.orbit import llh2xyz
 from gnss_sim.rinex import IonoUtc
 
@@ -192,39 +193,102 @@ def _make_engine() -> SignalEngine:
         enable_sbas=True, iono_enable=False)
 
 
+def test_default_schedule_carries_corrections_and_prn_mask() -> None:
+    """The engine's SBAS cycle must include the differential correction set."""
+    types = list(sbas.DEFAULT_SCHEDULE)
+    assert len(types) % 3 == 0
+    for needed in (1, 2, 3, 4, 6, 9, 17):
+        assert needed in types, f"schedule missing MT{needed}"
+    bits = sbas.sbas_bit_block(123, (42164000.0, 0.0, 0.0), t0_sod=0.0)
+    mt1 = None
+    for k, mt in enumerate(types):
+        p = sbas.parse_message(bits[k * 250:(k + 1) * 250])
+        assert p["crc_ok"]
+        if p["msg_type"] == 1:
+            mt1 = p["data"]
+    assert mt1 is not None, "no MT1 in the default schedule"
+    mask = mt1[:210]
+    for prn in (1, 7, 30, 32, 120, 123, 126):
+        assert mask[prn - 1] == 1, f"PRN {prn} not in MT1 mask"
+
+
 def test_engine_sbas_channel_is_populated() -> None:
     eng = _make_engine()
     sbas_chans = [c for c in eng.channels if c.kind == "sbas"]
     assert sbas_chans, "должен быть хотя бы один SBAS-канал"
     ch = sbas_chans[0]
     assert ch.sbas_bits is not None and ch.sbas_bits.ndim == 1
+    # FEC-encoded 500 sym/s block: one full schedule * 2 symbols / bit.
     assert ch.sbas_bits.size % sbas.SBAS_MSG_BITS == 0
-    assert ch.sbas_bits.size == 6 * sbas.SBAS_MSG_BITS
+    assert ch.sbas_bits.size == (len(sbas.DEFAULT_SCHEDULE)
+                                 * sbas.SBAS_MSG_BITS
+                                 * sbas.SBAS_SYMBOLS_PER_BIT)
     assert ch.sbas_frame_start is not None
     assert ch.sbas_frame_start.sec % 6.0 == 0.0
     assert set(np.unique(ch.sbas_bits).tolist()) == {0, 1}
 
 
-def test_engine_sbas_term_has_expected_bit_transitions() -> None:
+def test_conv_fec_roundtrip_and_length() -> None:
+    """Rate-1/2 K=7 FEC: 2 symbols per bit and exact Viterbi recovery."""
+    rng = np.random.default_rng(7)
+    bits = [int(x) for x in rng.integers(0, 2, 250)]
+    sym, _ = sbas.conv_encode(bits, state=0)
+    assert len(sym) == 2 * len(bits)
+    assert sbas.viterbi_decode(sym).tolist() == bits
+
+
+def test_conv_fec_state_carries_across_blocks() -> None:
+    """Encoding a bit stream split across calls must equal one continuous call.
+
+    The engine regenerates the SBAS block every schedule period; carrying the
+    6-bit encoder memory (DO-229 "no flush") keeps the trellis continuous so the
+    first message (MT1 PRN mask) survives the block boundary.
+    """
+    rng = np.random.default_rng(11)
+    bits = [int(x) for x in rng.integers(0, 2, 400)]
+    whole, _ = sbas.conv_encode(bits, state=0)
+    s1, e1 = sbas.conv_encode(bits[:137], state=0)
+    s2, _ = sbas.conv_encode(bits[137:], state=e1)
+    assert s1 + s2 == whole
+
+
+def test_engine_sbas_symbols_are_modulated_at_500sps() -> None:
+    """The 500 sym/s channel must change every 2 ms *inside* one block.
+
+    Regression: the bit/symbol index used to be a scalar computed once per
+    synthesis block, so for the default 500 ms block the data was a constant
+    sign and no SBAS message (nor its FEC) was ever transmitted.
+    """
     eng = _make_engine()
     ch = next(c for c in eng.channels if c.kind == "sbas")
-    t = np.arange(16, dtype=np.float64) * 1e-4
-    carrier = np.ones_like(t)
+    fs = eng.fs
+    n = int(0.2 * fs)                      # 200 ms -> ~100 symbols
+    t = np.arange(n, dtype=np.float64) / fs
+    g = GpsTime(eng.g.week, eng.g.sec)
+    rho = eng._geometry(ch, g, eng.xyz_fn(g))
+    out = eng._sbas_term(ch, g, t, CODE_FREQ_CA, np.ones_like(t), np, rho)
 
-    ca = ch.ca.astype(np.float64)
-    chip = np.floor(ch.ca_phase + 0.0 * t).astype(np.int64) % 1023
-    code = ca[chip]
-    assert not np.any(code == 0.0)
+    cp = ch.ca_phase + CODE_FREQ_CA * t
+    data = out / ch.ca.astype(np.float64)[
+        np.floor(cp).astype(np.int64) % 1023]
+    # One sample per 2 ms code group (code-phase aligned, as a receiver sees it).
+    grp = np.floor(cp / 2046.0).astype(np.int64)
+    _, first = np.unique(grp, return_index=True)
+    vals = data[first]
 
-    for sym in range(4):
-        g = GpsTime(eng.g.week, float(sym) * 0.004)
-        out = eng._sbas_term(ch, g, t, 0.0, carrier, np)
-        data = out / code
-        expected = 1.0 - 2.0 * float(ch.sbas_bits[sym])
-        assert np.allclose(data, expected)
-    # Соседние биты преамбулы MT9 (0x53 = 0101...) чередуются.
-    bits = [1.0 - 2.0 * float(ch.sbas_bits[i]) for i in range(4)]
-    assert bits[0] != bits[1] and bits[1] != bits[2]
+    assert set(np.round(vals, 6).tolist()) <= {1.0, -1.0}
+    # ~100 symbols over 200 ms => 500 sym/s, with many transitions.
+    assert len(vals) >= 95
+    assert np.count_nonzero(np.diff(vals)) >= 40
+
+    rec = ((1.0 - vals) / 2.0).astype(np.int8)
+    base_ms = (sub_gps_time(g, ch.sbas_frame_start)
+               - rho.rng / SPEED_OF_LIGHT) * 1000.0
+    k0 = int(np.floor(base_ms / 2.0)) + int(grp[first[0]])
+    sym = ch.sbas_bits
+    expect = np.array([sym[(k0 + i) % sym.shape[0]]
+                       for i in range(len(rec))], dtype=np.int8)
+    assert np.array_equal(rec, expect)
 
 
 def test_engine_sbas_signal_nontrivial() -> None:

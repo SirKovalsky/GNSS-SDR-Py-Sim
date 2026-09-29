@@ -1,8 +1,9 @@
 """RTCA DO-229 SBAS L1 C/A navigation message construction (250 bps).
 
-Every SBAS L1 message is a 250-bit block transmitted at 250 bit/s (one message
-per second, before the 1/2-rate convolutional FEC that halves the *channel*
-rate to 500 sym/s at the user level)::
+Every SBAS L1 message is a 250-bit block at 250 bit/s (one message per
+second).  The 250 bps data is then rate-1/2 K=7 convolutional encoded to the
+500 sym/s channel rate that the receiver's FEC decoder expects (2 ms per
+symbol = 2 C/A code periods)::
 
     bits   0..  7  preamble        (24-bit sequence 0x53, 0x9A, 0xC6 spread
                                     over three successive messages)
@@ -56,7 +57,13 @@ CRC24Q_POLY = 0x1864CFB
 SBAS_MSG_BITS = 250
 SBAS_DATA_BITS = 212
 SBAS_RATE_BPS = 250
-SYMBOL_SECONDS = 0.004          # 4 ms data bit -> 4 C/A code periods
+SYMBOL_SECONDS = 0.004          # 4 ms data bit -> 4 C/A code periods (raw)
+#: SBAS L1 channel symbols: rate-1/2 convolutional FEC at 500 sym/s (2 ms).
+SBAS_SYMBOL_RATE_BPS = 500
+SBAS_SYMBOLS_PER_BIT = 2
+FEC_STATE_BITS = 6
+FEC_G1 = 0o171                  # DO-229 / ICAO SARPS convolutional code
+FEC_G2 = 0o133
 
 #: The three 8-bit preambles, cycled once per message.  The start of every
 #: other 24-bit preamble is synchronous with a 6-second GPS subframe epoch, so
@@ -65,8 +72,19 @@ PREAMBLES: tuple[int, ...] = (0x53, 0x9A, 0xC6)
 
 #: Realistic repeating broadcast cycle used by the engine.  Length must be a
 #: multiple of 6 so the preamble rotation stays aligned to the 6-second GPS
-#: subframe epoch; MT9 (ephemeris), MT17 (almanac) and null MT63 dominate.
-DEFAULT_SCHEDULE: tuple[int, ...] = (9, 17, 63, 9, 17, 63)
+#: subframe epoch.  It carries the GEO ephemeris/almanac (MT9/MT17) *and* the
+#: differential correction set (MT1 PRN mask, MT2-5 fast corrections, MT6
+#: integrity, MT7 degradation, MT24/25 long term).  Without the corrections a
+#: receiver tracks the GEO but can never apply SBAS (no DGPS/fix=2), so the
+#: cycle is 18 messages / 18 s (a multiple of 3) and repeats the fast
+#: corrections frequently.
+DEFAULT_SCHEDULE: tuple[int, ...] = (
+    1, 9, 2, 6, 3, 7, 4, 6, 25, 9, 24, 6, 26, 17, 2, 6, 3, 9)
+
+#: Satellites declared monitored in the MT1 mask: every simulated GPS PRN plus
+#: the synthetic GEOs 120..126, so a receiver maps fast corrections onto them.
+DEFAULT_PRN_MASK_PRNS: tuple[int, ...] = (
+    tuple(range(1, 33)) + (120, 121, 122, 123, 124, 125, 126))
 
 
 # ----------------------------------------------------------------------
@@ -186,6 +204,83 @@ def message_bytes(bits: Sequence[int]) -> bytes:
 def bits_to_bipolar(bits: Sequence[int]) -> np.ndarray:
     """Map 0/1 bits to +1/-1 (``1 - 2*bit``)."""
     return (1 - 2 * np.asarray(bits, dtype=np.int16)).astype(np.int8)
+
+
+# ----------------------------------------------------------------------
+# Rate-1/2 K=7 convolutional FEC (DO-229 / ICAO SARPS), 500 sym/s
+# ----------------------------------------------------------------------
+def _parity(x: int) -> int:
+    return bin(x).count("1") & 1
+
+
+def conv_encode(bits: Sequence[int], *, state: int = 0,
+                invert_g2: bool = True) -> tuple[list[int], int]:
+    """Convolutional encode ``bits``; returns ``(symbols, state)``.
+
+    Rate 1/2, K=7, ``G1 = 171o`` / ``G2 = 133o``, output order G1 then G2, no
+    flush (DO-229 Appendix A / ICAO SARPS Annex 10 Vol. I App. B).  The SBAS
+    convention inverts the G2 branch (as does the Galileo I/NAV ICD).  The SBAS
+    broadcast is 500 channel symbols/s = two symbols per 250 bps data bit; a
+    receiver *cannot* decode the message without this FEC.  ``state`` is the
+    6-bit encoder memory and carries across calls so the trellis is continuous.
+    """
+    mem = int(state) & 0x3F
+    out: list[int] = []
+    for bit in bits:
+        reg = ((int(bit) & 1) << 6) | mem
+        out.append(_parity(reg & FEC_G1))
+        g2 = _parity(reg & FEC_G2)
+        out.append(g2 ^ 1 if invert_g2 else g2)
+        mem = (((int(bit) & 1) << 5) | (mem >> 1)) & 0x3F
+    return out, mem
+
+
+def _conv_step(state: int, bit: int, invert_g2: bool = True
+               ) -> tuple[int, int, int]:
+    reg = ((int(bit) & 1) << 6) | (int(state) & 0x3F)
+    nxt = (((int(bit) & 1) << 5) | ((int(state) & 0x3F) >> 1)) & 0x3F
+    g2 = _parity(reg & FEC_G2)
+    return _parity(reg & FEC_G1), (g2 ^ 1 if invert_g2 else g2), nxt
+
+
+def viterbi_decode(coded: Sequence[float], invert_g2: bool = True) -> np.ndarray:
+    """Hard-decision Viterbi decode of an SBAS rate-1/2 symbol stream.
+
+    ``coded`` values > 0 are symbol 1, otherwise 0.  Returns the decoded bits.
+    Used to validate :func:`conv_encode` (and mirrors what an SBAS receiver's
+    FEC decoder does after preamble/polarity resolution).
+    """
+    stream = [1 if v > 0 else 0 for v in coded]
+    if len(stream) % 2:
+        raise ValueError("coded sequence length must be even")
+    inf = 1 << 30
+    cost = [inf] * 64
+    cost[0] = 0
+    trace: list[list[tuple[int, int] | None]] = []
+    for t in range(len(stream) // 2):
+        ncost = [inf] * 64
+        nprev: list[tuple[int, int] | None] = [None] * 64
+        r1, r2 = stream[2 * t], stream[2 * t + 1]
+        for state in range(64):
+            if cost[state] >= inf:
+                continue
+            for bit in (0, 1):
+                g1, g2, nxt = _conv_step(state, bit, invert_g2)
+                c = cost[state] + (g1 != r1) + (g2 != r2)
+                if c < ncost[nxt]:
+                    ncost[nxt] = c
+                    nprev[nxt] = (state, bit)
+        trace.append(nprev)
+        cost = ncost
+    state = min(range(64), key=lambda s: cost[s])
+    out: list[int] = []
+    for t in range(len(trace) - 1, -1, -1):
+        prev = trace[t][state]
+        assert prev is not None
+        state, bit = prev
+        out.append(bit)
+    out.reverse()
+    return np.array(out, dtype=np.int8)
 
 
 # ----------------------------------------------------------------------
@@ -407,8 +502,20 @@ def _geo_almanac(prn: int, sv_ecef: Sequence[float]) -> dict:
             "velocity": (0.0, 0.0, 0.0)}
 
 
+def _prn_mask_bits(prns: Sequence[int]) -> list[int]:
+    """Return the 210-bit MT1 PRN mask for the given SV numbers (1-based)."""
+    bits = [0] * 210
+    for p in prns:
+        i = int(p)
+        if 1 <= i <= 210:
+            bits[i - 1] = 1
+    return bits
+
+
 def _make_by_type(msg_type: int, preamble: int, prn: int,
-                  sv_ecef: Sequence[float], t0_sod: float) -> np.ndarray:
+                  sv_ecef: Sequence[float], t0_sod: float,
+                  mask_prns: Sequence[int] = DEFAULT_PRN_MASK_PRNS
+                  ) -> np.ndarray:
     if msg_type == 9:
         return make_mt9(t0_sod=t0_sod, position=tuple(sv_ecef),
                         preamble=preamble)
@@ -426,7 +533,7 @@ def _make_by_type(msg_type: int, preamble: int, prn: int,
     elif msg_type in (2, 3, 4, 5):
         data = mt2_data()
     elif msg_type == 1:
-        data = mt1_data()
+        data = mt1_data(mask=_prn_mask_bits(mask_prns))
     elif msg_type == 63:
         data = [0] * SBAS_DATA_BITS
     else:
@@ -436,27 +543,55 @@ def _make_by_type(msg_type: int, preamble: int, prn: int,
 
 def sbas_bit_block(prn: int, sv_ecef: Sequence[float], *,
                    t0_sod: float = 0.0,
-                   schedule: Sequence[int] = DEFAULT_SCHEDULE) -> np.ndarray:
+                   schedule: Sequence[int] = DEFAULT_SCHEDULE,
+                   mask_prns: Sequence[int] = DEFAULT_PRN_MASK_PRNS
+                   ) -> np.ndarray:
     """Return a repeating ``int8`` bit block for one synthetic GEO.
 
     The schedule must contain a whole number of 3-message preamble cycles so
-    that concatenating blocks preserves the 0x53/0x9A/0xC6 rotation.  Default
-    length 6 also makes the block start re-align with the 6-second GPS subframe
-    epoch every repetition.  ``t0_sod`` is the SBAS/GPS time-of-day written
-    into MT9/MT17.
+    that concatenating blocks preserves the 0x53/0x9A/0xC6 rotation.  The
+    default 18-message (18 s) cycle carries MT9/MT17 plus the differential
+    correction set (MT1 mask, MT2-5 fast, MT6/MT7 integrity, MT24/25 long
+    term).  ``t0_sod`` is the SBAS/GPS time-of-day written into MT9/MT17.
     """
     sched = tuple(int(m) & 0x3F for m in schedule)
     if not sched or len(sched) % 3:
         raise ValueError("SBAS schedule length must be a positive multiple of 3")
-    msgs = [_make_by_type(mt, PREAMBLES[k % 3], prn, sv_ecef, t0_sod)
+    msgs = [_make_by_type(mt, PREAMBLES[k % 3], prn, sv_ecef, t0_sod,
+                          mask_prns)
             for k, mt in enumerate(sched)]
     return np.concatenate(msgs).astype(np.int8)
+
+
+def sbas_symbol_block(prn: int, sv_ecef: Sequence[float], *,
+                      t0_sod: float = 0.0,
+                      schedule: Sequence[int] = DEFAULT_SCHEDULE,
+                      mask_prns: Sequence[int] = DEFAULT_PRN_MASK_PRNS,
+                      state: int = 0, return_state: bool = False):
+    """Return the FEC-encoded 500 sym/s block for one synthetic GEO.
+
+    The 250 bps messages from :func:`sbas_bit_block` are passed through the
+    rate-1/2 K=7 convolutional encoder with a continuous trellis, giving two
+    symbols per data bit (one symbol per 2 ms = 2 C/A code periods).  A real
+    SBAS receiver's FEC decoder needs exactly this encoding; broadcasting raw
+    250 bps bits made every SBAS message undecodable.
+
+    ``state``/``return_state`` let the caller carry the encoder memory across
+    consecutively broadcast blocks (no flush, DO-229).  With ``return_state``
+    the result is ``(symbols, end_state)``.
+    """
+    bits = sbas_bit_block(prn, sv_ecef, t0_sod=t0_sod, schedule=schedule,
+                          mask_prns=mask_prns)
+    symbols, end = conv_encode(bits.tolist(), state=state, invert_g2=True)
+    arr = np.asarray(symbols, dtype=np.int8)
+    return (arr, end) if return_state else arr
 
 
 def sbas_message_stream(duration_s: float = 6.0, *,
                         prn: int = 0, sv_ecef: Sequence[float] = (0.0, 0.0, 0.0),
                         t0_sod: float = 0.0,
-                        schedule: Sequence[int] = DEFAULT_SCHEDULE
+                        schedule: Sequence[int] = DEFAULT_SCHEDULE,
+                        mask_prns: Sequence[int] = DEFAULT_PRN_MASK_PRNS
                         ) -> Iterator[np.ndarray]:
     """Yield one 250-bit ``int8`` message per second (250 bps) for a duration."""
     sched = tuple(int(m) & 0x3F for m in schedule)
@@ -464,7 +599,7 @@ def sbas_message_stream(duration_s: float = 6.0, *,
         raise ValueError("SBAS schedule length must be a positive multiple of 3")
     for k in range(int(duration_s)):
         yield _make_by_type(sched[k % len(sched)], PREAMBLES[k % 3],
-                            prn, sv_ecef, t0_sod)
+                            prn, sv_ecef, t0_sod, mask_prns)
 
 
 def sbas_stream_bits(duration_s: float = 6.0, **kw) -> np.ndarray:
@@ -541,16 +676,34 @@ def self_test() -> None:
     if abs(dec17["t0_sod"] - 43200.0) > 64.0:
         raise AssertionError("MT17 t0 round-trip out of tolerance")
 
-    # 6) block geometry: 6 messages = 6 s = 1500 bits at 250 bps.
+    # 6) block geometry: one full schedule at 250 bps, FEC to 500 sym/s.
     block = sbas_bit_block(122, pos, t0_sod=43200.0)
-    if block.size != 6 * SBAS_MSG_BITS:
+    if block.size != len(DEFAULT_SCHEDULE) * SBAS_MSG_BITS:
         raise AssertionError("unexpected block length")
-    for k in range(6):
+    for k in range(len(DEFAULT_SCHEDULE)):
         m = block[k * 250:(k + 1) * 250]
         if not parse_message(m)["crc_ok"]:
             raise AssertionError(f"block message {k} CRC failed")
         if int(m[0:8].dot(1 << np.arange(7, -1, -1))) != PREAMBLES[k % 3]:
             raise AssertionError(f"block message {k} preamble mismatch")
+
+    # 7) rate-1/2 convolutional FEC (500 sym/s) and symbol block.
+    probe = [int(x) for x in np.random.default_rng(0).integers(0, 2, 250)]
+    sym, _ = conv_encode(probe)
+    if len(sym) != 2 * len(probe):
+        raise AssertionError("FEC must produce 2 symbols per bit")
+    if not np.array_equal(viterbi_decode(sym), np.array(probe, dtype=np.int8)):
+        raise AssertionError("FEC encode/decode round-trip failed")
+    sblk = sbas_symbol_block(122, pos, t0_sod=43200.0)
+    if sblk.size != (SBAS_SYMBOLS_PER_BIT * len(DEFAULT_SCHEDULE)
+                     * SBAS_MSG_BITS):
+        raise AssertionError("unexpected FEC symbol block length")
+
+    # 8) the default cycle must carry the differential correction set.
+    types = set(int(m) for m in DEFAULT_SCHEDULE)
+    for needed in (1, 2, 6, 9, 17):
+        if needed not in types:
+            raise AssertionError(f"schedule is missing MT{needed}")
 
 
 if __name__ == "__main__":  # pragma: no cover

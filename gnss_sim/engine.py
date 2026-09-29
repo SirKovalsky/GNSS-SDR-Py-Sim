@@ -55,7 +55,7 @@ from .orbit import (
     compute_range, ecef2neu, ionospheric_delay, ltcmat, neu2azel, xyz2llh,
 )
 from .rinex import Ephemeris, IonoUtc, select_ephemeris
-from .sbas import sbas_bit_block
+from .sbas import DEFAULT_SCHEDULE, sbas_symbol_block
 
 # Antenna pattern (dB) versus boresight angle in 5 deg steps, ported from gpssim.
 _ANT_PAT_DB = (
@@ -68,6 +68,9 @@ _ANT_PAT = np.array([10.0 ** (-db / 20.0) for db in _ANT_PAT_DB])
 
 TWO_PI = 2.0 * np.pi
 _SBAS_GEO_RADIUS = 42164000.0
+#: SBAS broadcast block length = one full message schedule (multiple of 6 s so
+#: the 24-bit preamble stays aligned to the 6 s GPS subframe epoch).
+_SBAS_FRAME_S = float(len(DEFAULT_SCHEDULE))
 _SBAS_RANGE = 3.8e7
 _GALILEO_SEC_BIT = 0.004          # 250 bps secondary / data symbol length
 #: GST week 0 started 1999-08-22 = GPS week 1024; the I/NAV WN field is GST.
@@ -257,9 +260,11 @@ class Channel:
     frame_start: GpsTime | None = None
     l1c_frame_start: GpsTime | None = None
     cnav2: np.ndarray | None = None
-    # SBAS 250 bps data (DO-229): repeating int8 bit block + 6 s frame epoch
+    # SBAS FEC symbols (500 sym/s, DO-229): repeating int8 block + frame epoch
     sbas_frame_start: GpsTime | None = None
     sbas_bits: np.ndarray | None = None
+    # convolutional-encoder memory carried across consecutive SBAS blocks
+    sbas_fec_state: int = 0
     # BeiDou B1I D1 data (50 bps channel bits) + 30 s frame epoch
     b1i_frame_start: GpsTime | None = None
     b1i_bits: np.ndarray | None = None
@@ -478,9 +483,11 @@ class SignalEngine:
             ch.l1c_frame_start = l0
             ch.cnav2 = self._l1c_frame_bits(ch, l0)
         elif ch.kind == "sbas":
-            # 6 s frame aligns the 3-message 0x53/0x9A/0xC6 preamble cycle
-            # with the 6 s GPS subframe epoch (DO-229 A.1).
-            s0 = GpsTime(self.g.week, float(int(self.g.sec // 6) * 6))
+            # One full 3-message-cycle-aligned broadcast block (multiple of 6 s)
+            # so the 0x53/0x9A/0xC6 preamble rotation lands on the 6 s GPS
+            # subframe epoch (DO-229 A.1).  Default schedule is 18 s.
+            s0 = GpsTime(self.g.week,
+                         float(int(self.g.sec // _SBAS_FRAME_S) * _SBAS_FRAME_S))
             ch.sbas_frame_start = s0
             ch.sbas_bits = self._sbas_block_bits(ch, s0)
         elif ch.kind == "galileo":
@@ -533,14 +540,27 @@ class SignalEngine:
         return np.zeros(1800, dtype=np.int8)
 
     def _sbas_block_bits(self, ch: Channel, frame_start: GpsTime) -> np.ndarray:
-        """Real DO-229 250 bps block for a synthetic GEO (6 messages = 6 s).
+        """FEC-encoded SBAS block (one full schedule; 18 msgs = 18 s = 9000 sym).
 
-        MT9 (GEO ephemeris) and MT17 (GEO almanac) are derived from the
-        channel's fixed ECEF position with zero ECEF velocity, so a receiver
-        decodes a self-consistent (static) GEO orbit.
+        The schedule messages (MT1/2/3/4/6/7/9/17/24/25/26 by default) are
+        built at 250 bps and then rate-1/2 K=7 convolutional encoded
+        (:func:`gnss_sim.sbas.conv_encode`) so the broadcast matches the SBAS
+        L1 channel that a real receiver's FEC/Viterbi decoder expects.  MT9
+        (GEO ephemeris) and MT17 (GEO almanac) are derived from the channel's
+        fixed ECEF position with zero ECEF velocity, so a receiver decodes a
+        self-consistent (static) GEO.  The encoder memory is carried across
+        regenerated blocks (DO-229 "no flush").
         """
         t0_sod = frame_start.sec % 86400.0
-        return sbas_bit_block(ch.prn, ch.sv_ecef, t0_sod=t0_sod)
+        block, state = sbas_symbol_block(
+            ch.prn, ch.sv_ecef, t0_sod=t0_sod,
+            state=int(getattr(ch, "sbas_fec_state", 0)), return_state=True)
+        # Carry the encoder memory so consecutively broadcast blocks stay a
+        # single continuous trellis (DO-229 "no flush"); without this the first
+        # message of every regenerated block (MT1, the PRN mask) lost its
+        # preamble to the state jump and no corrections could be mapped.
+        ch.sbas_fec_state = int(state)
+        return block
 
     def _galileo_block_bits(self, ch: Channel, frame_start: GpsTime) -> np.ndarray:
         """Real Galileo E1-B I/NAV sub-frame (15 pages = 30 s = 7500 bits).
@@ -605,10 +625,10 @@ class SignalEngine:
                             ch.l1c_frame_start.sec - 604800.0)
                     ch.cnav2 = self._l1c_frame_bits(ch, ch.l1c_frame_start)
             if ch.sbas_frame_start is not None:
-                while sub_gps_time(g, ch.sbas_frame_start) >= 6.0:
+                while sub_gps_time(g, ch.sbas_frame_start) >= _SBAS_FRAME_S:
                     ch.sbas_frame_start = GpsTime(
                         ch.sbas_frame_start.week,
-                        ch.sbas_frame_start.sec + 6.0)
+                        ch.sbas_frame_start.sec + _SBAS_FRAME_S)
                     if ch.sbas_frame_start.sec >= 604800.0:
                         ch.sbas_frame_start = GpsTime(
                             ch.sbas_frame_start.week + 1,
@@ -736,17 +756,31 @@ class SignalEngine:
                - e1c[chip] * e1sec[sec_idx] * comp_c)
         return 0.7071067811865476 * sig * carrier
 
-    def _sbas_term(self, ch, g, t, f_code, carrier, xp):
+    def _sbas_term(self, ch, g, t, f_code, carrier, xp, rho=None):
         ca = self._device(ch.ca, xp)
         cp = ch.ca_phase + f_code * t
         chip = xp.floor(cp).astype(xp.int64) % 1023
         code = ca[chip].astype(xp.float64)
         if ch.sbas_bits is not None and ch.sbas_frame_start is not None:
             block = self._device(ch.sbas_bits, xp, cache=False)
-            # One DO-229 data bit spans 4 ms = 4 C/A code periods (250 bps).
-            sym = int(sub_gps_time(g, ch.sbas_frame_start) / 0.004)
-            bit = block[sym % block.shape[0]]
-            data = (1.0 - 2.0 * bit).astype(xp.float64)
+            # DO-229 SBAS L1: the 250 bps message is rate-1/2 convolutional
+            # encoded to 500 sym/s, i.e. one channel symbol spans 2 ms =
+            # 2 C/A code periods.  The symbol index must be evaluated *per
+            # sample* and track the received code epochs exactly like the GPS
+            # legacy / Galileo legs: ``floor(base_ms/2)`` is the 2 ms symbol at
+            # the block start (including the propagation delay ``rng/c``) and
+            # ``floor(cp/2046)`` counts the 2 ms code groups elapsed inside the
+            # block.  Two earlier bugs made SBAS undecodable: the index was a
+            # scalar per 500 ms block (data constant) and there was no FEC.
+            if rho is not None:
+                base_ms = (sub_gps_time(g, ch.sbas_frame_start)
+                           - rho.rng / SPEED_OF_LIGHT) * 1000.0
+            else:
+                base_ms = (g.sec - ch.sbas_frame_start.sec) * 1000.0
+            k = (xp.floor(base_ms / 2.0).astype(xp.int64)
+                 + xp.floor(cp / 2046.0).astype(xp.int64))
+            sym = k % block.shape[0]
+            data = (1.0 - 2.0 * block[sym]).astype(xp.float64)
         else:
             data = xp.ones_like(t)
         return code * data * carrier
@@ -820,7 +854,8 @@ class SignalEngine:
                 acc += ch.amp * self._galileo_term(ch, g, t, f_code, carrier, xp,
                                                    rho)
             elif ch.kind == "sbas":
-                acc += ch.amp * self._sbas_term(ch, g, t, f_code, carrier, xp)
+                acc += ch.amp * self._sbas_term(ch, g, t, f_code, carrier, xp,
+                                                rho)
             elif ch.kind == "beidou":
                 acc += ch.amp * self._b1i_term(ch, g, t, f_code, carrier, xp,
                                                rho)

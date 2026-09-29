@@ -1465,12 +1465,16 @@ class MainWindow(QtWidgets.QMainWindow):
         f5.addWidget(self.lbl_tx_info, 6, 0, 1, 3)
         self.cb_tx_native = QtWidgets.QCheckBox(
             "Нативная передача (C++, без Python/GIL в петле UHD)")
-        self.cb_tx_native.setChecked(self._native_tx_available())
+        # Explicit opt-in: the helper is never used silently just because the
+        # executable exists (SimConfig.tx_native / CLI --tx-native default off).
+        self.cb_tx_native.setChecked(False)
+        self.cb_tx_native.setEnabled(self._native_tx_available())
         self.cb_tx_native.setToolTip(
             "Сегмент предгенерируется во временный cs16-файл и играется "
             "native/gnss_sim_tx.exe — убирает underflow Python-петли на "
-            "~25 Мвыб/с. Если exe не собран (native\\build.bat), "
-            "используется встроенный Python-путь с записью в журнал.")
+            "~25 Мвыб/с. По умолчанию выключено (передача идёт встроенным "
+            "Python-путём UHD); недоступно, если exe не собран "
+            "(native\\build.bat).")
         f5.addWidget(self.cb_tx_native, 7, 0, 1, 3)
         f5.addWidget(self._group_reset_btn(self._reset_uhd_group,
                                            "Сбросить только параметры B210"),
@@ -1485,7 +1489,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_ant.setText("TX/RX")
         self.sp_bw.setValue(0.0)
         self.cmb_clk.setCurrentText("internal")
-        self.cb_tx_native.setChecked(self._native_tx_available())
+        self.cb_tx_native.setChecked(False)
+        self.cb_tx_native.setEnabled(self._native_tx_available())
         self._update_channel_validity()
 
     def _build_monitor_group(self) -> QtWidgets.QGroupBox:
