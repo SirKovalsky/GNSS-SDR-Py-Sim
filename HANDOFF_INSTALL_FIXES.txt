@@ -120,8 +120,10 @@ PID-файл. Подкоманды:
 Переменные окружения: PYTHON (по умолч. .venv/bin/python, иначе python3),
 GNSS_BG_LOG (по умолч. <repo>/player.log), GNSS_BG_PID
 (по умолч. <repo>/player.pid), GNSS_BG_EXTRA (доп. аргументы строкой).
-Особенности: по умолчанию плеер зациклен (актуально для фона; --no-loop
-отключает); фиксирует $! после nohup (nohup exec'ает python — PID точный).
+Особенности: скрипт добавляет -d 0 (до Стоп) — иначе CLI-дефолт -d 120
+обрывал бы передачу через 120 с (loop не спасает: runner._run_source
+останавливается на duration); --no-loop даёт один проход. Фиксирует $!
+после nohup (nohup exec'ает python — PID точный).
 Проверка: `bash -n scripts/run_player_bg.sh` (Git Bash на Windows) — синтаксис OK.
 На Linux сделать исполняемым: `chmod +x scripts/run_player_bg.sh`.
 СТАТУС: скрипт закоммичен (9ddae8b, mode 755, LF). Инструкция добавлена в

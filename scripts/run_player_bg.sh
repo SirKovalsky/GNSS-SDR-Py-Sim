@@ -23,6 +23,10 @@
 #   scripts/run_player_bg.sh log 100
 #   scripts/run_player_bg.sh stop
 #
+# Передача идёт непрерывно: скрипт по умолчанию добавляет `-d 0` («до Стоп»),
+# иначе CLI-дефолт -d 120 оборвал бы эфир через 120 с. Передайте свой
+# `-d СЕК`, чтобы ограничить длительность; `--no-loop` — один проход.
+#
 # Переменные окружения:
 #   PYTHON         интерпретатор (по умолч. <repo>/.venv/bin/python, иначе python3)
 #   GNSS_BG_LOG    путь к логу (по умолч. <repo>/player.log)
@@ -68,7 +72,10 @@ do_start() {
     fi
     local py
     py="$(pick_python)"
-    local -a args=(-m gnss_sim --iq-input "$iq" --tx)
+    # -d 0 = «до Стоп»: без него CLI-дефолт -d 120 остановил бы передачу через
+    # 120 с даже при включённом зацикливании. Свой -d можно передать позже —
+    # argparse берёт последнее значение.
+    local -a args=(-m gnss_sim --iq-input "$iq" --tx -d 0)
     # GNSS_BG_EXTRA намеренно разворачивается по словам (это строка аргументов).
     # shellcheck disable=SC2206
     [[ -n "${GNSS_BG_EXTRA:-}" ]] && args+=(${GNSS_BG_EXTRA})
