@@ -1,0 +1,169 @@
+HANDOFF: проблемы установки GNSS-SDR-Py-Sim и их решения
+=======================================================
+Дата: 2026-09-29
+Проект: E:\Software_my\GNSS-SDR-Py-Sim
+Ветка: main, коммит 4f6d93b (запушен в origin/main)
+Назначение: отчёт для основной сессии о правках установки/окружения.
+
+Все правки установки уже в коммите 4f6d93b. В рабочем дереве untracked:
+- uhd_4.10.0.0-release_Win64_VS2022.exe (установщик UHD в корне, НЕ коммитить);
+- scripts/run_player_bg.sh (новый скрипт фонового запуска плеера, см. ниже);
+- этот файл HANDOFF_INSTALL_FIXES.txt.
+
+ОКРУЖЕНИЕ (проверено)
+--------------------
+- OS: Windows (win32), PowerShell 5.1
+- Python: 3.12.10 в .venv (создан `py -3.12 -m venv .venv`); py-лаунчер
+  также видит 3.13 (по умолчанию) и 3.7
+- numpy 1.26.4, PyQt5 5.15.11, pyqtgraph 0.14.0, pyserial 3.5, pytest 9.1.1
+- uhd 4.10.0.0 (bindings), uhd.get_version_string() = '4.10.0.0-release'
+- cupy-cuda12x 13.6.0, fastrlock 0.8.3
+- GPU: NVIDIA GeForce RTX 4070 Laptop, драйвер 591.74, CUDA (макс. драйвера) 13.1
+- Железо: USRP B210 (USB VID 2500, PID 0020)
+
+ПРОБЛЕМА 1: pip install падает на numpy (Python 3.13)
+-----------------------------------------------------
+Симптом: `pip install -r requirements.txt` -> numpy 1.26.4 уходит в source
+build (Meson) и падает 'Unknown compiler(s): ...' (нет C-компилятора).
+Причина: pin 'numpy>=1.24,<2.0' не имеет wheel'ов под py3.13 (NumPy 1.26.4
+поддерживает <=3.12), pip уходит в сборку.
+Решение: маркеры по версии Python.
+- requirements.txt:
+    numpy>=1.24,<2.0; python_version < "3.13"
+    numpy>=2.0,<3.0; python_version >= "3.13"
+- pyproject.toml: те же условия (одинарные кавычки).
+Проверка: gnss_sim НЕ использует удалённые в NumPy 2 API (np.float_/np.int_/
+np.trapz/np.in1d и т.п.); на 3.13 (numpy 2.5.3) `import gnss_sim` работает.
+
+PYTEST в зависимости
+--------------------
+Было: setup_windows.ps1 предлагал `python -m pytest tests -q`, но pytest не
+был в requirements. Добавлено 'pytest>=7.0' в requirements.txt и extra 'dev'
+в pyproject.toml.
+
+ПРОБЛЕМА 2: uhd требует numpy<2, несовместим с Python 3.13
+----------------------------------------------------------
+Симптом: wheel uhd cp313 есть, но зависимость 'numpy<2.0,>=1.11' снова тянет
+source build numpy 1.26.4 и падает. С --no-deps под numpy 2.5.3 — runtime
+ImportError 'A module that was compiled using NumPy 1.x cannot be run in
+NumPy 2.5.3'.
+Вывод: UHD => Python <= 3.12.
+Решение: установлен Python 3.12.10 (winget Python.Python.3.12), пересоздан
+.venv; uhd==4.10.0.0 + numpy 1.26.4 (cp312 wheel, без сборки) работают.
+Правки:
+- setup_windows.ps1: default -Python 'py -3.12'; добавлен -Uhd; ветка UHD
+  сначала проверяет уже установленные биндинги (`import uhd`), иначе на >=3.13
+  предупреждает и советует 3.12, иначе ставит uhd==4.10.0.0.
+- README.md: инструкции на `py -3.12`, пояснение про UHD/NumPy.
+
+ПРОБЛЕМА 3: USRP B210 не виден
+------------------------------
+Диагностика: Get-PnpDevice показывал B210 (USB VID_2500&PID_0020) как
+'WestBridge', Status Error, ProblemCode 28 — не установлен WinUSB драйвер
+(libusb/UHD на Windows требует WinUSB).
+Действие: установлен Zadig (winget akeo.ie.Zadig), привязан WinUSB (admin+GUI).
+СТАТУС: РЕШЕНО — пользователь перезагрузил ПК после установки, устройство
+заработало. Это НЕ баг проекта, правки не нужны.
+Примечание: C:\Program Files\UHD уже есть; FPGA-образ
+C:\Program Files\UHD\share\uhd\images\usrp_b210_fpga.bin присутствует.
+Пакет pip `uhd` FPGA-образы НЕ содержит.
+
+ПРОБЛЕМА 4 (ГЛАВНАЯ): CuPy не грузит nvrtc64_120_0.dll
+------------------------------------------------------
+Симптом: после `setup_windows.ps1 -Cuda` и запуска GUI появлялся диалог
+'CuPy failed to load nvrtc64_120_0.dll: FileNotFoundError: Could not find
+module ... (or one of its dependencies)'.
+Причина: колесо cupy-cuda12x НЕ содержит CUDA runtime. CuPy ищет CUDA по
+CUDA_PATH / nvcc on PATH / /usr/local/cuda (cupy/_environment.py:
+_get_cuda_path); _setup_win32_dll_directory добавляет только <CUDA_PATH>/bin
+и cupy/.data/lib. На машине нет CUDA Toolkit, CUDA_PATH пуст. NVIDIA-колёса
+nvidia-*-cu12 кладут DLL в site-packages/nvidia/<comp>/bin, но НЕ регистрируют
+их в DLL-поиске Windows -> nvrtc не найден, JIT-ядра не компилируются.
+Решение (реализовано):
+1. Новый gnss_sim/cuda_env.py -> configure_cuda_dlls(): на win32 находит все
+   site-packages/nvidia/*/bin, вызывает os.add_dll_directory(...) для каждого,
+   добавляет их в PATH и, если CUDA_PATH не задан, выставляет его в каталог с
+   cudart64_*.dll. Off-Windows и без nvidia-пакетов — no-op.
+2. gnss_sim/engine.py: вызов configure_cuda_dlls() ПЕРЕД `import cupy`.
+3. setup_windows.ps1 -Cuda: кроме cupy-cuda12x<14 ставит
+   nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-nvjitlink-cu12.
+4. pyproject.toml extra 'cuda' теперь включает эти 3 nvidia-пакета.
+5. requirements.txt / README.md: команды установки обновлены.
+Проверка (воспроизводимо):
+  .venv\Scripts\python.exe -c "from gnss_sim.engine import cuda_available; print(cuda_available())"
+  -> True (CUDA_PATH изначально None, выставляется самим cuda_env)
+  cupy JIT (cp.sqrt) компилируется.
+  pytest tests/test_galileo_nav.py::test_engine_cpu_vs_cuda tests/test_cnav2.py::test_engine_cnav2_cpu_vs_cuda -q -> 2 passed
+
+ПРОБЛЕМА 5: запуск плеера на удалённом Linux по SSH (фоновый режим)
+------------------------------------------------------------------
+Контекст: плеер — это штатный CLI-режим playback готового IQ-файла на USRP:
+    python -m gnss_sim --iq-input FILE --tx [--uhd-args type=b200 --tx-gain ...]
+(см. README.md ~стр. 274-275, 302-305). Нативный C++ помощник
+(native/tx_player.cpp) собран ТОЛЬКО под Windows/MSVC (windows.h,
+SetPriorityClass), поэтому на Linux используется Python-путь UHD
+(gnss_sim/uhd_tx.py), а --tx-native там недоступен.
+Проблема: при запуске по SSH процесс получает SIGHUP и умирает при закрытии
+сессии — передача обрывается.
+Решение: скрипт scripts/run_player_bg.sh — запускает плеер в фоне через
+nohup (unSIGHUP), уводит stdin/stdout/stderr из терминала в лог, пишет
+PID-файл. Подкоманды:
+    scripts/run_player_bg.sh start  IQ.cs16 [арг. gnss_sim ...]
+    scripts/run_player_bg.sh stop
+    scripts/run_player_bg.sh restart IQ.cs16 [арг. ...]
+    scripts/run_player_bg.sh status        # ps по PID + путь лога
+    scripts/run_player_bg.sh log [N]       # хвост лога, по умолч. 40 строк
+Примеры:
+    scripts/run_player_bg.sh start out.cs16 --uhd-args type=b200 --tx-gain 18
+    scripts/run_player_bg.sh start out.cs16 --uhd-args type=b200,serial=XXXX
+    scripts/run_player_bg.sh log 100
+    scripts/run_player_bg.sh stop
+Переменные окружения: PYTHON (по умолч. .venv/bin/python, иначе python3),
+GNSS_BG_LOG (по умолч. <repo>/player.log), GNSS_BG_PID
+(по умолч. <repo>/player.pid), GNSS_BG_EXTRA (доп. аргументы строкой).
+Особенности: по умолчанию плеер зациклен (актуально для фона; --no-loop
+отключает); фиксирует $! после nohup (nohup exec'ает python — PID точный).
+Проверка: `bash -n scripts/run_player_bg.sh` (Git Bash на Windows) — синтаксис OK.
+На Linux сделать исполняемым: `chmod +x scripts/run_player_bg.sh`.
+СТАТУС: скрипт создан, но НЕ закоммичен (untracked).
+
+ИЗМЕНЁННЫЕ ФАЙЛЫ (коммит 4f6d93b)
+----------------------------------
+- gnss_sim/cuda_env.py   (новый)
+- gnss_sim/engine.py
+- scripts/setup_windows.ps1
+- pyproject.toml
+- requirements.txt
+- README.md
+
+РЕЗУЛЬТАТЫ ТЕСТОВ
+-----------------
+Полный прогон: 363 passed, 11 skipped, 9 failed.
+2 CUDA-теста теперь ВЫПОЛНЯЮТСЯ (раньше skip) и проходят.
+9 failed — окружение, НЕ регрессии:
+- сеть/данные (SSL CERTIFICATE_VERIFY_FAILED при скачивании RINEX BKG/CDDIS,
+  нет локальных файлов):
+    test_b1i_guard_and_merged.py::test_apply_b1i_band_gps_only_keeps_band
+      (читает отсутствующий brdc2680.26n)
+    test_cddis_ram_b1i.py::test_parse_nav_file_accepts_list_and_merges
+    test_reuse_and_looping.py::test_gzip_rinex_decompression_and_parse
+    test_reuse_and_looping.py::test_parse_nav_gz_extension_matches_plain
+    test_time_continuous_loop.py::test_nonloop_l1ca_output_byte_identical
+    test_time_continuous_loop.py::test_nonloop_runner_matches_engine_directly
+- дата/таймзона GUI (QDate 1752 vs 2026):
+    test_reuse_and_looping.py::test_start_time_coverage_validation
+    test_reuse_and_looping.py::test_gui_validate_start_rejects_out_of_range
+    test_tx_and_gui.py::test_gui_start_coverage_binding
+
+ЗАМЕЧАНИЯ / TODO для основной сессии
+------------------------------------
+- Запуск .ps1 блокируется ExecutionPolicy; использовать:
+  powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/setup_windows.ps1
+- Untracked uhd_4.10.0.0-release_Win64_VS2022.exe в корне — не коммитить
+  (по желанию: добавить в .gitignore или удалить).
+- Желательно: если CuPy установлен, но падает при загрузке, GUI должен
+  сообщать об ошибке и переключаться на CPU, а не показывать сырой диалог
+  синтеза (см. gnss_sim/gui.py:2508 и :2728). Сейчас CUDA в auto-режиме
+  выбирается по cuda_available(); проверить graceful fallback.
+- Linux: cuda_env — no-op (там nvidia-колёса находятся через RPATH), но extra
+  'cuda' теперь тянет nvidia-пакеты и на Linux — это ок.
