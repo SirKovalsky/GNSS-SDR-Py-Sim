@@ -328,6 +328,47 @@ python run.py --print-interpreter
 > Сдвиг возможен только генерацией новой сессии (`-t` + эфемериды), а не
 > смещением уже записанного файла.
 
+### Плеер в фоне на удалённом хосте (SSH)
+
+На удалённом Linux-хосте (например, с подключённым B210), куда вы заходите по
+SSH, обычный запуск `python -m gnss_sim --iq-input … --tx` завершается вместе с
+сессией: при выходе процессу приходит `SIGHUP`. Для непрерывной передачи есть
+скрипт `scripts/run_player_bg.sh` — он поднимает плеер через `nohup`, уводит
+вывод в лог и пишет PID-файл, поэтому передача продолжается после закрытия SSH.
+
+```bash
+# один раз сделать исполняемым
+chmod +x scripts/run_player_bg.sh
+
+# запустить в фоне
+./scripts/run_player_bg.sh start out.cs16 --uhd-args type=b200 --tx-gain 18
+
+# состояние (PID, uptime, путь лога) и хвост лога
+./scripts/run_player_bg.sh status
+./scripts/run_player_bg.sh log 100
+
+# перезапуск с другими аргументами / остановка
+./scripts/run_player_bg.sh restart out.cs16 --uhd-args type=b200,serial=XXXX
+./scripts/run_player_bg.sh stop
+```
+
+Аргументы после `start`/`restart` — это IQ-файл и любые опции `gnss_sim`
+(`--uhd-args`, `--tx-gain`, `--tx-antenna`, `--tx-channel`, `--clock-source`,
+`--no-loop` и т.д.); ключи `--iq-input` и `--tx` подставляются автоматически.
+По умолчанию сигнал **зациклен** (передача идёт до `stop`); `--no-loop` отыграет
+файл один раз.
+
+| Переменная | По умолчанию | Назначение |
+| --- | --- | --- |
+| `PYTHON` | `<repo>/.venv/bin/python`, иначе `python3` | интерпретатор |
+| `GNSS_BG_LOG` | `<repo>/player.log` | файл журнала |
+| `GNSS_BG_PID` | `<repo>/player.pid` | PID-файл |
+| `GNSS_BG_EXTRA` | — | доп. аргументы `gnss_sim` одной строкой |
+
+Скрипт — это bash (Linux/macOS). На Windows нативный помощник
+`native/gnss_sim_tx.exe` (`--tx-native`) даёт передачу без Python в петле; на
+Linux его нет — используется Python-путь UHD (`gnss_sim/uhd_tx.py`).
+
 
 ## RINEX-эфемериды
 
